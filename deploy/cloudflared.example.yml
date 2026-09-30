@@ -1,0 +1,23 @@
+# Example for a *locally-managed* Cloudflare Tunnel (config file on the
+# server). If your tunnel was created in the Zero Trust dashboard and runs
+# with `cloudflared tunnel run --token ...`, you don't need this file: add
+# the public hostname in the dashboard instead (see README).
+#
+# Setup once:
+#   cloudflared tunnel login
+#   cloudflared tunnel create vps-probe
+#   cloudflared tunnel route dns vps-probe probe.example.com
+# Then put this file at /etc/cloudflared/config.yml and run
+#   cloudflared service install
+#
+# Protect the hostname with a Cloudflare Access application (Zero Trust →
+# Access → Applications) before exposing it, and set cf_access in
+# server.yml so the server itself also insists on the Access login.
+
+tunnel: <TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  - hostname: probe.example.com
+    service: http://127.0.0.1:8080
+  - service: http_status:404

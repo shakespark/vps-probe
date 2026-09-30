@@ -1,0 +1,654 @@
+// VPS probe UI: a small hash-routed single-page app over the read-only API.
+//
+// Strings reported by agents (hostnames, interfaces, mounts, peer names) are
+// untrusted: they only ever reach the DOM as text via h(), reach URLs via
+// encodeURIComponent, and reach charts as canvas text (richText tooltips).
+// Nothing here builds HTML from strings.
+
+'use strict';
+
+const $app = document.getElementById('app');
+const $status = document.getElementById('status');
+const $foot = document.getElementById('foot');
+
+// ---------- DOM helpers ----------
+
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k === 'text') el.textContent = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (k === 'href' || k === 'title' || k.startsWith('data-')) el.setAttribute(k, v);
+    else throw new Error('h: unsupported prop ' + k);
+  }
+  for (const c of kids.flat()) {
+    if (c == null || c === false) continue;
+    el.append(c instanceof Node ? c : String(c));
+  }
+  return el;
+}
+
+const enc = encodeURIComponent;
+function dec(s) {
+  try { return decodeURIComponent(s); } catch { return s; }
+}
+
+// A progress bar; width is set through CSSOM, which CSP allows.
+function bar(pct) {
+  const fill = h('span');
+  const p = Math.max(0, Math.min(100, pct || 0));
+  fill.style.width = p + '%';
+  return h('div', { class: 'bar' + (p >= 90 ? ' bad' : p >= 80 ? ' warn' : '') }, fill);
+}
+
+function seg(options, current, onPick) {
+  return h('div', { class: 'seg' }, options.map(([value, label]) =>
+    h('button', { class: value === current ? 'active' : null, text: label, onclick: () => onPick(value) })));
+}
+
+// ---------- formatting ----------
+
+const UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+function fmtBytes(n) {
+  if (n == null || !isFinite(n)) return '—';
+  let v = Math.abs(n), i = 0;
+  while (v >= 1024 && i < UNITS.length - 1) { v /= 1024; i++; }
+  const s = i === 0 ? v.toFixed(0) : v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2);
+  return (n < 0 ? '-' : '') + s + ' ' + UNITS[i];
+}
+const fmtRate = n => n == null ? '—' : fmtBytes(n) + '/s';
+const fmtPct = (v, d = 1) => v == null || !isFinite(v) ? '—' : v.toFixed(d) + '%';
+const fmtMs = v => v == null ? '—' : (v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : v.toFixed(0)) + ' ms';
+function fmtDur(sec) {
+  if (sec == null || sec < 0) return '—';
+  const d = Math.floor(sec / 86400), hr = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  if (d > 0) return `${d} 天 ${hr} 小时`;
+  if (hr > 0) return `${hr} 小时 ${m} 分`;
+  return `${m} 分`;
+}
+const fmtTime = unix => new Date(unix * 1000).toLocaleString('zh-CN', { hour12: false });
+const nowSec = () => Math.floor(Date.now() / 1000);
+
+const QUOTA_MODES = { sum: '收+发', max: '取大', tx: '仅上行', rx: '仅下行' };
+function billable(rx, tx, mode) {
+  switch (mode) {
+    case 'max': return Math.max(rx, tx);
+    case 'tx': return tx;
+    case 'rx': return rx;
+    default: return rx + tx;
+  }
+}
+const quotaBytes = gb => gb * 1024 ** 3; // traffic_quota_gb counts 1024³ bytes
+
+// ---------- API ----------
+
+async function api(path) {
+  const r = await fetch(path, { headers: { Accept: 'application/json' } });
+  if (!r.ok) throw new Error(`${r.status} ${(await r.text()).trim()}`);
+  return r.json();
+}
+
+// ---------- charts ----------
+
+const darkQuery = matchMedia('(prefers-color-scheme: dark)');
+
+class Chart {
+  constructor(title) {
+    this.box = h('div', { class: 'chart' });
+    this.el = h('div', { class: 'panel' }, h('h2', { text: title }), this.box);
+    this.c = null;
+    this.ro = new ResizeObserver(() => this.c && this.c.resize());
+    this.ro.observe(this.box);
+  }
+  set(option) {
+    if (!this.c) this.c = echarts.init(this.box, darkQuery.matches ? 'dark' : null);
+    this.c.setOption(option, { notMerge: true, lazyUpdate: true });
+  }
+  dispose() {
+    this.ro.disconnect();
+    if (this.c) this.c.dispose();
+  }
+}
+
+// Series points; a null is inserted where data is missing so lines break
+// over outages instead of bridging them. "Missing" is judged against the
+// series' own typical spacing, since some data (disks: every 60s) is sparser
+// than the bucket step.
+function points(ts, vals, step, f = v => v) {
+  const diffs = ts.slice(1).map((t, i) => t - ts[i]).sort((a, b) => a - b);
+  const typical = Math.max(step, diffs.length ? diffs[diffs.length >> 1] : step);
+  const out = [];
+  for (let i = 0; i < ts.length; i++) {
+    if (i > 0 && ts[i] - ts[i - 1] > typical * 2.5) out.push([(ts[i - 1] + step) * 1000, null]);
+    out.push([ts[i] * 1000, vals[i] == null ? null : f(vals[i])]);
+  }
+  return out;
+}
+
+function line(name, data, extra) {
+  return Object.assign({ type: 'line', name, data, showSymbol: false, connectNulls: false,
+    lineStyle: { width: 1.5 }, emphasis: { disabled: true } }, extra);
+}
+
+function timeOption(from, to, yFmt, series, { yMax, y2, tipFmt = yFmt } = {}) {
+  const yAxis = [{ type: 'value', min: 0, max: yMax, axisLabel: { formatter: yFmt },
+    splitLine: { lineStyle: { opacity: 0.35 } } }];
+  if (y2) yAxis.push(y2);
+  return {
+    backgroundColor: 'transparent',
+    animation: false,
+    grid: { left: 8, right: 12, top: 36, bottom: 8, containLabel: true },
+    tooltip: { trigger: 'axis', renderMode: 'richText', confine: true,
+      valueFormatter: v => v == null ? '—' : tipFmt(v) },
+    legend: { top: 0, type: 'scroll' },
+    xAxis: { type: 'time', min: from * 1000, max: to * 1000, axisLabel: { hideOverlap: true } },
+    yAxis,
+    series,
+  };
+}
+
+// ---------- router ----------
+
+const routes = [
+  [/^\/$/, () => overviewPage()],
+  [/^\/node\/([^/]+)$/, m => nodePage(dec(m[1]))],
+  [/^\/ping$/, () => matrixPage()],
+  [/^\/ping\/([^/]+)\/([^/]+)$/, m => linkPage(dec(m[1]), dec(m[2]))],
+  [/^\/traffic$/, () => trafficPage()],
+  [/^\/alerts$/, () => alertsPage()],
+];
+
+let page = null;
+let gen = 0;
+let timer = 0;
+
+function navigate() {
+  if (page && page.destroy) page.destroy();
+  clearTimeout(timer);
+  const path = location.hash.replace(/^#/, '') || '/';
+  let found = null;
+  for (const [re, make] of routes) {
+    const m = path.match(re);
+    if (m) { found = make(m); break; }
+  }
+  page = found || { nav: '', el: h('div', { class: 'empty', text: '页面不存在' }) };
+  for (const a of document.querySelectorAll('#nav a')) {
+    a.classList.toggle('active', a.dataset.route === page.nav);
+  }
+  $app.replaceChildren(page.el);
+  const my = ++gen;
+  const loop = async () => {
+    if (!page.refresh) return;
+    try {
+      await page.refresh();
+      if (my !== gen) return;
+      $status.textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      $status.classList.remove('error');
+    } catch (e) {
+      if (my !== gen) return;
+      $status.textContent = '更新失败：' + e.message;
+      $status.classList.add('error');
+    }
+    if (my === gen) timer = setTimeout(loop, page.interval ? page.interval() : 10000);
+  };
+  loop();
+}
+
+// Re-render (and let pages re-run refresh) without leaving the page.
+function rerender() { navigate(); }
+
+// ---------- overview ----------
+
+function overviewPage() {
+  const grid = h('div', { class: 'cards' });
+  const count = h('span', { class: 'muted' });
+  return {
+    nav: 'overview',
+    el: h('div', null, h('div', { class: 'row' }, h('h1', { text: '总览' }), count), h('div', { class: 'section' }, grid)),
+    async refresh() {
+      const nodes = await api('/api/nodes');
+      count.textContent = `${nodes.filter(n => n.online).length} / ${nodes.length} 在线`;
+      grid.replaceChildren(...nodes.map(nodeCard));
+    },
+  };
+}
+
+function rootDisk(disks) {
+  return (disks || []).find(d => d.mount === '/') || (disks || [])[0];
+}
+
+function nodeCard(n) {
+  const s = n.status;
+  const head = h('div', { class: 'card-head' },
+    h('span', { class: 'dot ' + (n.online ? 'on' : 'off'), title: n.online ? '在线' : '离线' }),
+    h('span', { class: 'name', text: n.name }),
+    n.name !== n.id ? h('span', { class: 'id muted', text: n.id }) : null,
+    h('span', { class: 'spacer' }),
+    !s ? h('span', { class: 'badge', text: '从未上报' })
+      : !n.online ? h('span', { class: 'badge bad', text: '离线 ' + fmtDur(nowSec() - s.fresh_at) }) : null,
+    s && Math.abs(s.clock_skew) > 60 ? h('span', { class: 'badge warn', text: `时钟偏差 ${s.clock_skew}s` }) : null);
+  const card = h('a', { class: 'card panel' + (n.online ? '' : ' offline'), href: '#/node/' + enc(n.id) }, head);
+  if (!s) return card;
+
+  const sys = s.sys;
+  card.append(h('div', { class: 'card-sub muted', text: sys
+    ? [sys.os, sys.arch, sys.cores ? sys.cores + ' 核' : null, '运行 ' + fmtDur(nowSec() - sys.boot_time)]
+      .filter(Boolean).join(' · ')
+    : '—' }));
+
+  const metric = (label, pct, val) => h('div', { class: 'metric' },
+    h('span', { class: 'label', text: label }), bar(pct), h('span', { class: 'val', text: val }));
+  card.append(metric('CPU', s.cpu, fmtPct(s.cpu)));
+  if (s.mem_total) card.append(metric('内存', 100 * s.mem_used / s.mem_total, `${fmtBytes(s.mem_used)} / ${fmtBytes(s.mem_total)}`));
+  if (s.swap_total) card.append(metric('Swap', 100 * s.swap_used / s.swap_total, `${fmtBytes(s.swap_used)} / ${fmtBytes(s.swap_total)}`));
+  const d = rootDisk(s.disks);
+  if (d) card.append(metric('磁盘', 100 * d.used / d.total, `${fmtBytes(d.used)} / ${fmtBytes(d.total)}`));
+
+  const rx = (s.net || []).reduce((a, x) => a + x.rx, 0), tx = (s.net || []).reduce((a, x) => a + x.tx, 0);
+  card.append(h('div', { class: 'kv' }, h('span', { class: 'k', text: '网速' }),
+    h('span', { class: 'num', text: `↓ ${fmtRate(rx)}   ↑ ${fmtRate(tx)}` })));
+  if (s.load1 != null) {
+    card.append(h('div', { class: 'kv' }, h('span', { class: 'k', text: '负载' }),
+      h('span', { class: 'num', text: [s.load1, s.load5, s.load15].map(v => v.toFixed(2)).join(' / ') })));
+  }
+  const t = s.traffic;
+  if (t) {
+    const used = billable(t.rx, t.tx, n.traffic_quota_mode);
+    card.append(h('div', { class: 'kv' }, h('span', { class: 'k', text: `本周期流量（${t.start} 起）` }),
+      h('span', { class: 'num', text: `↓ ${fmtBytes(t.rx)}   ↑ ${fmtBytes(t.tx)}` })));
+    if (n.traffic_quota_gb) {
+      const q = quotaBytes(n.traffic_quota_gb);
+      card.append(metric('配额', 100 * used / q, `${fmtBytes(used)} / ${fmtBytes(q)}`));
+    }
+  }
+  return card;
+}
+
+// ---------- node detail ----------
+
+const RANGES = [['1h', '1 小时', 3600], ['6h', '6 小时', 6 * 3600], ['24h', '24 小时', 86400],
+  ['7d', '7 天', 7 * 86400], ['30d', '30 天', 30 * 86400]];
+let rangeKey = '1h';
+const rangeSec = () => RANGES.find(r => r[0] === rangeKey)[2];
+const rangeSeg = () => seg(RANGES.map(r => [r[0], r[1]]), rangeKey, v => { rangeKey = v; rerender(); });
+const rangeInterval = () => rangeSec() > 86400 ? 60000 : 10000;
+
+function nodePage(id) {
+  const title = h('h1', { text: id });
+  const dot = h('span', { class: 'dot' });
+  const sub = h('div', { class: 'muted' });
+  const summary = h('div', { class: 'summary' });
+  const charts = {
+    cpu: new Chart('CPU'), load: new Chart('负载'), mem: new Chart('内存 / Swap'),
+    net: new Chart('网络'), disk: new Chart('磁盘使用率'), ping: new Chart('时延（到各 peer）'),
+  };
+  const el = h('div', null,
+    h('div', { class: 'row' }, h('a', { href: '#/', text: '← 总览' })),
+    h('div', { class: 'panel section' },
+      h('div', { class: 'row' }, dot, title), sub, summary),
+    h('div', { class: 'row section' }, h('span', { class: 'muted', text: '时间范围' }), rangeSeg()),
+    h('div', { class: 'charts section' }, Object.values(charts).map(c => c.el)));
+
+  return {
+    nav: 'overview',
+    el,
+    interval: rangeInterval,
+    destroy() { Object.values(charts).forEach(c => c.dispose()); },
+    async refresh() {
+      const to = nowSec(), from = to - rangeSec();
+      const q = `from=${from}&to=${to}`;
+      const [nodes, m, net, disks, matrix] = await Promise.all([
+        api('/api/nodes'),
+        api(`/api/nodes/${enc(id)}/metrics?${q}`),
+        api(`/api/nodes/${enc(id)}/net?${q}`),
+        api(`/api/nodes/${enc(id)}/disks?${q}`),
+        api('/api/ping/matrix?window=1h'),
+      ]);
+      const n = nodes.find(x => x.id === id);
+      if (!n) throw new Error('未知节点 ' + id);
+      renderNodeHead(n, title, dot, sub, summary);
+
+      const peers = [...new Set(matrix.links.filter(l => l.src === id).map(l => l.dst))];
+      const pings = await Promise.all(peers.map(d => api(`/api/ping/${enc(id)}/${enc(d)}?${q}`)));
+
+      const st = m.step, rollup = m.tier !== 'raw';
+      const c = m.cols;
+      charts.cpu.set(timeOption(from, to, v => v.toFixed(0) + '%', [
+        line('CPU', points(m.ts, c.cpu, st)),
+        line('Steal', points(m.ts, c.steal, st)),
+        rollup ? line('CPU 峰值', points(m.ts, c.cpu_max, st), { lineStyle: { width: 1, type: 'dashed' } }) : null,
+      ].filter(Boolean), { yMax: 100, tipFmt: v => fmtPct(v) }));
+      charts.load.set(timeOption(from, to, v => v.toFixed(2), [
+        line('1 分钟', points(m.ts, c.load1, st)),
+        line('5 分钟', points(m.ts, c.load5, st)),
+        line('15 分钟', points(m.ts, c.load15, st)),
+      ]));
+      const memMax = Math.max(0, ...c.mem_total.filter(v => v != null));
+      charts.mem.set(timeOption(from, to, fmtBytes, [
+        line('内存', points(m.ts, c.mem_used, st), { areaStyle: { opacity: 0.15 } }),
+        line('Swap', points(m.ts, c.swap_used, st)),
+      ], { yMax: memMax || undefined }));
+
+      const netSeries = [];
+      for (const iface of Object.keys(net).sort()) {
+        const s = net[iface];
+        netSeries.push(line(`${iface} ↓`, points(s.ts, s.cols.rx, s.step)));
+        netSeries.push(line(`${iface} ↑`, points(s.ts, s.cols.tx, s.step)));
+      }
+      charts.net.set(timeOption(from, to, fmtRate, netSeries));
+
+      charts.disk.set(timeOption(from, to, v => v.toFixed(0) + '%',
+        Object.keys(disks).sort().map(mount => {
+          const s = disks[mount];
+          const pct = s.cols.used.map((u, i) => u == null || !s.cols.total[i] ? null : 100 * u / s.cols.total[i]);
+          return line(mount, points(s.ts, pct, s.step));
+        }), { yMax: 100, tipFmt: v => fmtPct(v) }));
+
+      const pingSeries = [];
+      peers.forEach((dst, i) => {
+        const s = pings[i];
+        pingSeries.push(line(dst, points(s.ts, s.cols.avg, s.step)));
+        pingSeries.push({ type: 'bar', name: dst + ' 丢包', yAxisIndex: 1, data: points(s.ts, s.cols.loss_pct, s.step),
+          barMaxWidth: 4, itemStyle: { opacity: 0.45 }, tooltip: { valueFormatter: v => v == null ? '—' : fmtPct(v, 0) } });
+      });
+      charts.ping.set(timeOption(from, to, fmtMs, pingSeries, {
+        y2: { type: 'value', min: 0, max: 100, axisLabel: { formatter: '{value}%' }, splitLine: { show: false } } }));
+    },
+  };
+}
+
+function renderNodeHead(n, title, dot, sub, summary) {
+  title.textContent = n.name + (n.name !== n.id ? `（${n.id}）` : '');
+  dot.className = 'dot ' + (n.online ? 'on' : 'off');
+  const s = n.status;
+  if (!s) { sub.textContent = '从未上报'; summary.replaceChildren(); return; }
+  const sys = s.sys || {};
+  sub.textContent = [sys.hostname, sys.os, sys.kernel, sys.arch, sys.agent_version && 'agent ' + sys.agent_version]
+    .filter(Boolean).join(' · ');
+  const kv = (k, v) => h('div', { class: 'kv' }, h('span', { class: 'k', text: k }), h('span', { class: 'num', text: v }));
+  const d = rootDisk(s.disks);
+  summary.replaceChildren(
+    kv('状态', n.online ? '在线' : '离线'),
+    kv('最后上报', fmtTime(s.fresh_at)),
+    kv('运行时间', sys.boot_time ? fmtDur(nowSec() - sys.boot_time) : '—'),
+    kv('CPU', fmtPct(s.cpu) + (sys.cores ? ` / ${sys.cores} 核` : '')),
+    kv('内存', s.mem_total ? `${fmtBytes(s.mem_used)} / ${fmtBytes(s.mem_total)}` : '—'),
+    kv('磁盘 /', d ? `${fmtBytes(d.used)} / ${fmtBytes(d.total)}` : '—'),
+    kv('时钟偏差', s.clock_skew + ' s'),
+    kv('本周期流量', s.traffic ? `↓ ${fmtBytes(s.traffic.rx)} ↑ ${fmtBytes(s.traffic.tx)}` : '—'));
+}
+
+// ---------- latency matrix ----------
+
+let matrixWindow = '5m';
+
+function latClass(link) {
+  if (link.avg == null) return 'lat4';
+  let lvl = link.avg < 30 ? 0 : link.avg < 80 ? 1 : link.avg < 150 ? 2 : link.avg < 250 ? 3 : 4;
+  if (link.loss_pct >= 20) lvl = 4;
+  else if (link.loss_pct >= 5) lvl = Math.max(lvl, 3);
+  return 'lat' + lvl;
+}
+
+function matrixPage() {
+  const wrap = h('div', { class: 'table-wrap' });
+  const el = h('div', null,
+    h('div', { class: 'row' }, h('h1', { text: '时延矩阵' }), h('span', { class: 'spacer' }),
+      h('span', { class: 'muted', text: '统计窗口' }),
+      seg([['5m', '5 分钟'], ['15m', '15 分钟'], ['1h', '1 小时']], matrixWindow, v => { matrixWindow = v; rerender(); })),
+    h('div', { class: 'panel section' }, wrap,
+      h('div', { class: 'legend muted' },
+        h('span', { class: 'l0', text: '< 30 ms' }), h('span', { class: 'l1', text: '< 80 ms' }),
+        h('span', { class: 'l2', text: '< 150 ms' }), h('span', { class: 'l3', text: '< 250 ms 或丢包 ≥ 5%' }),
+        h('span', { class: 'l4', text: '更高 / 丢包 ≥ 20% / 不通' }),
+        h('span', { text: '行 = 发起方，列 = 目标；点击格子查看历史' }))));
+  return {
+    nav: 'ping',
+    el,
+    async refresh() {
+      const [data, nodes] = await Promise.all([api('/api/ping/matrix?window=' + matrixWindow), api('/api/nodes')]);
+      const names = new Map(nodes.map(n => [n.id, n.name]));
+      const links = new Map(data.links.map(l => [l.src + '\n' + l.dst, l]));
+      const extra = [...new Set(data.links.map(l => l.dst).filter(d => !names.has(d)))].sort();
+      const cols = [...data.nodes, ...extra];
+      if (!data.links.length) {
+        wrap.replaceChildren(h('div', { class: 'empty', text: '这个窗口内没有时延数据' }));
+        return;
+      }
+      const head = h('tr', null, h('th', { text: '发起 \\ 目标' }),
+        cols.map(c => h('th', { text: names.get(c) || c, title: c })));
+      const rows = data.nodes.map(src => h('tr', null,
+        h('td', { text: names.get(src) || src, title: src }),
+        cols.map(dst => {
+          if (src === dst) return h('td', { class: 'self', text: '—' });
+          const l = links.get(src + '\n' + dst);
+          if (!l) return h('td', { class: 'muted', text: '' });
+          const tip = `${src} → ${dst}\n平均 ${fmtMs(l.avg)}  最小 ${fmtMs(l.min)}  最大 ${fmtMs(l.max)}\n` +
+            `抖动 ${fmtMs(l.jitter)}  丢包 ${fmtPct(l.loss_pct)}（${l.lost}/${l.sent}）`;
+          return h('td', { class: 'cell ' + latClass(l), title: tip,
+            onclick: () => { location.hash = `#/ping/${enc(src)}/${enc(dst)}`; } },
+          h('span', { class: 'ms', text: l.avg == null ? '不通' : fmtMs(l.avg) }),
+          l.loss_pct > 0 && l.avg != null ? h('span', { class: 'loss', text: '丢包 ' + fmtPct(l.loss_pct, 0) }) : null);
+        })));
+      wrap.replaceChildren(h('table', { class: 'matrix' }, h('thead', null, head), h('tbody', null, rows)));
+    },
+  };
+}
+
+function linkPage(src, dst) {
+  const chart = new Chart('时延与丢包');
+  const stats = h('div', { class: 'summary' });
+  const el = h('div', null,
+    h('div', { class: 'row' }, h('a', { href: '#/ping', text: '← 时延矩阵' })),
+    h('div', { class: 'panel section' }, h('h1', { text: `${src} → ${dst}` }), stats),
+    h('div', { class: 'row section' }, h('span', { class: 'muted', text: '时间范围' }), rangeSeg()),
+    h('div', { class: 'section' }, chart.el));
+  return {
+    nav: 'ping',
+    el,
+    interval: rangeInterval,
+    destroy() { chart.dispose(); },
+    async refresh() {
+      const to = nowSec(), from = to - rangeSec();
+      const s = await api(`/api/ping/${enc(src)}/${enc(dst)}?from=${from}&to=${to}`);
+      const c = s.cols, st = s.step;
+      const sent = c.sent.reduce((a, v) => a + (v || 0), 0), lost = c.lost.reduce((a, v) => a + (v || 0), 0);
+      const vals = k => c[k].filter(v => v != null);
+      const kv = (k, v) => h('div', { class: 'kv' }, h('span', { class: 'k', text: k }), h('span', { class: 'num', text: v }));
+      const avgs = vals('avg');
+      stats.replaceChildren(
+        kv('发送', String(sent)), kv('丢包率', sent ? fmtPct(100 * lost / sent, 2) : '—'),
+        kv('最小', vals('min').length ? fmtMs(Math.min(...vals('min'))) : '—'),
+        kv('平均', avgs.length ? fmtMs(avgs.reduce((a, v) => a + v, 0) / avgs.length) : '—'),
+        kv('最大', vals('max').length ? fmtMs(Math.max(...vals('max'))) : '—'),
+        kv('数据粒度', `${s.tier} / ${st}s`));
+      chart.set(timeOption(from, to, fmtMs, [
+        line('最小', points(s.ts, c.min, st), { lineStyle: { width: 1, type: 'dashed' } }),
+        line('平均', points(s.ts, c.avg, st), { lineStyle: { width: 2 } }),
+        line('最大', points(s.ts, c.max, st), { lineStyle: { width: 1, type: 'dashed' } }),
+        { type: 'bar', name: '丢包', yAxisIndex: 1, data: points(s.ts, c.loss_pct, st), barMaxWidth: 6,
+          itemStyle: { opacity: 0.5 }, tooltip: { valueFormatter: v => v == null ? '—' : fmtPct(v, 1) } },
+      ], { y2: { type: 'value', min: 0, max: 100, axisLabel: { formatter: '{value}%' }, splitLine: { show: false } } }));
+    },
+  };
+}
+
+// ---------- traffic ----------
+
+let trafficNode = null;
+
+function trafficPage() {
+  const table = h('div', { class: 'table-wrap' });
+  const detailTitle = h('h2');
+  const chart = new Chart('每日流量');
+  const history = h('div', { class: 'table-wrap' });
+  const caption = h('div', { class: 'muted' });
+  const el = h('div', null,
+    h('h1', { text: '流量' }),
+    h('div', { class: 'panel section' }, table),
+    h('div', { class: 'section' }, detailTitle),
+    h('div', { class: 'charts' }, chart.el, h('div', { class: 'panel' }, h('h2', { text: '历史周期' }), history)),
+    h('div', { class: 'section' }, caption));
+  return {
+    nav: 'traffic',
+    el,
+    destroy() { chart.dispose(); },
+    async refresh() {
+      const [nodes, stats] = await Promise.all([api('/api/traffic'), api('/api/stats')]);
+      if (!nodes.length) return;
+      if (!nodes.some(n => n.id === trafficNode)) trafficNode = nodes[0].id;
+      caption.textContent = `每日流量的日期按服务端时区（${stats.timezone || '—'}）划分，应与各 agent 的 traffic.timezone 一致。` +
+        '配额的 GB 按 1024³ 字节计算。';
+
+      const head = h('tr', null, ['节点', '周期起始', '下行', '上行', '合计', '计费方式', '已用 / 配额'].map(t => h('th', { text: t })));
+      const rows = nodes.map(n => {
+        const p = n.periods[0];
+        const used = p ? billable(p.rx, p.tx, n.traffic_quota_mode) : 0;
+        const q = n.traffic_quota_gb ? quotaBytes(n.traffic_quota_gb) : 0;
+        return h('tr', { class: 'clickable' + (n.id === trafficNode ? ' selected' : ''),
+          onclick: () => { trafficNode = n.id; rerender(); } },
+        h('td', { text: n.name }),
+        h('td', { text: p ? p.start : '—' }),
+        h('td', { text: p ? fmtBytes(p.rx) : '—' }),
+        h('td', { text: p ? fmtBytes(p.tx) : '—' }),
+        h('td', { text: p ? fmtBytes(p.rx + p.tx) : '—' }),
+        h('td', { text: QUOTA_MODES[n.traffic_quota_mode] || n.traffic_quota_mode }),
+        h('td', null, q ? [bar(100 * used / q), `${fmtBytes(used)} / ${fmtBytes(q)}（${fmtPct(100 * used / q)}）`]
+          : `${fmtBytes(used)} / 不限`));
+      });
+      table.replaceChildren(h('table', null, h('thead', null, head), h('tbody', null, rows)));
+
+      const n = nodes.find(x => x.id === trafficNode);
+      detailTitle.textContent = n.name + '：本周期每日流量与历史周期';
+      history.replaceChildren(n.periods.length
+        ? h('table', null,
+          h('thead', null, h('tr', null, ['周期起始', '下行', '上行', '合计', '计费量'].map(t => h('th', { text: t })))),
+          h('tbody', null, n.periods.map(p => h('tr', null,
+            h('td', { text: p.start, title: p.ifaces.map(i => `${i.iface}: ↓${fmtBytes(i.rx)} ↑${fmtBytes(i.tx)}`).join('\n') }),
+            h('td', { text: fmtBytes(p.rx) }), h('td', { text: fmtBytes(p.tx) }),
+            h('td', { text: fmtBytes(p.rx + p.tx) }),
+            h('td', { text: fmtBytes(billable(p.rx, p.tx, n.traffic_quota_mode)) })))))
+        : h('div', { class: 'empty', text: '暂无数据' }));
+
+      const daily = await api(`/api/traffic/${enc(n.id)}/daily`);
+      const days = daily.days;
+      chart.set({
+        backgroundColor: 'transparent',
+        animation: false,
+        grid: { left: 8, right: 12, top: 36, bottom: 8, containLabel: true },
+        tooltip: { trigger: 'axis', renderMode: 'richText', confine: true, valueFormatter: fmtBytes },
+        legend: { top: 0 },
+        xAxis: { type: 'category', data: days.map(d => d.day.slice(5)), axisLabel: { hideOverlap: true } },
+        yAxis: { type: 'value', axisLabel: { formatter: fmtBytes }, splitLine: { lineStyle: { opacity: 0.35 } } },
+        series: [
+          { type: 'bar', name: '下行', stack: 't', data: days.map(d => d.rx), barMaxWidth: 28 },
+          { type: 'bar', name: '上行', stack: 't', data: days.map(d => d.tx), barMaxWidth: 28 },
+        ],
+      });
+    },
+  };
+}
+
+// ---------- alerts ----------
+
+const METRICS = { cpu: 'CPU', steal: 'Steal', load1: '负载(1m)', mem: '内存', swap: 'Swap', disk: '磁盘',
+  offline: '离线', ping_loss: '丢包', ping_avg: '时延', traffic: '流量配额' };
+const EVENTS = { firing: '告警', repeat: '仍在告警', recovered: '恢复', level: '流量档位' };
+
+function fmtRuleValue(metric, v) {
+  if (v == null) return '—';
+  if (metric === 'offline') return v < 60 ? Math.round(v) + ' 秒' : fmtDur(v);
+  if (metric === 'ping_avg') return fmtMs(v);
+  if (metric === 'load1') return v.toFixed(2);
+  return fmtPct(v);
+}
+
+function ruleText(r) {
+  if (r.metric === 'offline') return `超过 ${r.for} 没有上报`;
+  if (r.metric === 'traffic') return `达到配额 ${r.levels.join(' / ')}%（每周期每档一次）`;
+  let t = `${METRICS[r.metric] || r.metric} ${r.op} ${fmtRuleValue(r.metric, r.threshold)}`;
+  if (r.for !== '0s') t += `，持续 ${r.for}`;
+  return t;
+}
+
+function alertsPage() {
+  const active = h('div', { class: 'table-wrap' });
+  const history = h('div', { class: 'table-wrap' });
+  const rules = h('div', { class: 'table-wrap' });
+  const tg = h('span', { class: 'badge' });
+  const table = (cols, rows) => h('table', { class: 'plain' },
+    h('thead', null, h('tr', null, cols.map(c => h('th', { text: c })))), h('tbody', null, rows));
+  const cell = t => h('td', { text: t });
+  return {
+    nav: 'alerts',
+    el: h('div', null,
+      h('div', { class: 'row' }, h('h1', { text: '告警' }), tg),
+      h('div', { class: 'panel section' }, h('h2', { text: '当前告警' }), active),
+      h('div', { class: 'panel section' }, h('h2', { text: '最近 7 天' }), history),
+      h('div', { class: 'panel section' }, h('h2', { text: '规则' }), rules)),
+    async refresh() {
+      const [d, nodes] = await Promise.all([api('/api/alerts'), api('/api/nodes')]);
+      const names = new Map(nodes.map(n => [n.id, n.name]));
+      const nodeText = id => names.get(id) || id;
+      const metricOf = new Map(d.rules.map(r => [r.name, r.metric]));
+      tg.textContent = d.telegram ? 'Telegram 已配置' : 'Telegram 未配置：告警只记录不发送';
+      tg.className = 'badge' + (d.telegram ? '' : ' warn');
+
+      active.replaceChildren(d.active.length
+        ? table(['状态', '规则', '节点', '对象', '当前值', '开始于'], d.active.map(a => h('tr', null,
+          h('td', null, h('span', { class: 'badge ' + (a.state === 'firing' ? 'bad' : 'warn'),
+            text: a.state === 'firing' ? '告警中' : '观察中' })),
+          cell(a.rule), cell(nodeText(a.node)), cell(a.target || '—'),
+          cell(fmtRuleValue(a.metric, a.value)), cell(fmtTime(a.since)))))
+        : h('div', { class: 'empty', text: '没有告警' }));
+
+      history.replaceChildren(d.history.length
+        ? table(['时间', '事件', '规则', '节点', '对象', '值'], d.history.map(e => h('tr', { title: e.message },
+          cell(fmtTime(e.ts)),
+          h('td', null, h('span', { class: 'badge ' + (e.event === 'recovered' ? '' : e.event === 'level' ? 'warn' : 'bad'),
+            text: EVENTS[e.event] || e.event })),
+          cell(e.rule), cell(nodeText(e.node)), cell(e.target || '—'),
+          cell(e.event === 'level' ? e.value + '%' : fmtRuleValue(metricOf.get(e.rule), e.value)))))
+        : h('div', { class: 'empty', text: '最近 7 天没有告警' }));
+
+      rules.replaceChildren(d.rules.length
+        ? table(['名称', '条件', '节点', '重复提醒', '恢复通知'], d.rules.map(r => h('tr', null,
+          cell(r.name), cell(ruleText(r)),
+          cell(r.nodes === 'all' ? '全部' : r.nodes.map(nodeText).join('、')),
+          cell(r.repeat === '0s' ? '不重复' : '每 ' + r.repeat),
+          cell(r.metric === 'traffic' ? '—' : r.notify_recovery === false ? '否' : '是'))))
+        : h('div', { class: 'empty', text: '没有配置告警规则' }));
+    },
+  };
+}
+
+// ---------- footer ----------
+
+async function refreshFooter() {
+  try {
+    const s = await api('/api/stats');
+    const i = s.ingest;
+    const dropped = Object.entries(i).filter(([k, v]) => v > 0 && !['accepted', 'duplicate'].includes(k));
+    $foot.replaceChildren(
+      `上报 ${i.accepted} 个包（重传 ${i.duplicate}）· `,
+      dropped.length ? h('span', { class: 'badge warn', text: '丢弃 ' + dropped.map(([k, v]) => `${k}=${v}`).join(' ') })
+        : '无丢弃',
+      ` · 数据库 ${fmtBytes(s.db_bytes)} · 服务端时间 ${fmtTime(s.server_time)}`);
+  } catch {
+    // The page's own refresh reports connectivity errors.
+  }
+}
+
+// ---------- start ----------
+
+window.addEventListener('hashchange', navigate);
+darkQuery.addEventListener('change', rerender);
+if (typeof echarts === 'undefined') {
+  $app.replaceChildren(h('div', { class: 'error', text: 'ECharts 加载失败' }));
+} else {
+  navigate();
+}
+refreshFooter();
+setInterval(refreshFooter, 30000);

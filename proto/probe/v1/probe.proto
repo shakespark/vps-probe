@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package probe.v1;
+
+option go_package = "vpsprobe/internal/proto/probev1";
+
+// Report is one sample from an agent. A single (node, ts) sample may be split
+// across several Reports (e.g. pings in a separate packet); the server merges
+// them field by field.
+message Report {
+  int64 ts = 1;   // sample time, unix seconds, aligned to the agent interval
+  uint64 id = 2;  // random, echoed back in Ack
+
+  SysInfo sys = 3;              // on start and hourly
+  CPU cpu = 4;
+  Load load = 5;
+  Mem mem = 6;
+  repeated Disk disks = 7;      // every 60s
+  repeated NetRate net = 8;
+  repeated IfaceTraffic traffic = 9;
+  repeated Ping pings = 10;
+}
+
+message SysInfo {
+  string hostname = 1;
+  string os = 2;       // PRETTY_NAME from /etc/os-release
+  string kernel = 3;
+  string arch = 4;
+  uint32 cores = 5;
+  int64 boot_time = 6; // unix seconds
+  uint64 uptime = 7;   // seconds
+  string agent_version = 8;
+}
+
+message CPU {
+  float usage = 1; // percent, 0-100
+  float steal = 2; // percent, 0-100
+}
+
+message Load {
+  float l1 = 1;
+  float l5 = 2;
+  float l15 = 3;
+}
+
+message Mem {
+  uint64 total = 1; // bytes
+  uint64 used = 2;  // total - MemAvailable
+  uint64 swap_total = 3;
+  uint64 swap_used = 4;
+}
+
+message Disk {
+  string mount = 1;
+  uint64 total = 2; // bytes
+  uint64 used = 3;
+  uint64 avail = 4; // available to unprivileged users, as df reports
+  float inode_pct = 5;
+}
+
+message NetRate {
+  string iface = 1;
+  uint64 rx_rate = 2; // bytes per second
+  uint64 tx_rate = 3;
+}
+
+message IfaceTraffic {
+  string iface = 1;
+  Period cur = 2;
+  Period prev = 3;
+}
+
+message Period {
+  string start = 1; // period start date, YYYY-MM-DD in the agent's timezone
+  uint64 rx = 2;    // bytes accumulated in this period
+  uint64 tx = 3;
+}
+
+message Ping {
+  string target = 1; // peer name from agent config
+  string addr = 2;   // resolved IP, empty if resolution failed
+  uint32 sent = 3;
+  uint32 lost = 4;
+  float min = 5;     // milliseconds, over replies only
+  float avg = 6;
+  float max = 7;
+  float jitter = 8;  // mean absolute difference of consecutive RTTs
+}
+
+message Ack {
+  repeated uint64 ids = 1;
+}

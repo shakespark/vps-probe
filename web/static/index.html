@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>VPS 探针</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/">VPS 探针</a>
+  <nav id="nav">
+    <a href="#/" data-route="overview">总览</a>
+    <a href="#/ping" data-route="ping">时延</a>
+    <a href="#/traffic" data-route="traffic">流量</a>
+    <a href="#/alerts" data-route="alerts">告警</a>
+  </nav>
+  <span id="status" class="status muted"></span>
+</header>
+<main id="app"></main>
+<footer id="foot" class="muted"></footer>
+<script src="/static/vendor/echarts-6.1.0.min.js"></script>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

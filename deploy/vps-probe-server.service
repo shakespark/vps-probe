@@ -1,0 +1,50 @@
+[Unit]
+Description=VPS probe server (UDP ingest + read-only web API)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vps-probe-server serve -config /etc/vps-probe/server.yml
+Restart=always
+RestartSec=5
+# Shutdown folds the SQLite WAL back into probe.db.
+TimeoutStopSec=30
+
+User=vps-probe-server
+Group=vps-probe-server
+StateDirectory=vps-probe-server
+StateDirectoryMode=0700
+UMask=0077
+
+# Hardening. The server binds unprivileged ports, reads its config and
+# writes only its state directory.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

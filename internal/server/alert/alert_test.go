@@ -1,0 +1,343 @@
+package alert
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"strings"
+	"testing"
+	"time"
+
+	"vpsprobe/internal/server/config"
+	"vpsprobe/internal/server/store"
+)
+
+type fakeSrc struct {
+	status map[string]*store.Status
+	links  []store.Link
+	states map[key]store.AlertState
+	events []store.AlertEvent
+}
+
+func (f *fakeSrc) Status(_ context.Context, id string) (*store.Status, error) {
+	return f.status[id], nil
+}
+func (f *fakeSrc) Matrix(context.Context, time.Duration) ([]store.Link, error) { return f.links, nil }
+func (f *fakeSrc) AlertStates() ([]store.AlertState, error) {
+	var out []store.AlertState
+	for _, s := range f.states {
+		out = append(out, s)
+	}
+	return out, nil
+}
+func (f *fakeSrc) SaveAlerts(put, del []store.AlertState, ev []store.AlertEvent) error {
+	for _, s := range put {
+		f.states[key{s.Rule, s.Node, s.Target}] = s
+	}
+	for _, s := range del {
+		delete(f.states, key{s.Rule, s.Node, s.Target})
+	}
+	f.events = append(f.events, ev...)
+	return nil
+}
+func (f *fakeSrc) PruneAlertStates(rules []string) error {
+	for k := range f.states {
+		keep := false
+		for _, r := range rules {
+			keep = keep || k.rule == r
+		}
+		if !keep {
+			delete(f.states, k)
+		}
+	}
+	return nil
+}
+
+type fakeNotifier struct{ msgs []string }
+
+func (n *fakeNotifier) Notify(text string) { n.msgs = append(n.msgs, text) }
+
+const tokA = "abcdefghijklmnopqrstuvwxyz0123456789"
+const tokB = "bcdefghijklmnopqrstuvwxyz0123456789a"
+
+type harness struct {
+	t   *testing.T
+	cfg *config.Config
+	src *fakeSrc
+	n   *fakeNotifier
+	e   *Evaluator
+	now time.Time
+}
+
+func setup(t *testing.T, rules string) *harness {
+	t.Helper()
+	cfg, err := config.Parse([]byte(`
+nodes:
+  - {id: a, name: 香港, token: ` + tokA + `, traffic_quota_gb: 100}
+  - {id: b, token: ` + tokB + `}
+alerts:
+` + rules))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &harness{t: t, cfg: cfg, src: &fakeSrc{status: map[string]*store.Status{}, states: map[key]store.AlertState{}},
+		n: &fakeNotifier{}, now: time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)}
+	h.newEvaluator()
+	return h
+}
+
+func (h *harness) newEvaluator() {
+	h.e = New(h.cfg, h.src, h.n, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.e.now = func() time.Time { return h.now }
+	if err := h.e.Load(); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// report makes node fresh at the current time with the given CPU.
+func (h *harness) report(node string, cpu float64) {
+	st := h.src.status[node]
+	if st == nil {
+		st = &store.Status{}
+		h.src.status[node] = st
+	}
+	st.FreshAt = h.now.Unix()
+	st.CPU = &cpu
+}
+
+// step advances the clock, optionally reporting, and runs one round.
+func (h *harness) step(d time.Duration, report func()) {
+	h.now = h.now.Add(d)
+	if report != nil {
+		report()
+	}
+	if err := h.e.Tick(context.Background()); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *harness) msgs() int { return len(h.n.msgs) }
+
+func TestCPUStateMachine(t *testing.T) {
+	h := setup(t, `  - {name: cpu_high, metric: cpu, op: ">", threshold: 90, for: 1m, repeat: 10m}`)
+	hot := func() { h.report("a", 95) }
+	cool := func() { h.report("a", 10) }
+
+	h.step(0, hot)
+	for i := 0; i < 5; i++ {
+		h.step(10*time.Second, hot)
+	}
+	if h.msgs() != 0 || h.e.Active()[0].State != statePending {
+		t.Fatalf("fired before for elapsed: %v", h.n.msgs)
+	}
+	h.step(10*time.Second, hot) // 60s
+	if h.msgs() != 1 || !strings.Contains(h.n.msgs[0], "🔴 告警 cpu_high · 香港（a）") ||
+		!strings.Contains(h.n.msgs[0], "CPU 95.0%（阈值 > 90.0%）") {
+		t.Fatalf("firing message: %q", h.n.msgs)
+	}
+
+	// Brief dips shorter than the debounce don't recover.
+	h.step(10*time.Second, cool)
+	h.step(10*time.Second, cool)
+	h.step(10*time.Second, hot)
+	if h.msgs() != 1 {
+		t.Fatalf("flapped: %v", h.n.msgs)
+	}
+	// Reminder after repeat.
+	for i := 0; i < 60; i++ {
+		h.step(10*time.Second, hot)
+	}
+	if h.msgs() != 2 || !strings.HasPrefix(h.n.msgs[1], "🟠 仍在告警") {
+		t.Fatalf("repeat: %v", h.n.msgs)
+	}
+	// Sustained recovery: condition false for min(for, 1m) = 60s.
+	for i := 0; i < 6; i++ {
+		h.step(10*time.Second, cool)
+	}
+	if h.msgs() != 2 {
+		t.Fatalf("recovered before the debounce: %v", h.n.msgs)
+	}
+	for i := 0; i < 1; i++ {
+		h.step(10*time.Second, cool)
+	}
+	if h.msgs() != 3 || !strings.HasPrefix(h.n.msgs[2], "🟢 恢复 cpu_high") {
+		t.Fatalf("recovery: %v", h.n.msgs)
+	}
+	if len(h.src.states) != 0 || len(h.e.Active()) != 0 {
+		t.Fatalf("state left: %v", h.src.states)
+	}
+	ev := h.src.events
+	if len(ev) != 3 || ev[0].Event != "firing" || ev[1].Event != "repeat" || ev[2].Event != "recovered" {
+		t.Fatalf("history: %+v", ev)
+	}
+}
+
+func TestPendingResetsWhenConditionClears(t *testing.T) {
+	h := setup(t, `  - {name: cpu_high, metric: cpu, op: ">", threshold: 90, for: 1m}`)
+	h.step(0, func() { h.report("a", 95) })
+	h.step(30*time.Second, func() { h.report("a", 50) })
+	h.step(30*time.Second, func() { h.report("a", 95) })
+	h.step(30*time.Second, func() { h.report("a", 95) })
+	if h.msgs() != 0 {
+		t.Fatalf("pending did not restart: %v", h.n.msgs)
+	}
+}
+
+func TestOfflineNodeHoldsFiringAndDropsPending(t *testing.T) {
+	h := setup(t, `  - {name: cpu_high, metric: cpu, op: ">", threshold: 90, for: 40s}`)
+	h.step(0, func() { h.report("a", 95); h.report("b", 95) })
+	h.step(20*time.Second, func() { h.report("a", 95) }) // b goes silent while pending
+	h.step(20*time.Second, func() { h.report("a", 95) }) // a fires; b is stale, its pending dropped
+	if h.msgs() != 1 {
+		t.Fatalf("msgs: %v", h.n.msgs)
+	}
+	// a stops reporting too: stale values must neither recover nor re-fire.
+	for i := 0; i < 20; i++ {
+		h.step(10*time.Second, nil)
+	}
+	act := h.e.Active()
+	if h.msgs() != 1 || len(act) != 1 || act[0].Node != "a" || act[0].State != stateFiring {
+		t.Fatalf("after silence: msgs=%v active=%+v", h.n.msgs, act)
+	}
+}
+
+func TestOffline(t *testing.T) {
+	h := setup(t, `  - {name: offline, metric: offline, for: 1m}`)
+	fresh := func() { h.report("a", 1) }
+	h.step(0, fresh)
+	// b never reports; within the startup grace nothing fires.
+	for i := 0; i < 11; i++ {
+		h.step(10*time.Second, fresh)
+	}
+	if h.msgs() != 0 {
+		t.Fatalf("fired during grace: %v", h.n.msgs)
+	}
+	h.step(10*time.Second, fresh) // 2m: b silent since start
+	if h.msgs() != 1 || !strings.Contains(h.n.msgs[0], "· b\n从未上报") {
+		t.Fatalf("never-reported: %q", h.n.msgs)
+	}
+	// a goes silent for 1m.
+	for i := 0; i < 6; i++ {
+		h.step(10*time.Second, nil)
+	}
+	if h.msgs() != 2 || !strings.Contains(h.n.msgs[1], "已 1 分 0 秒 没有上报") {
+		t.Fatalf("offline: %q", h.n.msgs)
+	}
+	// One fresh report recovers at once.
+	h.step(10*time.Second, fresh)
+	if h.msgs() != 3 || !strings.HasPrefix(h.n.msgs[2], "🟢 恢复在线 offline · 香港（a）\n已恢复上报，离线约 1 分 0 秒") {
+		t.Fatalf("recovery: %q", h.n.msgs)
+	}
+}
+
+func TestOneMessagePerRound(t *testing.T) {
+	h := setup(t, `  - {name: cpu, metric: cpu, op: ">", threshold: 90}
+  - {name: disk, metric: disk, op: ">", threshold: 80}`)
+	h.step(0, func() {
+		h.report("a", 99)
+		h.src.status["a"].Disks = []store.Disk{{Mount: "/", Total: 100, Used: 85}, {Mount: "/data", Total: 100, Used: 10}}
+		h.report("b", 99)
+	})
+	if h.msgs() != 1 || strings.Count(h.n.msgs[0], "🔴") != 3 || !strings.Contains(h.n.msgs[0], "磁盘 / 85.0%") {
+		t.Fatalf("batch: %q", h.n.msgs)
+	}
+}
+
+func TestPingLoss(t *testing.T) {
+	h := setup(t, `  - {name: loss, metric: ping_loss, op: ">", threshold: 20}
+  - {name: rtt, metric: ping_avg, op: ">", threshold: 200}`)
+	avg := 150.0
+	h.src.links = []store.Link{{Src: "a", Dst: "b", Sent: 60, Lost: 30, LossPct: 50, Avg: &avg},
+		{Src: "a", Dst: "void", Sent: 60, Lost: 60, LossPct: 100}}
+	h.step(0, func() { h.report("a", 1) })
+	m := h.n.msgs
+	if len(m) != 1 || strings.Count(m[0], "🔴 告警 loss") != 2 || strings.Contains(m[0], "rtt") ||
+		!strings.Contains(m[0], "a → void 丢包 100.0%") {
+		t.Fatalf("ping: %q", m)
+	}
+}
+
+func TestTrafficLevels(t *testing.T) {
+	h := setup(t, `  - {name: quota, metric: traffic, levels: [80, 90, 100]}`)
+	gb := int64(1 << 30)
+	use := func(start string, g int64) func() {
+		return func() {
+			h.report("a", 1)
+			h.report("b", 1) // no quota: skipped
+			h.src.status["a"].Traffic = &store.Period{Start: start, RX: g * gb / 2, TX: g * gb / 2}
+			h.src.status["b"].Traffic = &store.Period{Start: start, RX: 1 << 50}
+		}
+	}
+	h.step(0, use("2026-09-01", 50))
+	h.step(10*time.Second, use("2026-09-01", 85))
+	h.step(10*time.Second, use("2026-09-01", 86))
+	if h.msgs() != 1 || !strings.Contains(h.n.msgs[0], "达到配额 100.00 GB 的 85%") {
+		t.Fatalf("80%%: %q", h.n.msgs)
+	}
+	// Jumping past two levels sends one message for the highest.
+	h.step(10*time.Second, use("2026-09-01", 101))
+	if h.msgs() != 2 || h.src.events[1].Value != 100 {
+		t.Fatalf("100%%: %q", h.n.msgs)
+	}
+	// Survives a restart without repeating.
+	h.newEvaluator()
+	h.step(10*time.Second, use("2026-09-01", 102))
+	if h.msgs() != 2 {
+		t.Fatalf("repeated after restart: %q", h.n.msgs)
+	}
+	// New period re-arms.
+	h.step(10*time.Second, use("2026-10-01", 81))
+	if h.msgs() != 3 {
+		t.Fatalf("new period: %q", h.n.msgs)
+	}
+}
+
+func TestFiringSurvivesRestartAndRemovedRulesArePruned(t *testing.T) {
+	h := setup(t, `  - {name: cpu_high, metric: cpu, op: ">", threshold: 90}`)
+	h.step(0, func() { h.report("a", 95) })
+	h.src.states[key{"old_rule", "a", ""}] = store.AlertState{Rule: "old_rule", Node: "a", State: stateFiring}
+	h.newEvaluator()
+	if _, ok := h.src.states[key{"old_rule", "a", ""}]; ok {
+		t.Fatal("removed rule's state kept")
+	}
+	h.step(10*time.Second, func() { h.report("a", 95) })
+	if h.msgs() != 1 {
+		t.Fatalf("re-fired after restart: %q", h.n.msgs)
+	}
+	for i := 0; i < 1; i++ {
+		h.step(10*time.Second, func() { h.report("a", 5) })
+	}
+	if h.msgs() != 2 || !strings.HasPrefix(h.n.msgs[1], "🟢") {
+		t.Fatalf("recovery after restart: %q", h.n.msgs)
+	}
+}
+
+func TestMessageUsesConfiguredTimezone(t *testing.T) {
+	h := setup(t, `  - {name: cpu_high, metric: cpu, op: ">", threshold: 90}`)
+	h.step(0, func() { h.report("a", 95) })
+	// 12:00 UTC is 20:00 in Asia/Shanghai (the config default).
+	if !strings.Contains(h.n.msgs[0], "2026-09-30 20:00:00") {
+		t.Fatalf("time: %q", h.n.msgs[0])
+	}
+}
+
+func TestNoRecoveryMessageWhenDisabled(t *testing.T) {
+	h := setup(t, `  - {name: cpu_high, metric: cpu, op: ">", threshold: 90, notify_recovery: false}`)
+	h.step(0, func() { h.report("a", 95) })
+	h.step(10*time.Second, func() { h.report("a", 5) })
+	if h.msgs() != 1 || len(h.src.events) != 2 || h.src.events[1].Event != "recovered" {
+		t.Fatalf("msgs=%q events=%+v", h.n.msgs, h.src.events)
+	}
+}
+
+// Ticker jitter must not delay firing by a whole round.
+func TestTickJitter(t *testing.T) {
+	h := setup(t, `  - {name: cpu_high, metric: cpu, op: ">", threshold: 90, for: 20s}`)
+	hot := func() { h.report("a", 95) }
+	h.step(0, hot)
+	h.step(10*time.Second-time.Millisecond, hot)
+	h.step(10*time.Second-time.Millisecond, hot)
+	if h.msgs() != 1 {
+		t.Fatalf("did not fire at ~20s: %v", h.n.msgs)
+	}
+}

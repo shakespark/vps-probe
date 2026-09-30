@@ -1,0 +1,32 @@
+# vps-probe agent config. Install as /etc/vps-probe/agent.yml,
+# owner root:vps-probe, mode 0640 (it contains the token).
+
+# Node id: 1-32 chars of letters, digits, '.', '_', '-'. Must match the
+# server's node entry exactly.
+node: hk-1
+
+server:
+  addr: 203.0.113.1:9527    # server UDP address; a hostname also works
+  token: "<node token>"     # from `vps-probe-server gen-token`, same value on the server
+
+interval: 10s               # sampling / reporting interval
+state_dir: /var/lib/vps-probe
+
+# Mount points to report disk usage for.
+disks: ["/"]
+
+# Interfaces to count traffic on. Empty = auto-detect physical NICs.
+interfaces: []
+
+traffic:
+  timezone: Asia/Shanghai
+  reset_day: 1              # 1 = calendar month; e.g. 15 = resets on the 15th
+
+ping:
+  interval: 1s
+  timeout: 2s
+  # Peers are only ever configured here, never pushed from the server.
+  # Use the peer's node id (as in server.yml) as name, so the latency matrix lines up.
+  peers:
+    - { name: jp-1, addr: 203.0.113.5 }
+    - { name: us-1, addr: 198.51.100.7 }

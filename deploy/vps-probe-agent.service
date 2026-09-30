@@ -1,0 +1,55 @@
+[Unit]
+Description=VPS probe agent (push-only metrics, accepts no commands)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vps-probe-agent -config /etc/vps-probe/agent.yml
+Restart=always
+RestartSec=5
+# Gives the final traffic read + save time to finish on shutdown.
+TimeoutStopSec=15
+
+User=vps-probe
+Group=vps-probe
+StateDirectory=vps-probe
+StateDirectoryMode=0700
+UMask=0077
+
+# Hardening. The agent only reads /proc, /sys and statfs, sends UDP, and
+# writes its state directory.
+NoNewPrivileges=yes
+# ICMP uses unprivileged datagram sockets (net.ipv4.ping_group_range). If the
+# host doesn't allow that, change both lines below to CAP_NET_RAW.
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+# read-only rather than yes: statfs on a monitored mount under /home must see
+# the real filesystem, not an empty tmpfs.
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Never add PrivateNetwork: /proc/net/dev is per network namespace and the
+# agent would only see lo.
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,87 @@
+# vps-probe-server 配置。含全部节点的 token：
+#   chown root:vps-probe-server server.yml && chmod 640 server.yml
+# 其他用户可读或组可写时服务端拒绝启动。
+
+listen:
+  web: 127.0.0.1:8080       # 只给本机的 cloudflared 用，不要改成 0.0.0.0
+  ingest: ":9527"           # UDP，agent 上报，同时监听 IPv4/IPv6；防火墙只对各 VPS 的 IP 放行
+
+# 全部数据都在这一个文件里（停机后只剩它一个文件）。
+db: /var/lib/vps-probe-server/probe.db
+
+# 按日流量的日期划分，须与各 agent 的 traffic.timezone 一致。
+timezone: Asia/Shanghai
+
+nodes:
+  # id 与 agent 配置里的 node 一致；各 agent 的 ping.peers[].name 也写这个 id。
+  # token 用 `vps-probe-server gen-token` 生成，每台一个。
+  # addr：其他节点 ping 它用的地址；reset_day：流量周期起始日（默认 1）。
+  # 这两项只用于 `vps-probe-server agent-config` 生成 agent.yml。
+  - id: hk-1
+    name: 香港 1
+    token: "REPLACE-WITH-gen-token-OUTPUT-000000000"
+    traffic_quota_gb: 1000      # 可选，GB 按 1024³ 字节计；0 或不写表示不限
+    traffic_quota_mode: sum     # sum(收+发) | max(取大) | tx | rx
+    addr: 203.0.113.5
+  - id: jp-1
+    name: 日本 1
+    token: "REPLACE-WITH-ANOTHER-gen-token-OUTPUT-01"
+
+# 超过这么久没有新报文，页面上就显示离线，约为 agent interval 的 3 倍。
+# 离线告警由下面的 offline 规则决定（默认 60s），所以页面先变红、稍后才发告警，这是正常的。
+offline_after: 30s
+
+# 可选。不配置时告警照常评估并记录在页面上，只是不发送。
+# 配置后用 `vps-probe-server test-telegram` 发一条测试消息检查。
+# bot 只用来发消息，服务端不接收任何 Telegram 消息。
+# telegram:
+#   bot_token: "123456789:AA..."
+#   chat_id: 123456789          # 个人 chat id 或群组 id（负数），不用加引号
+
+# 可选，但接入 Cloudflare Access 后强烈建议打开：每个网页请求都必须带有效的
+# Access 令牌，否则 403。先确认经 Access 能正常登录访问，再加这段并重启（见 README 第 3 步）。
+# cf_access:
+#   team_domain: myteam.cloudflareaccess.com
+#   aud: "0123...（64 位十六进制 AUD tag）"
+
+# 告警规则，见 docs/DESIGN.md §7。整段不写 = 使用下面这组默认规则；写 `alerts: []` = 不告警。
+# metric: cpu | steal | load1 | mem | swap | disk | offline | ping_loss | ping_avg | traffic
+alerts:
+  - name: offline
+    metric: offline
+    for: 60s                  # 超过 60s 没有新报文
+  - name: cpu_high
+    metric: cpu
+    op: ">"
+    threshold: 90
+    for: 5m                   # 持续多久才告警
+    # nodes: [hk-1]           # 默认 all
+    # repeat: 1h              # 仍未恢复时每隔多久提醒一次，默认不提醒
+    # notify_recovery: false  # 默认恢复时也发消息
+  - name: mem_high
+    metric: mem
+    op: ">"
+    threshold: 90
+    for: 5m
+  - name: disk_full
+    metric: disk              # 每个挂载点分别评估
+    op: ">"
+    threshold: 90
+    for: 10m
+  - name: link_loss
+    metric: ping_loss         # 每条 (发起, 目标) 链路按最近 60s 汇总
+    op: ">"
+    threshold: 20
+    for: 3m
+  - name: traffic_quota
+    metric: traffic           # 只对设置了 traffic_quota_gb 的节点生效
+    levels: [80, 90, 100]     # 每个周期每档只提醒一次
+
+retention:
+  raw: 48h                  # 10s 原始数据
+  m5: 30d                   # 5 分钟聚合
+  h1: 400d                  # 1 小时聚合
+
+backup:
+  dir: /var/lib/vps-probe-server/backups
+  keep: 7                   # 每天 04:00 后备份一份；0 表示关闭
