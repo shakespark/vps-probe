@@ -39,6 +39,7 @@ interfaces: [eth0]
 traffic:
   timezone: UTC
   reset_day: 15
+  reset_time: "18:21"
 ping:
   interval: 500ms
   timeout: 1s
@@ -49,7 +50,7 @@ ping:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Interval != 5*time.Second || c.Traffic.ResetDay != 15 || len(c.Ping.Peers) != 2 || c.Interfaces[0] != "eth0" {
+	if c.Interval != 5*time.Second || c.Traffic.ResetDay != 15 || c.Traffic.ResetHour != 18 || c.Traffic.ResetMinute != 21 || len(c.Ping.Peers) != 2 || c.Interfaces[0] != "eth0" {
 		t.Fatalf("got %+v", c)
 	}
 }
@@ -61,6 +62,8 @@ func TestErrors(t *testing.T) {
 		"short token":     strings.Replace(minimal, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG", "short", 1),
 		"no port":         strings.Replace(minimal, "203.0.113.1:9527", "203.0.113.1", 1),
 		"reset day":       minimal + "traffic:\n  reset_day: 32\n",
+		"reset time":      minimal + "traffic:\n  reset_time: \"24:00\"\n",
+		"reset time fmt":  minimal + "traffic:\n  reset_time: 18h21m\n",
 		"timezone":        minimal + "traffic:\n  timezone: Mars/Olympus\n",
 		"relative disk":   minimal + "disks: [data]\n",
 		"timeout too big": minimal + "ping:\n  timeout: 30s\n",

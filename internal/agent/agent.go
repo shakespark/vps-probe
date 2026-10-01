@@ -70,14 +70,15 @@ func New(cfg *config.Config, sink Sink, version string, dryRun bool, log *slog.L
 		return nil, err
 	}
 	statePath := filepath.Join(cfg.StateDir, stateFile)
+	reset := traffic.Reset{Day: cfg.Traffic.ResetDay, Hour: cfg.Traffic.ResetHour, Minute: cfg.Traffic.ResetMinute}
 	if dryRun {
-		a.acct, err = traffic.OpenReadOnly(statePath, cfg.Traffic.Location, cfg.Traffic.ResetDay, log)
+		a.acct, err = traffic.OpenReadOnly(statePath, cfg.Traffic.Location, reset, log)
 	} else {
 		// Two writers would overwrite each other's increments.
 		if a.lock, err = lockFile(statePath + ".lock"); err != nil {
 			return nil, err
 		}
-		a.acct, err = traffic.Open(statePath, cfg.Traffic.Location, cfg.Traffic.ResetDay, log)
+		a.acct, err = traffic.Open(statePath, cfg.Traffic.Location, reset, log)
 	}
 	if err != nil {
 		return nil, err
@@ -114,7 +115,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	a.log.Info("agent started", "node", a.cfg.Node, "server", a.cfg.Server.Addr,
 		"interval", a.cfg.Interval, "interfaces", a.ifaces, "peers", len(a.cfg.Ping.Peers),
-		"period_reset_day", a.cfg.Traffic.ResetDay, "timezone", a.cfg.Traffic.Location)
+		"period_reset_day", a.cfg.Traffic.ResetDay,
+		"period_reset_time", fmt.Sprintf("%02d:%02d", a.cfg.Traffic.ResetHour, a.cfg.Traffic.ResetMinute), "timezone", a.cfg.Traffic.Location)
 
 	for {
 		now := time.Now()

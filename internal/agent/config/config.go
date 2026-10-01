@@ -34,10 +34,13 @@ type Server struct {
 }
 
 type Traffic struct {
-	Timezone string `yaml:"timezone"`
-	ResetDay int    `yaml:"reset_day"`
+	Timezone  string `yaml:"timezone"`
+	ResetDay  int    `yaml:"reset_day"`
+	ResetTime string `yaml:"reset_time"` // HH:MM, default 00:00
 
-	Location *time.Location `yaml:"-"`
+	Location    *time.Location `yaml:"-"`
+	ResetHour   int            `yaml:"-"`
+	ResetMinute int            `yaml:"-"`
 }
 
 type Ping struct {
@@ -113,6 +116,13 @@ func (c *Config) validate() error {
 
 	if c.Traffic.ResetDay < 1 || c.Traffic.ResetDay > 31 {
 		bad("traffic.reset_day %d: must be 1-31", c.Traffic.ResetDay)
+	}
+	if c.Traffic.ResetTime != "" {
+		t, err := time.Parse("15:04", c.Traffic.ResetTime)
+		if err != nil {
+			bad("traffic.reset_time %q: want HH:MM (24-hour)", c.Traffic.ResetTime)
+		}
+		c.Traffic.ResetHour, c.Traffic.ResetMinute = t.Hour(), t.Minute()
 	}
 	loc, err := time.LoadLocation(c.Traffic.Timezone)
 	if err != nil {

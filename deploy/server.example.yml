@@ -15,7 +15,8 @@ timezone: Asia/Shanghai
 nodes:
   # id 与 agent 配置里的 node 一致；各 agent 的 ping.peers[].name 也写这个 id。
   # token 用 `vps-probe-server gen-token` 生成，每台一个。
-  # addr：其他节点 ping 它用的地址；reset_day：流量周期起始日（默认 1）。
+  # addr：其他节点 ping 它用的地址；reset_day：流量周期起始日（默认 1）；
+  # reset_time：周期在当天几点开始（"HH:MM"，默认 00:00，按 timezone 计）。
   # 这两项只用于 `vps-probe-server agent-config` 生成 agent.yml。
   - id: hk-1
     name: 香港 1

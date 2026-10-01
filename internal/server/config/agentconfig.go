@@ -26,6 +26,9 @@ func (c *Config) AgentConfig(id, serverAddr string) (string, error) {
 	fmt.Fprintf(&b, "interval: 10s\nstate_dir: /var/lib/vps-probe\ndisks: [\"/\"]\n")
 	fmt.Fprintf(&b, "interfaces: []            # empty = auto-detect physical NICs\n")
 	fmt.Fprintf(&b, "traffic:\n  timezone: %q   # must match the server's timezone\n  reset_day: %d\n", c.Timezone, n.ResetDay)
+	if n.ResetTime != "" {
+		fmt.Fprintf(&b, "  reset_time: %q\n", n.ResetTime)
+	}
 	fmt.Fprintf(&b, "ping:\n  interval: 1s\n  timeout: 2s\n")
 	var peers, missing []string
 	for _, p := range c.Nodes {

@@ -79,7 +79,7 @@ type state struct {
 type Accountant struct {
 	path     string
 	loc      *time.Location
-	resetDay int
+	reset    Reset
 	log      *slog.Logger
 	readOnly bool
 
@@ -94,25 +94,28 @@ type Accountant struct {
 // Open loads the state file at path, creating an empty state if it doesn't
 // exist. A file that can't be parsed is moved aside (never deleted) and
 // accounting starts fresh.
-func Open(path string, loc *time.Location, resetDay int, log *slog.Logger) (*Accountant, error) {
-	return load(path, loc, resetDay, log, false)
+func Open(path string, loc *time.Location, reset Reset, log *slog.Logger) (*Accountant, error) {
+	return load(path, loc, reset, log, false)
 }
 
 // OpenReadOnly loads the state like Open but never modifies the file: a
 // corrupt file is left in place and Save is a no-op. Used by dry runs, which
 // must not race the real agent's increments or leave a root-owned file behind.
-func OpenReadOnly(path string, loc *time.Location, resetDay int, log *slog.Logger) (*Accountant, error) {
-	return load(path, loc, resetDay, log, true)
+func OpenReadOnly(path string, loc *time.Location, reset Reset, log *slog.Logger) (*Accountant, error) {
+	return load(path, loc, reset, log, true)
 }
 
-func load(path string, loc *time.Location, resetDay int, log *slog.Logger, readOnly bool) (*Accountant, error) {
-	if resetDay < 1 || resetDay > 31 {
-		return nil, fmt.Errorf("traffic: reset_day %d out of range 1-31", resetDay)
+func load(path string, loc *time.Location, reset Reset, log *slog.Logger, readOnly bool) (*Accountant, error) {
+	if reset.Day < 1 || reset.Day > 31 {
+		return nil, fmt.Errorf("traffic: reset_day %d out of range 1-31", reset.Day)
+	}
+	if reset.Hour < 0 || reset.Hour > 23 || reset.Minute < 0 || reset.Minute > 59 {
+		return nil, fmt.Errorf("traffic: reset time %02d:%02d out of range", reset.Hour, reset.Minute)
 	}
 	a := &Accountant{
 		path:     path,
 		loc:      loc,
-		resetDay: resetDay,
+		reset:    reset,
 		log:      log,
 		readOnly: readOnly,
 		st:       state{Version: stateVersion, Interfaces: map[string]*ifaceState{}},
@@ -165,7 +168,7 @@ func (a *Accountant) Update(s Sample) error {
 	if s.BootID == "" {
 		return errors.New("traffic: empty boot id")
 	}
-	periodStart := PeriodStart(s.Time, a.loc, a.resetDay)
+	periodStart := PeriodStart(s.Time, a.loc, a.reset)
 	key := PeriodKey(periodStart)
 
 	a.mu.Lock()
@@ -230,9 +233,9 @@ func prune(p map[string]*Totals) {
 // in either period. The latter keeps a month's traffic visible when an
 // interface disappears or is renamed mid-period.
 func (a *Accountant) Snapshot(now time.Time, monitored []string) []IfaceTotals {
-	curStart := PeriodStart(now, a.loc, a.resetDay)
+	curStart := PeriodStart(now, a.loc, a.reset)
 	curKey := PeriodKey(curStart)
-	prevKey := PeriodKey(PrevPeriodStart(curStart, a.loc, a.resetDay))
+	prevKey := PeriodKey(PrevPeriodStart(curStart, a.loc, a.reset))
 
 	a.mu.Lock()
 	defer a.mu.Unlock()

@@ -27,7 +27,12 @@ func at(s string) time.Time {
 
 func open(t *testing.T, path string, resetDay int) *Accountant {
 	t.Helper()
-	a, err := Open(path, sh, resetDay, discard)
+	return openReset(t, path, Reset{Day: resetDay})
+}
+
+func openReset(t *testing.T, path string, r Reset) *Accountant {
+	t.Helper()
+	a, err := Open(path, sh, r, discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +162,19 @@ func TestResetDay(t *testing.T) {
 		t.Fatalf("cur: %+v", snap)
 	}
 	if snap.PrevStart != "2026-08-15" || snap.Prev.RX != 1000 {
+		t.Fatalf("prev: %+v", snap)
+	}
+}
+
+func TestResetTime(t *testing.T) {
+	a := openReset(t, filepath.Join(t.TempDir(), "s.json"), Reset{Day: 21, Hour: 18, Minute: 21})
+	mustUpdate(t, a, sample("2026-10-21 18:20:50", "b1", "2026-10-01 00:00:00", 1000, 0))
+	mustUpdate(t, a, sample("2026-10-21 18:21:00", "b1", "2026-10-01 00:00:00", 1200, 0))
+	snap := a.Snapshot(at("2026-10-21 18:21:00"), []string{"eth0"})[0]
+	if snap.CurStart != "2026-10-21" || snap.Cur.RX != 200 {
+		t.Fatalf("cur: %+v", snap)
+	}
+	if snap.PrevStart != "2026-09-21" || snap.Prev.RX != 1000 {
 		t.Fatalf("prev: %+v", snap)
 	}
 }
@@ -410,8 +428,13 @@ func TestConcurrentUpdateAndSave(t *testing.T) {
 
 func TestOpenRejectsBadResetDay(t *testing.T) {
 	for _, d := range []int{0, 32, -1} {
-		if _, err := Open(filepath.Join(t.TempDir(), "s.json"), sh, d, discard); err == nil {
+		if _, err := Open(filepath.Join(t.TempDir(), "s.json"), sh, Reset{Day: d}, discard); err == nil {
 			t.Errorf("reset_day %d accepted", d)
+		}
+	}
+	for _, r := range []Reset{{Day: 1, Hour: 24}, {Day: 1, Minute: 60}, {Day: 1, Hour: -1}} {
+		if _, err := Open(filepath.Join(t.TempDir(), "s.json"), sh, r, discard); err == nil {
+			t.Errorf("reset %+v accepted", r)
 		}
 	}
 }
@@ -426,7 +449,7 @@ func TestReadOnlyNeverWrites(t *testing.T) {
 	}
 	before, _ := os.ReadFile(path)
 
-	ro, err := OpenReadOnly(path, sh, 1, discard)
+	ro, err := OpenReadOnly(path, sh, Reset{Day: 1}, discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +470,7 @@ func TestReadOnlyNeverWrites(t *testing.T) {
 
 	// A corrupt file is left in place.
 	os.WriteFile(path, []byte("{broken"), 0o600)
-	if _, err := OpenReadOnly(path, sh, 1, discard); err != nil {
+	if _, err := OpenReadOnly(path, sh, Reset{Day: 1}, discard); err != nil {
 		t.Fatal(err)
 	}
 	if data, _ := os.ReadFile(path); string(data) != "{broken" {

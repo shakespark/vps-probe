@@ -10,7 +10,7 @@ import (
 func TestAgentConfigRoundTrip(t *testing.T) {
 	c, err := Parse([]byte(`
 nodes:
-  - {id: hk-1, token: ` + tokA + `, addr: 203.0.113.5, reset_day: 15}
+  - {id: hk-1, token: ` + tokA + `, addr: 203.0.113.5, reset_day: 15, reset_time: "8:05"}
   - {id: jp-1, token: ` + tokB + `, addr: jp.example.com}
   - {id: us-1, token: cdefghijklmnopqrstuvwxyz0123456789ab}
 `))
@@ -25,7 +25,7 @@ nodes:
 	if err != nil {
 		t.Fatalf("generated config does not load: %v\n%s", err, out)
 	}
-	if a.Node != "hk-1" || a.Server.Token != tokA || a.Server.Addr != "198.51.100.1:9527" || a.Traffic.ResetDay != 15 {
+	if a.Node != "hk-1" || a.Server.Token != tokA || a.Server.Addr != "198.51.100.1:9527" || a.Traffic.ResetDay != 15 || a.Traffic.ResetHour != 8 || a.Traffic.ResetMinute != 5 {
 		t.Fatalf("got %+v", a)
 	}
 	if len(a.Ping.Peers) != 1 || a.Ping.Peers[0].Name != "jp-1" || a.Ping.Peers[0].Addr != "jp.example.com" {

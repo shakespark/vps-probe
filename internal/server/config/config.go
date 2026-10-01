@@ -50,10 +50,12 @@ type Node struct {
 	QuotaGB   float64 `yaml:"traffic_quota_gb"`
 	QuotaMode string  `yaml:"traffic_quota_mode"` // sum | max | tx | rx
 	// Only used by agent-config: the address other agents ping, and this
-	// node's traffic reset day. The agent's own file stays authoritative.
+	// node's traffic reset day and time. The agent's own file stays
+	// authoritative.
 	Addr       string `yaml:"addr"`
 	ResetDay   int    `yaml:"reset_day"`
-	DisplayIdx int    `yaml:"-"` // position in the file
+	ResetTime  string `yaml:"reset_time"` // HH:MM, default 00:00
+	DisplayIdx int    `yaml:"-"`          // position in the file
 }
 
 type Retention struct {
@@ -309,6 +311,13 @@ func (c *Config) validate() error {
 		}
 		if n.ResetDay < 1 || n.ResetDay > 31 {
 			bad("nodes[%s].reset_day: must be 1-31", n.ID)
+		}
+		if n.ResetTime != "" {
+			if t, err := time.Parse("15:04", n.ResetTime); err != nil {
+				bad("nodes[%s].reset_time %q: want HH:MM (24-hour)", n.ID, n.ResetTime)
+			} else {
+				n.ResetTime = t.Format("15:04")
+			}
 		}
 		if n.QuotaGB < 0 {
 			bad("nodes[%s].traffic_quota_gb: must not be negative", n.ID)

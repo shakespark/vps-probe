@@ -175,6 +175,7 @@ agent 停止前会把流量最后读一次并保存，升级不会丢月流量�
 | 时延矩阵里对不上 | agent 的 `ping.peers[].name` 要写对端的节点 id；用 `agent-config` 生成的配置自动满足 |
 | agent 起不来：`no physical network interface detected` | 在 agent.yml 写 `interfaces: [网卡名]` |
 | ping 全部丢包、日志 `ping disabled` | `install.sh` 会自动处理 ICMP 权限；手动安装时见第 4 步说明 |
+| 改了 `reset_day` / `reset_time` 后流量页显示的周期不对 | 旧起始日期的周期记录还在服务端。停服务端后删掉它：`DELETE FROM traffic_period WHERE node=(SELECT id FROM nodes WHERE name='节点id') AND start='旧日期'`，`traffic_daily` 同理，再启动 |
 
 ## 附录：开发
 

@@ -21,6 +21,7 @@ interfaces: []
 traffic:
   timezone: Asia/Shanghai
   reset_day: 1              # 1 = calendar month; e.g. 15 = resets on the 15th
+  # reset_time: "18:21"     # optional time of day the period starts (default 00:00)
 
 ping:
   interval: 1s
