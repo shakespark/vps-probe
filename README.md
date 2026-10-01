@@ -102,6 +102,7 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
 - 如果系统的 `net.ipv4.ping_group_range` 不允许普通用户 ping，`install.sh` 会只给 agent 服务加 `CAP_NET_RAW`（`/etc/systemd/system/vps-probe-agent.service.d/icmp.conf`），不改系统设置。
 - 默认自动识别物理网卡（有 `/sys/class/net/<网卡>/device` 的）。识别不到时在 agent.yml 里写 `interfaces: [eth0]`。
 - 新增节点后，想让已有节点也 ping 它：给这些节点重新生成 agent.yml，再各自 `./install.sh agent --config ...`。
+- 某些节点之间不想互 ping：在其中一方写 `no_ping: [对方 id, ...]`（双向生效），然后给涉及的节点重新生成 agent.yml 并安装。
 - 服务端那台机器本身也可以装 agent，`-server` 写 `127.0.0.1:9527` 即可。
 
 ## 5. 告警与 Telegram

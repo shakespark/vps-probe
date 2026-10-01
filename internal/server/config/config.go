@@ -52,10 +52,12 @@ type Node struct {
 	// Only used by agent-config: the address other agents ping, and this
 	// node's traffic reset day and time. The agent's own file stays
 	// authoritative.
-	Addr       string `yaml:"addr"`
-	ResetDay   int    `yaml:"reset_day"`
-	ResetTime  string `yaml:"reset_time"` // HH:MM, default 00:00
-	DisplayIdx int    `yaml:"-"`          // position in the file
+	Addr      string `yaml:"addr"`
+	ResetDay  int    `yaml:"reset_day"`
+	ResetTime string `yaml:"reset_time"` // HH:MM, default 00:00
+	// Node ids this node and those nodes don't ping, in either direction.
+	NoPing     []string `yaml:"no_ping"`
+	DisplayIdx int      `yaml:"-"` // position in the file
 }
 
 type Retention struct {
@@ -330,6 +332,21 @@ func (c *Config) validate() error {
 		}
 	}
 
+	for _, n := range c.Nodes {
+		seen := map[string]bool{}
+		for _, p := range n.NoPing {
+			switch {
+			case !ids[p]:
+				bad("nodes[%s].no_ping: %q is not a node id", n.ID, p)
+			case p == n.ID:
+				bad("nodes[%s].no_ping: lists the node itself", n.ID)
+			case seen[p]:
+				bad("nodes[%s].no_ping: %q listed twice", n.ID, p)
+			}
+			seen[p] = true
+		}
+	}
+
 	if time.Duration(c.OfflineAfter) < 5*time.Second {
 		bad("offline_after: must be at least 5s")
 	}
@@ -446,4 +463,12 @@ func (c *Config) Node(id string) (*Node, bool) {
 		}
 	}
 	return nil, false
+}
+
+// NoPing reports whether a and b must not ping each other: either one
+// lists the other in no_ping.
+func (c *Config) NoPing(a, b string) bool {
+	na, okA := c.Node(a)
+	nb, okB := c.Node(b)
+	return okA && slices.Contains(na.NoPing, b) || okB && slices.Contains(nb.NoPing, a)
 }

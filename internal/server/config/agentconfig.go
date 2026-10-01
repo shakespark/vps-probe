@@ -7,7 +7,7 @@ import (
 )
 
 // AgentConfig renders agent.yml for one node: its token, and every other
-// node that has an addr as a ping peer. The result is a local file for the
+// node that has an addr as a ping peer, except those paired by no_ping. The result is a local file for the
 // agent; nothing is ever pushed to agents.
 func (c *Config) AgentConfig(id, serverAddr string) (string, error) {
 	n, ok := c.Node(id)
@@ -30,10 +30,12 @@ func (c *Config) AgentConfig(id, serverAddr string) (string, error) {
 		fmt.Fprintf(&b, "  reset_time: %q\n", n.ResetTime)
 	}
 	fmt.Fprintf(&b, "ping:\n  interval: 1s\n  timeout: 2s\n")
-	var peers, missing []string
+	var peers, missing, skipped []string
 	for _, p := range c.Nodes {
 		switch {
 		case p.ID == id:
+		case c.NoPing(id, p.ID):
+			skipped = append(skipped, p.ID)
 		case p.Addr == "":
 			missing = append(missing, p.ID)
 		default:
@@ -47,6 +49,9 @@ func (c *Config) AgentConfig(id, serverAddr string) (string, error) {
 	}
 	if len(missing) > 0 {
 		fmt.Fprintf(&b, "  # Not pinged (no addr in server.yml): %s\n", strings.Join(missing, ", "))
+	}
+	if len(skipped) > 0 {
+		fmt.Fprintf(&b, "  # Not pinged (no_ping in server.yml): %s\n", strings.Join(skipped, ", "))
 	}
 	return b.String(), nil
 }

@@ -302,7 +302,7 @@ backup:
 - 启动时不等待公钥：取到之前所有请求都 403，后台每 30s 重试（fail closed）。
 - 拒绝原因按类别限频写日志。开启后在服务器上直接 `curl 127.0.0.1:8080` 也会 403，属预期。
 
-节点的 `addr`（其他节点 ping 它的地址）、`reset_day` 和 `reset_time` 只供 `vps-probe-server agent-config` 生成 agent.yml 使用；agent 自己的配置文件仍是唯一依据，agent 不从服务端获取任何配置。
+节点的 `addr`（其他节点 ping 它的地址）、`no_ping`（与哪些节点互不 ping，双向生效）、`reset_day` 和 `reset_time` 只供 `vps-probe-server agent-config` 生成 agent.yml 使用；agent 自己的配置文件仍是唯一依据，agent 不从服务端获取任何配置。
 
 提供 `vps-probe-server gen-token` 子命令：生成 32 字节随机 token（base64url），同一个值同时填进 agent 和服务端配置。服务端启动时检查配置文件权限：其他用户可读或组可写则拒绝启动。推荐 `root:vps-probe-server 0640`，服务能读但不能改。
 

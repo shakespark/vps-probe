@@ -54,3 +54,45 @@ func TestBadAddr(t *testing.T) {
 		}
 	}
 }
+
+func TestNoPing(t *testing.T) {
+	c, err := Parse([]byte(`
+nodes:
+  - {id: a, token: ` + tokA + `, addr: a.example.com, no_ping: [c]}
+  - {id: b, token: ` + tokB + `, addr: b.example.com}
+  - {id: c, token: cdefghijklmnopqrstuvwxyz0123456789ab, addr: c.example.com}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	peers := func(id string) (names []string, out string) {
+		out, err := c.AgentConfig(id, "198.51.100.1:9527")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, err := agentconfig.Parse([]byte(out))
+		if err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		for _, p := range a.Ping.Peers {
+			names = append(names, p.Name)
+		}
+		return names, out
+	}
+	// Both directions are dropped, other pairs are kept.
+	for id, want := range map[string]string{"a": "b", "b": "a,c", "c": "b"} {
+		got, out := peers(id)
+		if strings.Join(got, ",") != want {
+			t.Errorf("%s pings %v, want %s", id, got, want)
+		}
+		if id != "b" && !strings.Contains(out, "Not pinged (no_ping in server.yml): ") {
+			t.Errorf("%s: no no_ping note:\n%s", id, out)
+		}
+	}
+
+	for _, np := range []string{"[x]", "[a]", "[b, b]"} {
+		if _, err := Parse([]byte("nodes:\n  - {id: a, token: " + tokA + ", no_ping: " + np + "}\n  - {id: b, token: " + tokB + "}\n")); err == nil {
+			t.Errorf("no_ping %s accepted", np)
+		}
+	}
+}
