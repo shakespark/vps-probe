@@ -414,6 +414,7 @@ alerts:
   - cpu、steal、load1、mem、swap 取最新一条；disk 按挂载点分别评估；
   - ping_loss、ping_avg 按 (src, dst) 链路取最近 60s 的汇总（单个 10s 样本只有 10 个包，太抖）；
   - offline = 超过 `for` 没有新鲜报文（从未上报的节点也算），不经过 pending；
+  - 目标节点已离线（超过 `offline_after` 没有新鲜报文）且有 offline 规则覆盖它时，指向它的链路不评估 ping_loss / ping_avg：节点宕机时其他节点必然全部 ping 不通，离线告警已经说明了，不再每条链路各报一次。目标还在上报、只是 ping 不通时照常告警；没有 offline 规则覆盖的目标也照常告警。
   - traffic 按节点的 `traffic_quota_mode` 计算已用量，没设配额的节点跳过；状态按 (规则, 节点, 周期起始) 记录，每个周期每个档位只提醒一次，下个周期自动重新计。
 - **数据缺失**（节点离线、没有对应数据）时：firing 的告警保持不动，不发恢复；pending 的归零。
 - 服务端启动后的前 2 分钟不评估 offline，避免服务端重启时误报所有节点离线。

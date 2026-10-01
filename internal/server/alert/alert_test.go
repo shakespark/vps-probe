@@ -257,6 +257,65 @@ func TestPingLoss(t *testing.T) {
 	}
 }
 
+func TestLinksToOfflineNodeDoNotAlert(t *testing.T) {
+	h := setup(t, `  - {name: offline, metric: offline, for: 1m}
+  - {name: loss, metric: ping_loss, op: ">", threshold: 20, for: 3m}`)
+	loss := func(pct float64) { h.src.links = []store.Link{{Src: "a", Dst: "b", Sent: 60, LossPct: pct}} }
+	both := func() { h.report("a", 1); h.report("b", 1) }
+	run := func(d time.Duration, report func()) {
+		for i := time.Duration(0); i < d; i += 10 * time.Second {
+			h.step(10*time.Second, report)
+		}
+	}
+	loss(0)
+	run(3*time.Minute, both) // past the startup grace
+
+	// b dies: a loses every ping to it, but only the offline alert is sent.
+	loss(100)
+	run(10*time.Minute, func() { h.report("a", 1) })
+	if h.msgs() != 1 || !strings.Contains(h.n.msgs[0], "🔴 告警 offline · b") {
+		t.Fatalf("b down: %q", h.n.msgs)
+	}
+	// b is back; the 60s loss window still holds the outage for a while.
+	loss(50)
+	run(time.Minute, both)
+	loss(0)
+	run(5*time.Minute, both)
+	if h.msgs() != 2 || !strings.HasPrefix(h.n.msgs[1], "🟢 恢复在线 offline · b") {
+		t.Fatalf("b back: %q", h.n.msgs)
+	}
+
+	// b reports but can't be pinged: that is worth an alert.
+	loss(100)
+	run(3*time.Minute+10*time.Second, both) // pending starts on the first round
+	if h.msgs() != 3 || !strings.Contains(h.n.msgs[2], "🔴 告警 loss · 香港（a）\na → b 丢包 100.0%") {
+		t.Fatalf("b unreachable: %q", h.n.msgs)
+	}
+	// Then b dies too: the link alert holds, no recovery and no repeat.
+	run(5*time.Minute, func() { h.report("a", 1) })
+	if h.msgs() != 4 || !strings.Contains(h.n.msgs[3], "🔴 告警 offline · b") {
+		t.Fatalf("b down while link firing: %q", h.n.msgs)
+	}
+	loss(0)
+	run(2*time.Minute, both)
+	if h.msgs() != 6 || !strings.Contains(h.n.msgs[4], "🟢 恢复在线 offline · b") ||
+		!strings.Contains(h.n.msgs[5], "🟢 恢复 loss · 香港（a）") {
+		t.Fatalf("all clear: %q", h.n.msgs)
+	}
+}
+
+func TestLinksToNodeWithoutOfflineRuleStillAlert(t *testing.T) {
+	h := setup(t, `  - {name: offline, metric: offline, for: 1m, nodes: [a]}
+  - {name: loss, metric: ping_loss, op: ">", threshold: 20, for: 3m}`)
+	h.src.links = []store.Link{{Src: "a", Dst: "b", Sent: 60, LossPct: 100}}
+	for i := 0; i < 19; i++ {
+		h.step(10*time.Second, func() { h.report("a", 1) })
+	}
+	if h.msgs() != 1 || !strings.Contains(h.n.msgs[0], "a → b 丢包 100.0%") {
+		t.Fatalf("b has no offline rule, the link must alert: %q", h.n.msgs)
+	}
+}
+
 func TestTrafficLevels(t *testing.T) {
 	h := setup(t, `  - {name: quota, metric: traffic, levels: [80, 90, 100]}`)
 	gb := int64(1 << 30)

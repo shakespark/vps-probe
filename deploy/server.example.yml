@@ -71,6 +71,7 @@ alerts:
     for: 10m
   - name: link_loss
     metric: ping_loss         # 每条 (发起, 目标) 链路按最近 60s 汇总
+                              # 目标节点离线时不报（离线告警已覆盖）
     op: ">"
     threshold: 20
     for: 3m

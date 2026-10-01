@@ -387,7 +387,7 @@ func (e *Evaluator) observe(r *config.Rule, snap *snapshot, now time.Time) []obs
 			}
 		case config.MetricPingLoss, config.MetricPingAvg:
 			for _, l := range snap.links {
-				if l.Src != n.ID || l.Sent == 0 {
+				if l.Src != n.ID || l.Sent == 0 || e.reportedDown(l.Dst, snap, now) {
 					continue
 				}
 				label := fmt.Sprintf("%s → %s", n.ID, l.Dst)
@@ -400,6 +400,25 @@ func (e *Evaluator) observe(r *config.Rule, snap *snapshot, now time.Time) []obs
 		}
 	}
 	return out
+}
+
+// reportedDown is true when dst is offline and an offline rule covers it.
+// Every link to a dead node loses all its pings; the offline alert already
+// says so, and one alert per peer would only repeat it. A target that still
+// reports but can't be pinged is not down here, so those links alert.
+func (e *Evaluator) reportedDown(dst string, snap *snapshot, now time.Time) bool {
+	if _, ok := e.cfg.Node(dst); !ok {
+		return false
+	}
+	if st := snap.status[dst]; st != nil && now.Sub(time.Unix(st.FreshAt, 0)) <= time.Duration(e.cfg.OfflineAfter) {
+		return false
+	}
+	for i := range e.cfg.Alerts {
+		if r := &e.cfg.Alerts[i]; r.Metric == config.MetricOffline && r.Nodes.Has(dst) {
+			return true
+		}
+	}
+	return false
 }
 
 // traffic notifies once per period when usage crosses a quota level.
