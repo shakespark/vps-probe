@@ -426,3 +426,34 @@ func TestAvailability(t *testing.T) {
 		t.Fatalf("dead link: %+v", v)
 	}
 }
+
+// Sockets and threads (agent >= 0.1.9) merge into the metrics row, roll up,
+// and are null for older agents.
+func TestSocketsAndThreads(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().Truncate(time.Hour).Add(-2 * time.Hour)
+	for i, ts := 0, now.Unix(); ts < now.Add(5*time.Minute).Unix(); i, ts = i+1, ts+10 {
+		// Split pieces: CPU in one, the rest in another.
+		write(t, s, "a", &pb.Report{Ts: ts, Cpu: &pb.CPU{Usage: 1}}, time.Unix(ts, 0))
+		write(t, s, "a", &pb.Report{Ts: ts, Load: &pb.Load{L1: 1, Threads: uint32(300 + i)},
+			Sockets: &pb.Sockets{Tcp: uint32(40 + i%2*20), Udp: 7, TcpTw: 3}}, time.Unix(ts, 0))
+		write(t, s, "b", &pb.Report{Ts: ts, Cpu: &pb.CPU{Usage: 1}, Load: &pb.Load{L1: 1}}, time.Unix(ts, 0)) // old agent
+	}
+	st, err := s.Status(ctx, "a")
+	if err != nil || st.TCP == nil || *st.TCP != 60 || *st.UDP != 7 || *st.TCPTW != 3 || *st.Threads != 329 || st.CPU == nil {
+		t.Fatalf("status a: %+v %v", st, err)
+	}
+	if st, _ := s.Status(ctx, "b"); st.TCP != nil || st.Threads != nil {
+		t.Fatalf("old agent: tcp %v threads %v", st.TCP, st.Threads)
+	}
+	if err := s.Rollup(now); err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.Metrics(ctx, "a", now.Unix(), now.Add(7*24*time.Hour).Unix()) // 5m tier
+	if err != nil || m.Tier != "5m" || len(m.TS) != 1 {
+		t.Fatalf("5m: %+v %v", m, err)
+	}
+	if *m.Cols["tcp"][0] != 50 || *m.Cols["tcp_max"][0] != 60 || *m.Cols["threads_max"][0] != 329 || *m.Cols["tcp_tw"][0] != 3 {
+		t.Fatalf("rollup: tcp %v max %v threads_max %v", *m.Cols["tcp"][0], *m.Cols["tcp_max"][0], *m.Cols["threads_max"][0])
+	}
+}

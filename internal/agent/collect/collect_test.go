@@ -115,6 +115,9 @@ func fixtureFS(t *testing.T) FS {
 	write(filepath.Join(fs.Proc, "loadavg"), "0.50 0.25 0.10 1/234 5678\n")
 	write(filepath.Join(fs.Proc, "uptime"), "12345.67 45678.90\n")
 	write(filepath.Join(fs.Proc, "net", "dev"), netDevFixture)
+	write(filepath.Join(fs.Proc, "net", "sockstat"), "sockets: used 418\nTCP: inuse 27 orphan 0 tw 5 alloc 58 mem 0\n"+
+		"UDP: inuse 8 mem 1023\nUDPLITE: inuse 0\nRAW: inuse 0\nFRAG: inuse 0 memory 0\n")
+	write(filepath.Join(fs.Proc, "net", "sockstat6"), "TCP6: inuse 3\nUDP6: inuse 1\nUDPLITE6: inuse 0\nRAW6: inuse 0\nFRAG6: inuse 0 memory 0\n")
 	write(filepath.Join(fs.Proc, "sys", "kernel", "random", "boot_id"), "3f2a1c9e-0000-4000-8000-000000000001\n")
 	write(filepath.Join(fs.Proc, "sys", "kernel", "osrelease"), "6.1.0-test\n")
 	write(filepath.Join(fs.Etc, "os-release"), "NAME=\"Debian GNU/Linux\"\nPRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n")
@@ -135,8 +138,20 @@ func fixtureFS(t *testing.T) FS {
 func TestFixtureReads(t *testing.T) {
 	fs := fixtureFS(t)
 
-	if l, err := fs.ReadLoad(); err != nil || l != (Load{0.5, 0.25, 0.1}) {
+	if l, err := fs.ReadLoad(); err != nil || l != (Load{0.5, 0.25, 0.1, 234}) {
 		t.Fatalf("load = %+v, %v", l, err)
+	}
+	if k, err := fs.ReadSockets(); err != nil || k != (Sockets{TCP: 30, UDP: 9, TCPTimeWait: 5}) {
+		t.Fatalf("sockets = %+v, %v", k, err)
+	}
+	// IPv6 disabled: no sockstat6.
+	os.Remove(filepath.Join(fs.Proc, "net", "sockstat6"))
+	if k, err := fs.ReadSockets(); err != nil || k != (Sockets{TCP: 27, UDP: 8, TCPTimeWait: 5}) {
+		t.Fatalf("sockets without IPv6 = %+v, %v", k, err)
+	}
+	os.WriteFile(filepath.Join(fs.Proc, "net", "sockstat"), []byte("sockets: used 1\n"), 0o644)
+	if _, err := fs.ReadSockets(); err == nil {
+		t.Fatal("truncated sockstat accepted")
 	}
 	if bt, err := fs.BootTime(); err != nil || !bt.Equal(time.Unix(1790000000, 0)) {
 		t.Fatalf("boot time = %v, %v", bt, err)
@@ -194,5 +209,11 @@ func TestHostReads(t *testing.T) {
 	}
 	if _, err := Host.BootID(); err != nil {
 		t.Fatal(err)
+	}
+	if k, err := Host.ReadSockets(); err != nil || k.TCP+k.UDP == 0 {
+		t.Fatalf("sockets = %+v, %v", k, err)
+	}
+	if l, err := Host.ReadLoad(); err != nil || l.Threads == 0 {
+		t.Fatalf("load = %+v, %v", l, err)
 	}
 }

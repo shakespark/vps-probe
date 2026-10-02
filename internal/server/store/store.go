@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -17,7 +18,7 @@ import (
 	_ "modernc.org/sqlite" // pure Go, keeps CGO_ENABLED=0 builds
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 // Rollup buckets, in seconds.
 const (
@@ -144,7 +145,25 @@ func (s *Store) step(version int, stmts []string) error {
 }
 
 // migrations[i] takes the schema from version i to i+1.
-var migrations = [][]string{schemaV1, schemaV2, schemaV3}
+var migrations = [][]string{schemaV1, schemaV2, schemaV3, schemaV4}
+
+// Sockets and threads (agent >= 0.1.9) join the metrics rows as nullable
+// columns, so older agents' rows simply have none.
+var schemaV4 = slices.Concat([]string{
+	`ALTER TABLE metrics_raw ADD COLUMN tcp INTEGER`,
+	`ALTER TABLE metrics_raw ADD COLUMN udp INTEGER`,
+	`ALTER TABLE metrics_raw ADD COLUMN tcp_tw INTEGER`,
+	`ALTER TABLE metrics_raw ADD COLUMN threads INTEGER`,
+}, rollupCounts("metrics_5m"), rollupCounts("metrics_1h"))
+
+func rollupCounts(table string) []string {
+	var out []string
+	for _, c := range []string{"tcp REAL", "tcp_max INTEGER", "udp REAL", "udp_max INTEGER", "tcp_tw REAL",
+		"threads REAL", "threads_max INTEGER"} {
+		out = append(out, `ALTER TABLE `+table+` ADD COLUMN `+c)
+	}
+	return out
+}
 
 var schemaV3 = []string{
 	// The source IP of the node's newest report, and when it first

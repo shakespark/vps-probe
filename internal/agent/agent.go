@@ -263,12 +263,17 @@ func (a *Agent) tick(ts time.Time) {
 	if l, err := a.fs.ReadLoad(); err != nil {
 		a.log.Error("read load", "err", err)
 	} else {
-		rep.Load = &pb.Load{L1: float32(l.L1), L5: float32(l.L5), L15: float32(l.L15)}
+		rep.Load = &pb.Load{L1: float32(l.L1), L5: float32(l.L5), L15: float32(l.L15), Threads: l.Threads}
 	}
 	if m, err := a.fs.ReadMem(); err != nil {
 		a.log.Error("read memory", "err", err)
 	} else {
 		rep.Mem = &pb.Mem{Total: m.Total, Used: m.Used, SwapTotal: m.SwapTotal, SwapUsed: m.SwapUsed}
+	}
+	if k, err := a.fs.ReadSockets(); err != nil {
+		a.log.Error("read sockets", "err", err)
+	} else {
+		rep.Sockets = &pb.Sockets{Tcp: k.TCP, Udp: k.UDP, TcpTw: k.TCPTimeWait}
 	}
 
 	if a.lastDisk.IsZero() || now.Sub(a.lastDisk) >= diskEvery {

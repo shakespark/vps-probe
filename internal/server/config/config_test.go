@@ -23,6 +23,10 @@ func TestDefaults(t *testing.T) {
 	if n.Name != "hk-1" || n.QuotaMode != "sum" {
 		t.Fatalf("node defaults: %+v", n)
 	}
+	c, err = Parse([]byte("nodes:\n  - {id: hk-1, token: " + tokA + ", region: us-la, group: 美国}\n"))
+	if err != nil || c.Nodes[0].Region != "US-LA" || c.Nodes[0].Group != "美国" {
+		t.Fatalf("region/group: %+v %v", c.Nodes[0], err)
+	}
 	if time.Duration(c.Retention.H1) != 400*24*time.Hour || c.Backup.Keep != 7 {
 		t.Fatalf("retention/backup: %+v %+v", c.Retention, c.Backup)
 	}
@@ -56,6 +60,9 @@ func TestRejects(t *testing.T) {
 		"renew alone":     "nodes:\n  - {id: a, token: " + tokA + ", renew_months: 1}\n",
 		"long price":      "nodes:\n  - {id: a, token: " + tokA + ", price: '" + strings.Repeat("x", MaxPriceLen+1) + "'}\n",
 		"price newline":   "nodes:\n  - {id: a, token: " + tokA + ", price: \"a\\nb\"}\n",
+		"bad region":      "nodes:\n  - {id: a, token: " + tokA + ", region: 香港}\n",
+		"long region":     "nodes:\n  - {id: a, token: " + tokA + ", region: ABCDEFGHI}\n",
+		"long group":      "nodes:\n  - {id: a, token: " + tokA + ", group: '" + strings.Repeat("组", MaxGroupLen+1) + "'}\n",
 	} {
 		if _, err := Parse([]byte(yml)); err == nil {
 			t.Errorf("%s: accepted", name)

@@ -66,12 +66,20 @@ type Node struct {
 	ExpireAt    string `yaml:"expire_at"`    // YYYY-MM-DD in the server timezone
 	RenewMonths int    `yaml:"renew_months"` // auto-renewing plan: a passed expiry moves forward by this many months
 	Price       string `yaml:"price"`        // display only, e.g. "$10/年"
-	DisplayIdx  int    `yaml:"-"`            // position in the file
+	// Display only: a short region code shown as a badge (HK, JP, US-LA)
+	// and a group for the overview tabs. Order on the page is file order.
+	Region     string `yaml:"region"`
+	Group      string `yaml:"group"`
+	DisplayIdx int    `yaml:"-"` // position in the file
 
 	expire time.Time // ExpireAt parsed, midnight UTC (a calendar date)
 }
 
-const MaxPriceLen = 64
+const (
+	MaxPriceLen  = 64
+	MaxRegionLen = 8
+	MaxGroupLen  = 32
+)
 
 // ExtraPeer is copied into the node's agent.yml ping.peers as is.
 type ExtraPeer struct {
@@ -368,6 +376,15 @@ func (c *Config) validate() error {
 		}
 		if len([]rune(n.Price)) > MaxPriceLen || strings.ContainsFunc(n.Price, unicode.IsControl) {
 			bad("nodes[%s].price: at most %d characters on one line", n.ID, MaxPriceLen)
+		}
+		n.Region = strings.ToUpper(n.Region)
+		if len(n.Region) > MaxRegionLen || strings.ContainsFunc(n.Region, func(r rune) bool {
+			return !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-')
+		}) {
+			bad("nodes[%s].region %q: at most %d letters, digits or '-', e.g. HK or US-LA", n.ID, n.Region, MaxRegionLen)
+		}
+		if len([]rune(n.Group)) > MaxGroupLen || strings.ContainsFunc(n.Group, unicode.IsControl) {
+			bad("nodes[%s].group: at most %d characters on one line", n.ID, MaxGroupLen)
 		}
 	}
 

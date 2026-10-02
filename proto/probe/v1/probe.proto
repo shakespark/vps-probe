@@ -19,6 +19,7 @@ message Report {
   repeated NetRate net = 8;
   repeated IfaceTraffic traffic = 9;
   repeated Ping pings = 10;
+  Sockets sockets = 11;          // since 0.1.9
 }
 
 message SysInfo {
@@ -41,6 +42,14 @@ message Load {
   float l1 = 1;
   float l5 = 2;
   float l15 = 3;
+  uint32 threads = 4; // all threads on the host, 4th field of /proc/loadavg (since 0.1.9)
+}
+
+// Sockets in use from /proc/net/sockstat and sockstat6, IPv4 + IPv6.
+message Sockets {
+  uint32 tcp = 1;    // TCP sockets other than TIME_WAIT (listening ones included)
+  uint32 udp = 2;
+  uint32 tcp_tw = 3; // TIME_WAIT
 }
 
 message Mem {

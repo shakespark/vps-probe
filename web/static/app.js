@@ -247,19 +247,153 @@ function rerender() { navigate(); }
 
 // ---------- overview ----------
 
+// ---------- preferences ----------
+
+// Per-browser view choices. Storage may be missing or throw (private
+// windows, blocked site data); the page then just uses the defaults.
+function loadPref(key, def) {
+  try {
+    const v = JSON.parse(localStorage.getItem('vps-probe.' + key));
+    return v && typeof v === 'object' ? { ...def, ...v } : def;
+  } catch {
+    return def;
+  }
+}
+function savePref(key, v) {
+  try { localStorage.setItem('vps-probe.' + key, JSON.stringify(v)); } catch { /* not persisted */ }
+}
+
+// ---------- overview ----------
+
+const NO_GROUP = '\n'; // groups can't contain control characters
+const ovPrefs = loadPref('overview', { view: 'cards', sort: '', group: '' });
+const setOvPref = (k, v) => { ovPrefs[k] = v; savePref('overview', ovPrefs); rerender(); };
+
+const totalRate = (s, k) => (s.net || []).reduce((a, x) => a + x[k], 0);
+const pctOf = (used, total) => total ? 100 * used / total : null;
+// [value, label, key, descending]. A null key sorts last. Live metrics
+// (descending sorts) also put nodes that are not online last, since their
+// values are stale.
+const live = f => n => n.status ? f(n.status, n) ?? null : null;
+const SORTS = [
+  ['', '默认顺序'],
+  ['name', '名称', n => n.name],
+  ['region', '地区', n => n.region || null],
+  ['cpu', 'CPU', live(s => s.cpu), true],
+  ['mem', '内存', live(s => pctOf(s.mem_used, s.mem_total)), true],
+  ['disk', '磁盘', live(s => { const d = rootDisk(s.disks); return d ? pctOf(d.used, d.total) : null; }), true],
+  ['rx', '下行网速', live(s => totalRate(s, 'rx')), true],
+  ['tx', '上行网速', live(s => totalRate(s, 'tx')), true],
+  ['traffic', '本周期流量', live(s => s.traffic ? s.traffic.rx + s.traffic.tx : null), true],
+  ['quota', '配额使用率', live((s, n) => n.traffic_quota_gb && s.traffic
+    ? pctOf(billable(s.traffic.rx, s.traffic.tx, n.traffic_quota_mode), quotaBytes(n.traffic_quota_gb)) : null), true],
+  ['tcp', 'TCP 连接', live(s => s.tcp), true],
+  ['expiry', '到期', n => n.expire_days ?? null],
+];
+
+function sortNodes(nodes, by) {
+  const spec = SORTS.find(x => x[0] === by);
+  if (!spec || !spec[2]) return nodes; // config order
+  const [, , key, desc] = spec;
+  const dir = desc ? -1 : 1;
+  const cmp = (a, b) => typeof a === 'string' ? a.localeCompare(b, 'zh-CN') : a - b;
+  return nodes.map((n, i) => ({ n, i, v: key(n), down: desc && !n.online })).sort((a, b) =>
+    a.down - b.down || (a.v == null) - (b.v == null) || (a.v == null ? 0 : dir * cmp(a.v, b.v)) || a.i - b.i)
+    .map(x => x.n);
+}
+
 function overviewPage() {
-  const grid = h('div', { class: 'cards' });
+  const body = h('div');
   const stats = h('div', { class: 'stats panel' });
+  const tabs = h('div');
+  const sortSel = picker(v => setOvPref('sort', v));
   return {
     nav: 'overview',
-    el: h('div', null, h('h1', { text: '总览' }), h('div', { class: 'section' }, stats), h('div', { class: 'section' }, grid)),
+    el: h('div', null,
+      h('div', { class: 'row filters' }, h('h1', { text: '总览' }), h('span', { class: 'spacer' }),
+        seg([['cards', '卡片'], ['table', '表格']], ovPrefs.view, v => setOvPref('view', v)), sortSel),
+      tabs, h('div', { class: 'section' }, stats), h('div', { class: 'section' }, body)),
     async refresh() {
-      const nodes = await api('/api/nodes');
+      const all = await api('/api/nodes');
+      // Group tabs in the order groups first appear in the config.
+      const groups = [...new Set(all.map(n => n.group || NO_GROUP))];
+      let group = ovPrefs.group;
+      if (group && !groups.includes(group)) group = '';
+      if (all.some(n => n.group)) {
+        const count = g => all.filter(n => (n.group || NO_GROUP) === g).length;
+        tabs.replaceChildren(seg([['', `全部 ${all.length}`],
+          ...groups.map(g => [g, `${g === NO_GROUP ? '未分组' : g} ${count(g)}`])], group, v => setOvPref('group', v)));
+        tabs.className = 'section';
+      } else {
+        tabs.replaceChildren();
+      }
+      const nodes = sortNodes(group ? all.filter(n => (n.group || NO_GROUP) === group) : all, ovPrefs.sort);
+      sortSel.fill(SORTS.map(([v, label]) => [v, '排序：' + label]), ovPrefs.sort);
       stats.replaceChildren(...overviewStats(nodes));
-      const newest = newestAgent(nodes);
-      grid.replaceChildren(...nodes.map(n => nodeCard(n, newest)));
+      const newest = newestAgent(all);
+      if (ovPrefs.view === 'table') {
+        body.className = 'panel table-wrap';
+        body.replaceChildren(nodeTable(nodes, newest));
+      } else {
+        body.className = 'cards';
+        body.replaceChildren(...nodes.map(n => nodeCard(n, newest)));
+      }
     },
   };
+}
+
+// The agent-version check, shared by cards and table rows.
+function agentStale(n, newest) {
+  const ver = n.status && n.status.sys && n.status.sys.agent_version;
+  const pv = parseVer(ver);
+  return pv && newest && cmpVer(pv, newest) < 0 ? ver : null;
+}
+
+const regionBadge = n => n.region ? h('span', { class: 'region', text: n.region }) : null;
+
+function connText(s) {
+  const parts = [];
+  if (s.tcp != null) parts.push(`TCP ${s.tcp}`, `UDP ${s.udp}`);
+  if (s.threads != null) parts.push(`线程 ${s.threads}`);
+  return parts.join(' · ');
+}
+
+// ServerStatus-style dense table: one row per node, click for details.
+function nodeTable(nodes, newest) {
+  const pctCell = (pct, title) => h('td', { title }, bar(pct), h('span', { class: 'num', text: fmtPct(pct, 0) }));
+  const rows = nodes.map(n => {
+    const s = n.status;
+    const name = h('td', null, h('span', { class: 'dot ' + (n.online ? 'on' : 'off') }), ' ',
+      h('a', { href: '#/node/' + enc(n.id), text: n.name }), ' ', regionBadge(n),
+      agentStale(n, newest) ? h('span', { class: 'badge warn', text: '可升级', title: 'agent ' + agentStale(n, newest) }) : null);
+    const tr = h('tr', { class: 'clickable' + (n.online ? '' : ' offline'),
+      onclick: e => { if (e.target.tagName !== 'A') location.hash = '#/node/' + enc(n.id); } }, name);
+    if (!s) {
+      tr.append(h('td', { class: 'muted', text: '从未上报' }), ...Array.from({ length: 8 }, () => h('td')));
+      return tr;
+    }
+    const d = rootDisk(s.disks);
+    const t = s.traffic;
+    const quota = n.traffic_quota_gb && t
+      ? pctOf(billable(t.rx, t.tx, n.traffic_quota_mode), quotaBytes(n.traffic_quota_gb)) : null;
+    tr.append(
+      pctCell(s.cpu),
+      pctCell(pctOf(s.mem_used, s.mem_total), s.mem_total ? `${fmtBytes(s.mem_used)} / ${fmtBytes(s.mem_total)}` : null),
+      pctCell(d ? pctOf(d.used, d.total) : null, d ? `${d.mount} ${fmtBytes(d.used)} / ${fmtBytes(d.total)}` : null),
+      h('td', { class: 'num', text: `↓ ${fmtRate(totalRate(s, 'rx'))} ↑ ${fmtRate(totalRate(s, 'tx'))}` }),
+      h('td', { class: 'num', title: t ? `${t.start} 起` : null,
+        text: t ? `↓ ${fmtBytes(t.rx)} ↑ ${fmtBytes(t.tx)}` + (quota != null ? ` · ${fmtPct(quota, 0)}` : '') : '—' }),
+      h('td', { class: 'num', text: s.load1 != null ? s.load1.toFixed(2) : '—' }),
+      h('td', { class: 'num', text: s.tcp != null ? `${s.tcp} / ${s.udp}` : '—', title: connText(s) || null }),
+      h('td', { class: 'num', text: s.sys ? fmtDur(nowSec() - s.sys.boot_time) : '—' }),
+      h('td', { class: 'num' + (expiryClass(n.expire_days) ? ' ' + expiryClass(n.expire_days) : ''),
+        text: n.expire_at ? fmtExpiry(n.expire_days) : '—', title: n.expire_at ? [n.expire_at, n.price].filter(Boolean).join(' · ') : null }));
+    return tr;
+  });
+  return h('table', { class: 'nodes' },
+    h('thead', null, h('tr', null, ['节点', 'CPU', '内存', '磁盘', '网速', '本周期流量', '负载', 'TCP / UDP', '运行', '到期']
+      .map(c => h('th', { text: c })))),
+    h('tbody', null, rows));
 }
 
 function overviewStats(nodes) {
@@ -295,20 +429,19 @@ function rootDisk(disks) {
 
 function nodeCard(n, newest) {
   const s = n.status;
-  const ver = s && s.sys && s.sys.agent_version;
-  const pv = parseVer(ver);
-  const stale = pv && newest && cmpVer(pv, newest) < 0;
+  const ver = agentStale(n, newest);
   const head = h('div', { class: 'card-head' },
     h('span', { class: 'dot ' + (n.online ? 'on' : 'off'), title: n.online ? '在线' : '离线' }),
     h('span', { class: 'name', text: n.name }),
     n.name !== n.id ? h('span', { class: 'id muted', text: n.id }) : null,
+    regionBadge(n),
     h('span', { class: 'spacer' }),
     !s ? h('span', { class: 'badge', text: '从未上报' })
       : !n.online ? h('span', { class: 'badge bad', text: '离线 ' + fmtDur(nowSec() - s.fresh_at) }) : null,
     s && Math.abs(s.clock_skew) > 60 ? h('span', { class: 'badge warn', text: `时钟偏差 ${s.clock_skew}s` }) : null,
     n.expire_days != null && n.expire_days <= 7
       ? h('span', { class: 'badge ' + expiryClass(n.expire_days), text: fmtExpiry(n.expire_days) }) : null,
-    stale ? h('span', { class: 'badge warn', text: 'agent 可升级', title: `agent ${ver}，最新 ${newest.join('.')}` }) : null);
+    ver ? h('span', { class: 'badge warn', text: 'agent 可升级', title: `agent ${ver}，最新 ${newest.join('.')}` }) : null);
   const card = h('a', { class: 'card panel' + (n.online ? '' : ' offline'), href: '#/node/' + enc(n.id) }, head);
   const expiry = n.expire_at ? h('div', { class: 'kv' }, h('span', { class: 'k', text: '到期' }),
     h('span', { class: 'num' + (expiryClass(n.expire_days) ? ' ' + expiryClass(n.expire_days) : ''),
@@ -332,12 +465,14 @@ function nodeCard(n, newest) {
   const d = rootDisk(s.disks);
   if (d) card.append(metric('磁盘', 100 * d.used / d.total, `${fmtBytes(d.used)} / ${fmtBytes(d.total)}`));
 
-  const rx = (s.net || []).reduce((a, x) => a + x.rx, 0), tx = (s.net || []).reduce((a, x) => a + x.tx, 0);
   card.append(h('div', { class: 'kv' }, h('span', { class: 'k', text: '网速' }),
-    h('span', { class: 'num', text: `↓ ${fmtRate(rx)}   ↑ ${fmtRate(tx)}` })));
+    h('span', { class: 'num', text: `↓ ${fmtRate(totalRate(s, 'rx'))}   ↑ ${fmtRate(totalRate(s, 'tx'))}` })));
   if (s.load1 != null) {
     card.append(h('div', { class: 'kv' }, h('span', { class: 'k', text: '负载' }),
       h('span', { class: 'num', text: [s.load1, s.load5, s.load15].map(v => v.toFixed(2)).join(' / ') })));
+  }
+  if (connText(s)) {
+    card.append(h('div', { class: 'kv' }, h('span', { class: 'k', text: '连接' }), h('span', { class: 'num', text: connText(s) })));
   }
   const t = s.traffic;
   if (t) {
@@ -369,7 +504,8 @@ function nodePage(id) {
   const summary = h('div', { class: 'summary' });
   const charts = {
     cpu: new Chart('CPU'), load: new Chart('负载'), mem: new Chart('内存 / Swap'),
-    net: new Chart('网络'), disk: new Chart('磁盘使用率'), ping: new Chart('时延（到各 peer）'),
+    net: new Chart('网络'), disk: new Chart('磁盘使用率'), conns: new Chart('连接与线程'),
+    ping: new Chart('时延（到各 peer）'),
   };
   const el = h('div', null,
     h('div', { class: 'row' }, h('a', { href: '#/', text: '← 总览' })),
@@ -418,6 +554,19 @@ function nodePage(id) {
         line('Swap', points(m.ts, c.swap_used, st)),
       ], { yMax: memMax || undefined }));
 
+      // Threads run in the hundreds and up, so they get the right axis.
+      const hasConns = c.tcp.some(v => v != null) || c.threads.some(v => v != null);
+      charts.conns.el.hidden = !hasConns; // agents before 0.1.9 report neither
+      if (hasConns) {
+        const count = v => v == null ? '—' : Math.round(v).toString();
+        charts.conns.set(timeOption(from, to, count, [
+          line('TCP', points(m.ts, c.tcp, st)),
+          line('UDP', points(m.ts, c.udp, st)),
+          line('TIME_WAIT', points(m.ts, c.tcp_tw, st), { lineStyle: { width: 1, type: 'dashed' } }),
+          line('线程', points(m.ts, c.threads, st), { yAxisIndex: 1 }),
+        ], { y2: { type: 'value', min: 0, splitLine: { show: false } } }));
+      }
+
       const netSeries = [];
       for (const iface of Object.keys(net).sort()) {
         const s = net[iface];
@@ -447,7 +596,8 @@ function nodePage(id) {
 }
 
 function renderNodeHead(n, title, dot, sub, summary) {
-  title.textContent = n.name + (n.name !== n.id ? `（${n.id}）` : '');
+  title.textContent = n.name + (n.name !== n.id ? `（${n.id}）` : '') + (n.region ? ` · ${n.region}` : '') +
+    (n.group ? ` · ${n.group}` : '');
   dot.className = 'dot ' + (n.online ? 'on' : 'off');
   const s = n.status;
   if (!s) { sub.textContent = '从未上报'; summary.replaceChildren(); return; }
@@ -464,6 +614,8 @@ function renderNodeHead(n, title, dot, sub, summary) {
     kv('内存', s.mem_total ? `${fmtBytes(s.mem_used)} / ${fmtBytes(s.mem_total)}` : '—'),
     kv('磁盘 /', d ? `${fmtBytes(d.used)} / ${fmtBytes(d.total)}` : '—'),
     kv('时钟偏差', s.clock_skew + ' s'),
+    kv('连接', s.tcp != null ? `TCP ${s.tcp} / UDP ${s.udp} / TIME_WAIT ${s.tcp_tw}` : '— （agent ≥ 0.1.9）'),
+    kv('线程', s.threads != null ? String(s.threads) : '—'),
     kv('本周期流量', s.traffic ? `↓ ${fmtBytes(s.traffic.rx)} ↑ ${fmtBytes(s.traffic.tx)}` : '—'),
     kv('上报来源 IP', s.ip ? `${s.ip}（${fmtTime(s.ip_since)} 起）` : '—'),
     ...(n.expire_at ? [kv('到期', [n.expire_at, fmtExpiry(n.expire_days),

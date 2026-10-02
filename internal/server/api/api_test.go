@@ -32,7 +32,7 @@ func setup(t *testing.T) (http.Handler, *store.Store) {
 	cfg, err := config.Parse([]byte(`
 nodes:
   - {id: hk-1, name: 香港, token: abcdefghijklmnopqrstuvwxyz0123456789, traffic_quota_gb: 1000,
-     expire_at: 2099-01-01, renew_months: 12, price: "$10/年"}
+     expire_at: 2099-01-01, renew_months: 12, price: "$10/年", region: hk, group: 亚洲}
   - {id: jp-1, token: bcdefghijklmnopqrstuvwxyz0123456789a}
 `))
 	if err != nil {
@@ -116,6 +116,8 @@ func TestNodesView(t *testing.T) {
 		Expire  string  `json:"expire_at"`
 		Days    *int    `json:"expire_days"`
 		Price   string  `json:"price"`
+		Region  string  `json:"region"`
+		Group   string  `json:"group"`
 		Status  *struct {
 			CPU     *float64 `json:"cpu"`
 			IP      string   `json:"ip"`
@@ -132,7 +134,8 @@ func TestNodesView(t *testing.T) {
 	if *nodes[0].Status.CPU != 50 || nodes[0].Status.Traffic.TX != 20 || nodes[0].Status.IP != "192.0.2.7" {
 		t.Fatalf("status: %s", rec.Body)
 	}
-	if nodes[0].Expire != "2099-01-01" || nodes[0].Days == nil || *nodes[0].Days < 20000 || nodes[0].Price != "$10/年" {
+	if nodes[0].Expire != "2099-01-01" || nodes[0].Days == nil || *nodes[0].Days < 20000 || nodes[0].Price != "$10/年" ||
+		nodes[0].Region != "HK" || nodes[0].Group != "亚洲" {
 		t.Fatalf("plan: %s", rec.Body)
 	}
 	if nodes[1].Online || nodes[1].Status != nil || nodes[1].Name != "jp-1" || nodes[1].Days != nil {

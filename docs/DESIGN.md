@@ -148,7 +148,8 @@
 | 类别 | 指标 | 来源 | 频率 |
 |---|---|---|---|
 | CPU | 使用率（总体）、steal | `/proc/stat` 差分 | 10s |
-| 负载 | load1/5/15 | `/proc/loadavg` | 10s |
+| 负载 | load1/5/15、线程总数 | `/proc/loadavg`（第 4 字段 `运行/总数` 的总数） | 10s |
+| 连接 | TCP（不含 TIME_WAIT，含监听）、UDP、TIME_WAIT，IPv4 + IPv6 合计 | `/proc/net/sockstat`、`sockstat6`（没有 sockstat6 = 关了 IPv6，按 0 计） | 10s |
 | 内存 | total / available / used、swap total/used | `/proc/meminfo`（used = total − MemAvailable） | 10s |
 | 磁盘 | 每个挂载点 used/total、inode 使用率 | `statfs`，挂载点可配置，默认 `/` | 60s |
 | 网络 | 各物理网卡 rx/tx 速率 | `/proc/net/dev` 差分 | 10s |
@@ -157,6 +158,8 @@
 | 时延 | 每个 peer 的 sent/lost/min/avg/max/jitter | ICMP，或 UDP DNS 查询 / 隧道回显 | 每秒 1 包，10s 汇总 |
 
 CPU steal 单独记录，便于发现超售的机器。
+
+线程总数而不是进程数：agent 的 systemd 单元有 `ProtectProc=invisible`，在 `/proc` 里只看得到自己的进程，数不了全部进程；`/proc/loadavg` 的总数不受影响，统计的是全部线程（内核调度实体）。连接数来自 agent 所在的网络命名空间，所以 agent 不能加 `PrivateNetwork`（见 §5.6）。连接数和线程数从 agent 0.1.9 起上报，旧 agent 这些字段为空，页面显示「—」。
 
 ### 5.2 ICMP 互测
 
@@ -298,6 +301,8 @@ nodes:
     expire_at: 2027-03-15      # 可选：到期日（按 timezone），总览显示剩余天数，expiry 规则提醒
     renew_months: 12           # 可选：自动续费周期（月），过了到期日按周期顺延
     price: "$10/年"            # 可选：只用于显示，最多 64 字符
+    region: HK                 # 可选：地区代码，显示为卡片上的角标（字母、数字、-，最多 8 个，自动转大写）
+    group: 亚洲                # 可选：总览按分组切换；页面上的默认顺序就是配置文件里的顺序
 telegram:                  # 可选；不配置则只记录不发送
   bot_token: "<token>"
   chat_id: "<chat id>"
@@ -341,11 +346,11 @@ backup:
 - WAL 模式：运行中旁边会有 `probe.db-wal` / `-shm`，里面可能有已提交的数据。正常停止时执行 `wal_checkpoint(TRUNCATE)` 并删除它们，停机后只剩 `probe.db` 一个文件。
 - 一个专用写连接（ingest、降采样、清理都走它），另开只读连接池给 Web 查询，避免 `SQLITE_BUSY`。
 - 节点 id 映射为整数（`nodes` 表），各数据表用 `WITHOUT ROWID` + 复合主键，减少体积。
-- schema 有版本号（`meta.schema_version`，当前为 3），升级按版本逐步执行，只加表不删数据；遇到比程序更新的版本拒绝打开。
+- schema 有版本号（`meta.schema_version`，当前为 4），升级按版本逐步执行，只加表或给表加可空的列，不删数据（v4 给 metrics 表加了连接数、线程数列）；遇到比程序更新的版本拒绝打开。
 
 | 表 | 主键 | 内容 | 保留 |
 |---|---|---|---|
-| `metrics_raw` / `_5m` / `_1h` | (node, ts) | cpu、steal、load、mem、swap；聚合表存 avg 与 max | 48h / 30d / 400d |
+| `metrics_raw` / `_5m` / `_1h` | (node, ts) | cpu、steal、load、mem、swap、tcp、udp、tcp_tw、threads；聚合表存 avg 与 max | 48h / 30d / 400d |
 | `net_raw` / `_5m` / `_1h` | (node, iface, ts) | 各网卡收/发速率 | 同上 |
 | `disk_raw` / `_1h` | (node, mount, ts) | 用量、inode | 48h / 400d |
 | `ping_raw` / `_5m` / `_1h` | (src, dst, ts) | sent、lost、min/avg/max、jitter | 同 metrics |
@@ -381,7 +386,7 @@ backup:
 
 | 路径 | 内容 |
 |---|---|
-| `GET /api/nodes` | 节点列表 + 最新状态（含来源 IP）+ 到期日（已按续费周期顺延）、剩余天数、价格 |
+| `GET /api/nodes` | 节点列表 + 最新状态（含来源 IP、连接数、线程数）+ 到期日（已按续费周期顺延）、剩余天数、价格、地区、分组 |
 | `GET /api/nodes/{id}/metrics?from&to` | 自动按时间跨度选择 raw/1m/5m |
 | `GET /api/nodes/{id}/disks?from&to` | 磁盘用量 |
 | `GET /api/nodes/{id}/net?from&to` | 各网卡速率 |
@@ -462,8 +467,8 @@ Telegram：
 
 ## 8. 前端页面
 
-1. **总览**：顶部汇总条：在线数、在线节点实时网速之和、各节点本周期流量之和（各自按自己的周期起始日）、最近到期的节点。每个节点一张卡片，显示在线状态、CPU/内存/磁盘进度条、实时网速、本周期流量/配额进度、运行时长、到期日/剩余天数/价格（7 天内到期或已过期时标题旁加角标）。agent 版本低于其他节点中最新的 agent 版本时显示「agent 可升级」：与 agent 互相比较而不是与服务端比较，因为只改服务端的版本不需要升级 agent；`dev` 等无法解析的版本不比较。节点详情另显示上报来源 IP。
-2. **节点详情**：时间范围可选 1h / 6h / 24h / 7d / 30d / 自定义；图表包括 CPU（含 steal）、负载、内存/Swap、磁盘、各网卡速率，以及该节点到各 peer 的时延。
+1. **总览**：可切换卡片 / 表格（仿 ServerStatus 的一行一台，点行进入详情，窄屏横向滚动），可按名称、地区、CPU、内存、磁盘、网速、本周期流量、配额使用率、TCP 连接、到期排序（按实时数值排序时离线和从未上报的节点排最后），配置了 `group` 时按分组切换（顺序为分组在配置文件里首次出现的顺序，另有「未分组」），汇总条跟随所选分组。这三个选择存在浏览器 localStorage（只是本机偏好，存不了时用默认值）。卡片和表格都显示 `region` 角标，卡片多一行「连接」（TCP、UDP、线程）。顶部汇总条：在线数、在线节点实时网速之和、各节点本周期流量之和（各自按自己的周期起始日）、最近到期的节点。每个节点一张卡片，显示在线状态、CPU/内存/磁盘进度条、实时网速、本周期流量/配额进度、运行时长、到期日/剩余天数/价格（7 天内到期或已过期时标题旁加角标）。agent 版本低于其他节点中最新的 agent 版本时显示「agent 可升级」：与 agent 互相比较而不是与服务端比较，因为只改服务端的版本不需要升级 agent；`dev` 等无法解析的版本不比较。节点详情另显示上报来源 IP。
+2. **节点详情**：时间范围可选 1h / 6h / 24h / 7d / 30d / 自定义；图表包括 CPU（含 steal）、负载、内存/Swap、磁盘、各网卡速率、连接与线程（TCP / UDP / TIME_WAIT，线程用右轴；agent < 0.1.9 时隐藏），以及该节点到各 peer 的时延。
 3. **时延**：
    - **网络质量**：统计窗口内丢包最多、抖动最大的 3 条链路，以及可用率条所选范围内可用率最低的 3 条（只算窗口内仍有数据的链路，被 `no_ping` 去掉的链路留下的旧数据不参与），点击进入链路历史。
    - **时延矩阵**：N×N 热力图（颜色表示 avg，角标表示丢包），点击格子查看该链路的历史曲线（min/avg/max 区间带 + 丢包柱）。

@@ -103,6 +103,8 @@ type nodeView struct {
 	ExpireDays  *int          `json:"expire_days,omitempty"`
 	RenewMonths int           `json:"renew_months,omitempty"`
 	Price       string        `json:"price,omitempty"`
+	Region      string        `json:"region,omitempty"`
+	Group       string        `json:"group,omitempty"`
 	Status      *store.Status `json:"status"` // null if it never reported
 }
 
@@ -116,7 +118,7 @@ func (a *API) nodes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		v := nodeView{ID: n.ID, Name: n.Name, QuotaGB: n.QuotaGB, QuotaMode: n.QuotaMode,
-			RenewMonths: n.RenewMonths, Price: n.Price, Status: st}
+			RenewMonths: n.RenewMonths, Price: n.Price, Region: n.Region, Group: n.Group, Status: st}
 		if date, days, ok := n.Expiry(now, a.cfg.Location); ok {
 			v.ExpireAt, v.ExpireDays = date, &days
 		}

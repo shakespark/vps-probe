@@ -57,27 +57,36 @@ func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time
 		}
 	}
 
-	if rep.Cpu != nil || rep.Load != nil || rep.Mem != nil {
+	if rep.Cpu != nil || rep.Load != nil || rep.Mem != nil || rep.Sockets != nil {
 		var cpu, steal, l1, l5, l15 sql.NullFloat64
-		var mt, mu, st, su sql.NullInt64
+		var mt, mu, st, su, tcp, udp, tw, threads sql.NullInt64
 		if c := rep.Cpu; c != nil {
 			cpu, steal = nf(c.Usage), nf(c.Steal)
 		}
 		if l := rep.Load; l != nil {
 			l1, l5, l15 = nf(l.L1), nf(l.L5), nf(l.L15)
+			if l.Threads > 0 { // 0: an agent before 0.1.9
+				threads = ni(uint64(l.Threads))
+			}
 		}
 		if m := rep.Mem; m != nil {
 			mt, mu, st, su = ni(m.Total), ni(m.Used), ni(m.SwapTotal), ni(m.SwapUsed)
 		}
+		if k := rep.Sockets; k != nil {
+			tcp, udp, tw = ni(uint64(k.Tcp)), ni(uint64(k.Udp)), ni(uint64(k.TcpTw))
+		}
 		if _, err := tx.Exec(`INSERT INTO metrics_raw(node, ts, cpu, steal, load1, load5, load15,
-				mem_total, mem_used, swap_total, swap_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				mem_total, mem_used, swap_total, swap_used, tcp, udp, tcp_tw, threads)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(node, ts) DO UPDATE SET
 				cpu = COALESCE(excluded.cpu, cpu), steal = COALESCE(excluded.steal, steal),
 				load1 = COALESCE(excluded.load1, load1), load5 = COALESCE(excluded.load5, load5),
 				load15 = COALESCE(excluded.load15, load15),
 				mem_total = COALESCE(excluded.mem_total, mem_total), mem_used = COALESCE(excluded.mem_used, mem_used),
-				swap_total = COALESCE(excluded.swap_total, swap_total), swap_used = COALESCE(excluded.swap_used, swap_used)`,
-			rid, ts, cpu, steal, l1, l5, l15, mt, mu, st, su); err != nil {
+				swap_total = COALESCE(excluded.swap_total, swap_total), swap_used = COALESCE(excluded.swap_used, swap_used),
+				tcp = COALESCE(excluded.tcp, tcp), udp = COALESCE(excluded.udp, udp),
+				tcp_tw = COALESCE(excluded.tcp_tw, tcp_tw), threads = COALESCE(excluded.threads, threads)`,
+			rid, ts, cpu, steal, l1, l5, l15, mt, mu, st, su, tcp, udp, tw, threads); err != nil {
 			return err
 		}
 	}

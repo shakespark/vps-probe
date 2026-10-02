@@ -32,6 +32,8 @@ nodes:
     expire_at: 2027-03-15       # 到期日，按 timezone 计
     renew_months: 12            # 可选：自动续费周期（月），过了到期日自动顺延；不写则过期后显示「已过期」
     price: "$10/年"             # 可选：只用于显示
+    region: HK                  # 可选：地区代码，卡片上的角标
+    group: 亚洲                 # 可选：总览按分组切换（页面默认顺序 = 本文件里的顺序）
   - id: jp-1
     name: 日本 1
     token: "REPLACE-WITH-ANOTHER-gen-token-OUTPUT-01"

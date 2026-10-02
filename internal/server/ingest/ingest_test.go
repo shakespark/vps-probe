@@ -256,6 +256,10 @@ func TestSanitize(t *testing.T) {
 	if rep.Sys.Os != "" || rep.Sys.Hostname != "ok" || rep.Cpu != nil || rep.Load == nil || rep.Mem != nil {
 		t.Fatalf("scalars: %+v", rep)
 	}
+	big := &pb.Report{Load: &pb.Load{L1: 1, Threads: 2e7}, Sockets: &pb.Sockets{Tcp: 5, Udp: 2e7}}
+	if n := Sanitize(big); n != 2 || big.Load == nil || big.Load.Threads != 0 || big.Sockets != nil {
+		t.Fatalf("counts: dropped %d, %+v", n, big)
+	}
 	if len(rep.Disks) != 1 || len(rep.Net) != 1 || len(rep.Traffic) != 1 || len(rep.Pings) != 2 {
 		t.Fatalf("lists: disks=%d net=%d traffic=%d pings=%d", len(rep.Disks), len(rep.Net), len(rep.Traffic), len(rep.Pings))
 	}

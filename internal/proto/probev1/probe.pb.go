@@ -36,6 +36,7 @@ type Report struct {
 	Net           []*NetRate             `protobuf:"bytes,8,rep,name=net,proto3" json:"net,omitempty"`
 	Traffic       []*IfaceTraffic        `protobuf:"bytes,9,rep,name=traffic,proto3" json:"traffic,omitempty"`
 	Pings         []*Ping                `protobuf:"bytes,10,rep,name=pings,proto3" json:"pings,omitempty"`
+	Sockets       *Sockets               `protobuf:"bytes,11,opt,name=sockets,proto3" json:"sockets,omitempty"` // since 0.1.9
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -136,6 +137,13 @@ func (x *Report) GetTraffic() []*IfaceTraffic {
 func (x *Report) GetPings() []*Ping {
 	if x != nil {
 		return x.Pings
+	}
+	return nil
+}
+
+func (x *Report) GetSockets() *Sockets {
+	if x != nil {
+		return x.Sockets
 	}
 	return nil
 }
@@ -297,6 +305,7 @@ type Load struct {
 	L1            float32                `protobuf:"fixed32,1,opt,name=l1,proto3" json:"l1,omitempty"`
 	L5            float32                `protobuf:"fixed32,2,opt,name=l5,proto3" json:"l5,omitempty"`
 	L15           float32                `protobuf:"fixed32,3,opt,name=l15,proto3" json:"l15,omitempty"`
+	Threads       uint32                 `protobuf:"varint,4,opt,name=threads,proto3" json:"threads,omitempty"` // all threads on the host, 4th field of /proc/loadavg (since 0.1.9)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -352,6 +361,74 @@ func (x *Load) GetL15() float32 {
 	return 0
 }
 
+func (x *Load) GetThreads() uint32 {
+	if x != nil {
+		return x.Threads
+	}
+	return 0
+}
+
+// Sockets in use from /proc/net/sockstat and sockstat6, IPv4 + IPv6.
+type Sockets struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Tcp           uint32                 `protobuf:"varint,1,opt,name=tcp,proto3" json:"tcp,omitempty"` // TCP sockets other than TIME_WAIT (listening ones included)
+	Udp           uint32                 `protobuf:"varint,2,opt,name=udp,proto3" json:"udp,omitempty"`
+	TcpTw         uint32                 `protobuf:"varint,3,opt,name=tcp_tw,json=tcpTw,proto3" json:"tcp_tw,omitempty"` // TIME_WAIT
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Sockets) Reset() {
+	*x = Sockets{}
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Sockets) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Sockets) ProtoMessage() {}
+
+func (x *Sockets) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Sockets.ProtoReflect.Descriptor instead.
+func (*Sockets) Descriptor() ([]byte, []int) {
+	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *Sockets) GetTcp() uint32 {
+	if x != nil {
+		return x.Tcp
+	}
+	return 0
+}
+
+func (x *Sockets) GetUdp() uint32 {
+	if x != nil {
+		return x.Udp
+	}
+	return 0
+}
+
+func (x *Sockets) GetTcpTw() uint32 {
+	if x != nil {
+		return x.TcpTw
+	}
+	return 0
+}
+
 type Mem struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Total         uint64                 `protobuf:"varint,1,opt,name=total,proto3" json:"total,omitempty"` // bytes
@@ -364,7 +441,7 @@ type Mem struct {
 
 func (x *Mem) Reset() {
 	*x = Mem{}
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[4]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -376,7 +453,7 @@ func (x *Mem) String() string {
 func (*Mem) ProtoMessage() {}
 
 func (x *Mem) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[4]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -389,7 +466,7 @@ func (x *Mem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Mem.ProtoReflect.Descriptor instead.
 func (*Mem) Descriptor() ([]byte, []int) {
-	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{4}
+	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Mem) GetTotal() uint64 {
@@ -433,7 +510,7 @@ type Disk struct {
 
 func (x *Disk) Reset() {
 	*x = Disk{}
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[5]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -445,7 +522,7 @@ func (x *Disk) String() string {
 func (*Disk) ProtoMessage() {}
 
 func (x *Disk) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[5]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -458,7 +535,7 @@ func (x *Disk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Disk.ProtoReflect.Descriptor instead.
 func (*Disk) Descriptor() ([]byte, []int) {
-	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{5}
+	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Disk) GetMount() string {
@@ -507,7 +584,7 @@ type NetRate struct {
 
 func (x *NetRate) Reset() {
 	*x = NetRate{}
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[6]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -519,7 +596,7 @@ func (x *NetRate) String() string {
 func (*NetRate) ProtoMessage() {}
 
 func (x *NetRate) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[6]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -532,7 +609,7 @@ func (x *NetRate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetRate.ProtoReflect.Descriptor instead.
 func (*NetRate) Descriptor() ([]byte, []int) {
-	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{6}
+	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *NetRate) GetIface() string {
@@ -567,7 +644,7 @@ type IfaceTraffic struct {
 
 func (x *IfaceTraffic) Reset() {
 	*x = IfaceTraffic{}
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[7]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -579,7 +656,7 @@ func (x *IfaceTraffic) String() string {
 func (*IfaceTraffic) ProtoMessage() {}
 
 func (x *IfaceTraffic) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[7]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -592,7 +669,7 @@ func (x *IfaceTraffic) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IfaceTraffic.ProtoReflect.Descriptor instead.
 func (*IfaceTraffic) Descriptor() ([]byte, []int) {
-	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{7}
+	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *IfaceTraffic) GetIface() string {
@@ -627,7 +704,7 @@ type Period struct {
 
 func (x *Period) Reset() {
 	*x = Period{}
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[8]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -639,7 +716,7 @@ func (x *Period) String() string {
 func (*Period) ProtoMessage() {}
 
 func (x *Period) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[8]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -652,7 +729,7 @@ func (x *Period) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Period.ProtoReflect.Descriptor instead.
 func (*Period) Descriptor() ([]byte, []int) {
-	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{8}
+	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *Period) GetStart() string {
@@ -692,7 +769,7 @@ type Ping struct {
 
 func (x *Ping) Reset() {
 	*x = Ping{}
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[9]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -704,7 +781,7 @@ func (x *Ping) String() string {
 func (*Ping) ProtoMessage() {}
 
 func (x *Ping) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[9]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -717,7 +794,7 @@ func (x *Ping) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ping.ProtoReflect.Descriptor instead.
 func (*Ping) Descriptor() ([]byte, []int) {
-	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{9}
+	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *Ping) GetTarget() string {
@@ -785,7 +862,7 @@ type Ack struct {
 
 func (x *Ack) Reset() {
 	*x = Ack{}
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[10]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -797,7 +874,7 @@ func (x *Ack) String() string {
 func (*Ack) ProtoMessage() {}
 
 func (x *Ack) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[10]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -810,7 +887,7 @@ func (x *Ack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ack.ProtoReflect.Descriptor instead.
 func (*Ack) Descriptor() ([]byte, []int) {
-	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{10}
+	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *Ack) GetIds() []uint64 {
@@ -824,7 +901,7 @@ var File_proto_probe_v1_probe_proto protoreflect.FileDescriptor
 
 const file_proto_probe_v1_probe_proto_rawDesc = "" +
 	"\n" +
-	"\x1aproto/probe/v1/probe.proto\x12\bprobe.v1\"\xd6\x02\n" +
+	"\x1aproto/probe/v1/probe.proto\x12\bprobe.v1\"\x83\x03\n" +
 	"\x06Report\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x03R\x02ts\x12\x0e\n" +
 	"\x02id\x18\x02 \x01(\x04R\x02id\x12#\n" +
@@ -836,7 +913,8 @@ const file_proto_probe_v1_probe_proto_rawDesc = "" +
 	"\x03net\x18\b \x03(\v2\x11.probe.v1.NetRateR\x03net\x120\n" +
 	"\atraffic\x18\t \x03(\v2\x16.probe.v1.IfaceTrafficR\atraffic\x12$\n" +
 	"\x05pings\x18\n" +
-	" \x03(\v2\x0e.probe.v1.PingR\x05pings\"\xd1\x01\n" +
+	" \x03(\v2\x0e.probe.v1.PingR\x05pings\x12+\n" +
+	"\asockets\x18\v \x01(\v2\x11.probe.v1.SocketsR\asockets\"\xd1\x01\n" +
 	"\aSysInfo\x12\x1a\n" +
 	"\bhostname\x18\x01 \x01(\tR\bhostname\x12\x0e\n" +
 	"\x02os\x18\x02 \x01(\tR\x02os\x12\x16\n" +
@@ -848,11 +926,16 @@ const file_proto_probe_v1_probe_proto_rawDesc = "" +
 	"\ragent_version\x18\b \x01(\tR\fagentVersion\"1\n" +
 	"\x03CPU\x12\x14\n" +
 	"\x05usage\x18\x01 \x01(\x02R\x05usage\x12\x14\n" +
-	"\x05steal\x18\x02 \x01(\x02R\x05steal\"8\n" +
+	"\x05steal\x18\x02 \x01(\x02R\x05steal\"R\n" +
 	"\x04Load\x12\x0e\n" +
 	"\x02l1\x18\x01 \x01(\x02R\x02l1\x12\x0e\n" +
 	"\x02l5\x18\x02 \x01(\x02R\x02l5\x12\x10\n" +
-	"\x03l15\x18\x03 \x01(\x02R\x03l15\"k\n" +
+	"\x03l15\x18\x03 \x01(\x02R\x03l15\x12\x18\n" +
+	"\athreads\x18\x04 \x01(\rR\athreads\"D\n" +
+	"\aSockets\x12\x10\n" +
+	"\x03tcp\x18\x01 \x01(\rR\x03tcp\x12\x10\n" +
+	"\x03udp\x18\x02 \x01(\rR\x03udp\x12\x15\n" +
+	"\x06tcp_tw\x18\x03 \x01(\rR\x05tcpTw\"k\n" +
 	"\x03Mem\x12\x14\n" +
 	"\x05total\x18\x01 \x01(\x04R\x05total\x12\x12\n" +
 	"\x04used\x18\x02 \x01(\x04R\x04used\x12\x1d\n" +
@@ -901,36 +984,38 @@ func file_proto_probe_v1_probe_proto_rawDescGZIP() []byte {
 	return file_proto_probe_v1_probe_proto_rawDescData
 }
 
-var file_proto_probe_v1_probe_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_proto_probe_v1_probe_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_proto_probe_v1_probe_proto_goTypes = []any{
 	(*Report)(nil),       // 0: probe.v1.Report
 	(*SysInfo)(nil),      // 1: probe.v1.SysInfo
 	(*CPU)(nil),          // 2: probe.v1.CPU
 	(*Load)(nil),         // 3: probe.v1.Load
-	(*Mem)(nil),          // 4: probe.v1.Mem
-	(*Disk)(nil),         // 5: probe.v1.Disk
-	(*NetRate)(nil),      // 6: probe.v1.NetRate
-	(*IfaceTraffic)(nil), // 7: probe.v1.IfaceTraffic
-	(*Period)(nil),       // 8: probe.v1.Period
-	(*Ping)(nil),         // 9: probe.v1.Ping
-	(*Ack)(nil),          // 10: probe.v1.Ack
+	(*Sockets)(nil),      // 4: probe.v1.Sockets
+	(*Mem)(nil),          // 5: probe.v1.Mem
+	(*Disk)(nil),         // 6: probe.v1.Disk
+	(*NetRate)(nil),      // 7: probe.v1.NetRate
+	(*IfaceTraffic)(nil), // 8: probe.v1.IfaceTraffic
+	(*Period)(nil),       // 9: probe.v1.Period
+	(*Ping)(nil),         // 10: probe.v1.Ping
+	(*Ack)(nil),          // 11: probe.v1.Ack
 }
 var file_proto_probe_v1_probe_proto_depIdxs = []int32{
 	1,  // 0: probe.v1.Report.sys:type_name -> probe.v1.SysInfo
 	2,  // 1: probe.v1.Report.cpu:type_name -> probe.v1.CPU
 	3,  // 2: probe.v1.Report.load:type_name -> probe.v1.Load
-	4,  // 3: probe.v1.Report.mem:type_name -> probe.v1.Mem
-	5,  // 4: probe.v1.Report.disks:type_name -> probe.v1.Disk
-	6,  // 5: probe.v1.Report.net:type_name -> probe.v1.NetRate
-	7,  // 6: probe.v1.Report.traffic:type_name -> probe.v1.IfaceTraffic
-	9,  // 7: probe.v1.Report.pings:type_name -> probe.v1.Ping
-	8,  // 8: probe.v1.IfaceTraffic.cur:type_name -> probe.v1.Period
-	8,  // 9: probe.v1.IfaceTraffic.prev:type_name -> probe.v1.Period
-	10, // [10:10] is the sub-list for method output_type
-	10, // [10:10] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	5,  // 3: probe.v1.Report.mem:type_name -> probe.v1.Mem
+	6,  // 4: probe.v1.Report.disks:type_name -> probe.v1.Disk
+	7,  // 5: probe.v1.Report.net:type_name -> probe.v1.NetRate
+	8,  // 6: probe.v1.Report.traffic:type_name -> probe.v1.IfaceTraffic
+	10, // 7: probe.v1.Report.pings:type_name -> probe.v1.Ping
+	4,  // 8: probe.v1.Report.sockets:type_name -> probe.v1.Sockets
+	9,  // 9: probe.v1.IfaceTraffic.cur:type_name -> probe.v1.Period
+	9,  // 10: probe.v1.IfaceTraffic.prev:type_name -> probe.v1.Period
+	11, // [11:11] is the sub-list for method output_type
+	11, // [11:11] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_proto_probe_v1_probe_proto_init() }
@@ -944,7 +1029,7 @@ func file_proto_probe_v1_probe_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_probe_v1_probe_proto_rawDesc), len(file_proto_probe_v1_probe_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

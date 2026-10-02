@@ -223,10 +223,10 @@ func (s *Sender) pump() (redial bool) {
 }
 
 func (s *Sender) sendLocked(it *item, now time.Time) {
-	it.lastSent = now
 	if s.conn == nil {
-		return
+		return // not sent: the next pump after a dial picks it up, not one retryAfter later
 	}
+	it.lastSent = now
 	if _, err := s.conn.Write(it.Bytes); err != nil {
 		s.log.Debug("report: send", "err", err)
 	}

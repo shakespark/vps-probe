@@ -26,10 +26,12 @@ func (s *Store) Rollup(since time.Time) error {
 		}
 		stmts := []string{
 			`INSERT OR REPLACE INTO metrics` + suffix + ` (node, ts, cpu, cpu_max, steal, steal_max,
-				load1, load1_max, load5, load15, mem_total, mem_used, mem_used_max, swap_total, swap_used, swap_used_max)
+				load1, load1_max, load5, load15, mem_total, mem_used, mem_used_max, swap_total, swap_used, swap_used_max,
+				tcp, tcp_max, udp, udp_max, tcp_tw, threads, threads_max)
 			SELECT node, ts / :step * :step, avg(cpu), max(cpu), avg(steal), max(steal),
 				avg(load1), max(load1), avg(load5), avg(load15),
-				max(mem_total), avg(mem_used), max(mem_used), max(swap_total), avg(swap_used), max(swap_used)
+				max(mem_total), avg(mem_used), max(mem_used), max(swap_total), avg(swap_used), max(swap_used),
+				avg(tcp), max(tcp), avg(udp), max(udp), avg(tcp_tw), avg(threads), max(threads)
 			FROM metrics_raw WHERE ts >= :from GROUP BY node, ts / :step`,
 
 			`INSERT OR REPLACE INTO net` + suffix + ` (node, iface, ts, rx, rx_max, tx, tx_max)

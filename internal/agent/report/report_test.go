@@ -52,11 +52,12 @@ func open(t *testing.T, aead cipher.AEAD, pkt []byte) *pb.Report {
 
 func typical() *pb.Report {
 	r := &pb.Report{
-		Ts:   time.Now().Unix(),
-		Cpu:  &pb.CPU{Usage: 12.5, Steal: 0.3},
-		Load: &pb.Load{L1: 0.1, L5: 0.2, L15: 0.3},
-		Mem:  &pb.Mem{Total: 2 << 30, Used: 1 << 30},
-		Net:  []*pb.NetRate{{Iface: "eth0", RxRate: 123456, TxRate: 654321}},
+		Ts:      time.Now().Unix(),
+		Cpu:     &pb.CPU{Usage: 12.5, Steal: 0.3},
+		Load:    &pb.Load{L1: 0.1, L5: 0.2, L15: 0.3, Threads: 312},
+		Mem:     &pb.Mem{Total: 2 << 30, Used: 1 << 30},
+		Sockets: &pb.Sockets{Tcp: 42, Udp: 7, TcpTw: 12},
+		Net:     []*pb.NetRate{{Iface: "eth0", RxRate: 123456, TxRate: 654321}},
 		Traffic: []*pb.IfaceTraffic{{Iface: "eth0",
 			Cur:  &pb.Period{Start: "2026-09-01", Rx: 51234567890, Tx: 40123456789},
 			Prev: &pb.Period{Start: "2026-08-01", Rx: 61234567890, Tx: 50123456789}}},
@@ -289,6 +290,8 @@ func TestSenderProbesOnlyNewestWhileDown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.redial()
+	t.Cleanup(func() { s.conn.Close() })
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	s.started = now
@@ -353,5 +356,28 @@ func TestSenderIgnoresForeignAcks(t *testing.T) {
 	s.handleAck(good)
 	if q, _ := s.Stats(); q != 0 {
 		t.Fatal("valid ack ignored")
+	}
+}
+
+// A report queued before the socket exists goes out on the first pump after
+// the dial, not retryAfter later.
+func TestSenderSendsQueuedReportAfterDial(t *testing.T) {
+	s, err := NewSender("127.0.0.1:9", testNode, testToken, discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	s.started = now
+	s.Enqueue(typical())
+	if !s.queue[0].lastSent.IsZero() {
+		t.Fatal("marked as sent without a socket")
+	}
+	s.redial()
+	t.Cleanup(func() { s.conn.Close() })
+	now = now.Add(pumpEvery)
+	s.pump()
+	if !s.queue[0].lastSent.Equal(now) {
+		t.Fatalf("not sent on the first pump after dialing (last sent %v)", s.queue[0].lastSent)
 	}
 }

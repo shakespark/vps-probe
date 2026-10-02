@@ -20,6 +20,7 @@ const (
 	maxLoad    = 1e4
 	maxRTT     = 60000 // ms
 	maxPingCnt = 1e5
+	maxCount   = 1e7 // sockets, threads
 )
 
 // Sanitize removes out-of-range values from rep in place and returns how
@@ -41,6 +42,13 @@ func Sanitize(rep *pb.Report) (dropped int) {
 	}
 	if l := rep.Load; l != nil && !(inRange(l.L1, 0, maxLoad) && inRange(l.L5, 0, maxLoad) && inRange(l.L15, 0, maxLoad)) {
 		rep.Load = nil
+		drop()
+	} else if l != nil && l.Threads > maxCount {
+		l.Threads = 0
+		drop()
+	}
+	if k := rep.Sockets; k != nil && !(k.Tcp <= maxCount && k.Udp <= maxCount && k.TcpTw <= maxCount) {
+		rep.Sockets = nil
 		drop()
 	}
 	if m := rep.Mem; m != nil && !(m.Total <= maxBytes && m.Used <= m.Total && m.SwapTotal <= maxBytes && m.SwapUsed <= m.SwapTotal) {

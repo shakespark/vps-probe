@@ -162,6 +162,13 @@ td.self { color: var(--muted); }
 .legend .l3::before { background: var(--lat3); }
 .legend .l4::before { background: var(--lat4); }
 
+/* Overview */
+.region { font-size: 11px; padding: 0 5px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); letter-spacing: .02em; }
+table.nodes th, table.nodes td { text-align: left; }
+table.nodes td .bar { width: 56px; }
+table.nodes tr.offline td { opacity: .7; }
+table.nodes .badge { margin-left: 4px; }
+
 /* Network quality */
 .quality { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px 24px; }
 .q-col { min-width: 0; }

@@ -33,6 +33,10 @@ type Status struct {
 	MemUsed   *int64   `json:"mem_used"`
 	SwapTotal *int64   `json:"swap_total"`
 	SwapUsed  *int64   `json:"swap_used"`
+	TCP       *int64   `json:"tcp"` // sockets and threads: null before agent 0.1.9
+	UDP       *int64   `json:"udp"`
+	TCPTW     *int64   `json:"tcp_tw"`
+	Threads   *int64   `json:"threads"`
 
 	Net     []IfaceRate `json:"net"`
 	Disks   []Disk      `json:"disks"`
@@ -102,10 +106,11 @@ func (s *Store) Status(ctx context.Context, node string) (*Status, error) {
 		}
 	}
 
-	err = s.r.QueryRowContext(ctx, `SELECT ts, cpu, steal, load1, load5, load15, mem_total, mem_used, swap_total, swap_used
+	err = s.r.QueryRowContext(ctx, `SELECT ts, cpu, steal, load1, load5, load15, mem_total, mem_used, swap_total, swap_used,
+			tcp, udp, tcp_tw, threads
 		FROM metrics_raw WHERE node = ? ORDER BY ts DESC LIMIT 1`, rid).
 		Scan(&st.MetricsTS, &st.CPU, &st.Steal, &st.Load1, &st.Load5, &st.Load15,
-			&st.MemTotal, &st.MemUsed, &st.SwapTotal, &st.SwapUsed)
+			&st.MemTotal, &st.MemUsed, &st.SwapTotal, &st.SwapUsed, &st.TCP, &st.UDP, &st.TCPTW, &st.Threads)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err
 	}
@@ -262,6 +267,13 @@ var metricCols = []column{
 	{"swap_total", "max(swap_total)", "max(swap_total)"},
 	{"swap_used", "avg(swap_used)", "avg(swap_used)"},
 	{"swap_used_max", "max(swap_used)", "max(swap_used_max)"},
+	{"tcp", "avg(tcp)", "avg(tcp)"},
+	{"tcp_max", "max(tcp)", "max(tcp_max)"},
+	{"udp", "avg(udp)", "avg(udp)"},
+	{"udp_max", "max(udp)", "max(udp_max)"},
+	{"tcp_tw", "avg(tcp_tw)", "avg(tcp_tw)"},
+	{"threads", "avg(threads)", "avg(threads)"},
+	{"threads_max", "max(threads)", "max(threads_max)"},
 }
 
 var netCols = []column{

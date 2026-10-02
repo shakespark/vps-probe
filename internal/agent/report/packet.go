@@ -42,9 +42,10 @@ func Packetize(aead cipher.AEAD, node string, rep *pb.Report) ([]Packet, error) 
 
 	// Each item adds one field (or one repeated element) to a piece.
 	var items []func(*pb.Report)
-	if rep.Cpu != nil || rep.Load != nil || rep.Mem != nil {
-		cpu, load, mem := rep.Cpu, rep.Load, rep.Mem
-		items = append(items, func(r *pb.Report) { r.Cpu, r.Load, r.Mem = cpu, load, mem })
+	// The server stores these four in one metrics row.
+	if rep.Cpu != nil || rep.Load != nil || rep.Mem != nil || rep.Sockets != nil {
+		cpu, load, mem, sockets := rep.Cpu, rep.Load, rep.Mem, rep.Sockets
+		items = append(items, func(r *pb.Report) { r.Cpu, r.Load, r.Mem, r.Sockets = cpu, load, mem, sockets })
 	}
 	for _, t := range rep.Traffic {
 		items = append(items, func(r *pb.Report) { r.Traffic = append(r.Traffic, t) })
