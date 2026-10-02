@@ -530,7 +530,7 @@ function matrixPage() {
       const cols = [...data.nodes, ...extra];
       renderQuality(quality, data.links, avail, nameOf, windowText, rangeText);
       srcSel.fill([['', '全部发起方'], ...data.nodes.map(id => [id, nameOf(id)])], availFilter.src);
-      renderStrips(strips, avail, data.nodes, cols, nameOf);
+      if (stale) renderStrips(strips, avail, data.nodes, cols, nameOf); // unchanged otherwise
       if (!data.links.length) {
         wrap.replaceChildren(h('div', { class: 'empty', text: '这个窗口内没有时延数据' }));
         return;
@@ -587,6 +587,9 @@ function availClass(c, i) {
   return c.lost[i] * 100 >= c.sent[i] ? 'a-lossy' : 'a-up';
 }
 
+const fmtCellTime = new Intl.DateTimeFormat('zh-CN',
+  { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
+
 // One row per link: a strip of cells like a status page's heartbeat bar.
 function renderStrips(box, avail, nodes, cols, nameOf) {
   const order = (arr, v) => { const i = arr.indexOf(v); return i < 0 ? arr.length : i; };
@@ -596,11 +599,10 @@ function renderStrips(box, avail, nodes, cols, nameOf) {
     box.replaceChildren(h('div', { class: 'empty', text: '这段时间内没有时延数据' }));
     return;
   }
-  const short = { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false };
-  const when = i => {
-    const a = new Date((avail.from + i * avail.cell) * 1000), b = new Date((avail.from + (i + 1) * avail.cell) * 1000);
-    return `${a.toLocaleString('zh-CN', short)} – ${b.toLocaleString('zh-CN', short)}`;
-  };
+  // Every link shares the same cells: label them once. toLocaleString with
+  // options builds a new formatter per call, far too slow for thousands of cells.
+  const t = i => fmtCellTime.format(new Date((avail.from + i * avail.cell) * 1000));
+  const when = Array.from({ length: avail.n }, (_, i) => `${t(i)} – ${t(i + 1)}`);
   const out = [];
   let src = null;
   for (const a of links) {
@@ -610,8 +612,8 @@ function renderStrips(box, avail, nodes, cols, nameOf) {
     }
     const c = a.cells;
     const cells = c.periods.map((p, i) => h('span', { class: availClass(c, i), title: p
-      ? `${when(i)}\n可用 ${p - c.down[i]} / ${p} 个 5 分钟\n丢包 ${fmtPct(100 * c.lost[i] / c.sent[i], 2)}  平均 ${fmtMs(c.avg[i])}`
-      : `${when(i)}\n无数据` }));
+      ? `${when[i]}\n可用 ${p - c.down[i]} / ${p} 个 5 分钟\n丢包 ${fmtPct(100 * c.lost[i] / c.sent[i], 2)}  平均 ${fmtMs(c.avg[i])}`
+      : `${when[i]}\n无数据` }));
     out.push(h('a', { class: 'avail-row', href: linkHref(a.src, a.dst) },
       h('span', { class: 'avail-name', text: nameOf(a.dst), title: `${a.src} → ${a.dst}` }),
       h('span', { class: 'strip' }, cells),
