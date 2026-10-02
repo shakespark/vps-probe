@@ -494,3 +494,88 @@ func (s *Store) each(ctx context.Context, q string, args []any, fn func(*sql.Row
 	}
 	return rows.Err()
 }
+
+// DownLossPct marks a 5-minute period as unavailable: at least this share
+// of its pings got no reply. It matches the default ping_loss rule.
+const DownLossPct = 20
+
+// Availability is one link's history in equal cells, from the 5m rollups.
+// Periods counts 5-minute periods with data, Down those at or above
+// DownLossPct; a cell without data has zero periods.
+type Availability struct {
+	Src      string   `json:"src"`
+	Dst      string   `json:"dst"`
+	Periods  int64    `json:"periods"`
+	Down     int64    `json:"down"`
+	AvailPct *float64 `json:"avail_pct"` // null without data
+	Sent     int64    `json:"sent"`
+	Lost     int64    `json:"lost"`
+	Avg      *float64 `json:"avg"`
+	Cells    Cells    `json:"cells"`
+}
+
+// Cells is column-oriented: index i covers [from + i*cell, from + (i+1)*cell).
+type Cells struct {
+	Periods []int64    `json:"periods"`
+	Down    []int64    `json:"down"`
+	Sent    []int64    `json:"sent"`
+	Lost    []int64    `json:"lost"`
+	Avg     []*float64 `json:"avg"`
+}
+
+// Availability splits [from, from + n*cell) into n cells for every link
+// with data in that span. cell must be a multiple of 5 minutes.
+func (s *Store) Availability(ctx context.Context, from, cell int64, n int) ([]*Availability, error) {
+	out := []*Availability{}
+	byLink := map[[2]string]*Availability{}
+	avgW := map[*Availability]float64{} // sum(avg * replies) over the whole span
+	replies := map[*Availability]int64{}
+	err := s.each(ctx, `SELECT src, dst, (ts - ?1) / ?2 AS i, count(*), sum(lost * 100 >= sent * ?3),
+			sum(sent), sum(lost),
+			sum(avg * (sent - lost)), sum(CASE WHEN avg IS NULL THEN 0 ELSE sent - lost END)
+		FROM ping_5m WHERE ts >= ?1 AND ts < ?1 + ?2 * ?4 AND sent > 0
+		GROUP BY src, dst, i ORDER BY src, dst, i`,
+		[]any{from, cell, DownLossPct, n}, func(r *sql.Rows) error {
+			var rid, i, periods, down, sent, lost, rep int64
+			var dst string
+			var w sql.NullFloat64
+			if err := r.Scan(&rid, &dst, &i, &periods, &down, &sent, &lost, &w, &rep); err != nil {
+				return err
+			}
+			src, ok := s.nodeName(rid)
+			if !ok || i < 0 || i >= int64(n) {
+				return nil
+			}
+			a := byLink[[2]string{src, dst}]
+			if a == nil {
+				a = &Availability{Src: src, Dst: dst, Cells: Cells{Periods: make([]int64, n), Down: make([]int64, n),
+					Sent: make([]int64, n), Lost: make([]int64, n), Avg: make([]*float64, n)}}
+				byLink[[2]string{src, dst}] = a
+				out = append(out, a)
+			}
+			c := &a.Cells
+			c.Periods[i], c.Down[i], c.Sent[i], c.Lost[i] = periods, down, sent, lost
+			if rep > 0 && w.Valid {
+				v := w.Float64 / float64(rep)
+				c.Avg[i] = &v
+				avgW[a] += w.Float64
+				replies[a] += rep
+			}
+			a.Periods += periods
+			a.Down += down
+			a.Sent += sent
+			a.Lost += lost
+			return nil
+		})
+	for _, a := range out {
+		if a.Periods > 0 {
+			v := 100 * float64(a.Periods-a.Down) / float64(a.Periods)
+			a.AvailPct = &v
+		}
+		if replies[a] > 0 {
+			v := avgW[a] / float64(replies[a])
+			a.Avg = &v
+		}
+	}
+	return out, err
+}

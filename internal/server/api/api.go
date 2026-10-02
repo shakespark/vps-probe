@@ -68,6 +68,7 @@ func (a *API) Handler(ui http.Handler) http.Handler {
 	mux.HandleFunc("GET /api/nodes/{id}/net", a.net)
 	mux.HandleFunc("GET /api/nodes/{id}/disks", a.disks)
 	mux.HandleFunc("GET /api/ping/matrix", a.matrix)
+	mux.HandleFunc("GET /api/ping/availability", a.availability)
 	mux.HandleFunc("GET /api/ping/{src}/{dst}", a.ping)
 	mux.HandleFunc("GET /api/traffic", a.traffic)
 	mux.HandleFunc("GET /api/traffic/{id}/daily", a.daily)
@@ -166,6 +167,38 @@ func (a *API) ping(w http.ResponseWriter, r *http.Request) {
 	}
 	s, err := a.store.Ping(r.Context(), src, dst, from, to)
 	a.reply(w, s, err)
+}
+
+// Availability ranges: cells of whole 5m periods, about 50-60 per strip.
+var availRanges = map[string]struct {
+	cell int64
+	n    int
+}{
+	"24h": {1800, 48},
+	"7d":  {3 * 3600, 56},
+	"30d": {12 * 3600, 60},
+}
+
+// availability returns every link's history as a strip of equal cells,
+// the last of which contains now.
+func (a *API) availability(w http.ResponseWriter, r *http.Request) {
+	rng := r.URL.Query().Get("range")
+	if rng == "" {
+		rng = "24h"
+	}
+	spec, ok := availRanges[rng]
+	if !ok {
+		http.Error(w, "range: want 24h, 7d or 30d", http.StatusBadRequest)
+		return
+	}
+	from := (a.now().Unix()/spec.cell+1)*spec.cell - int64(spec.n)*spec.cell
+	links, err := a.store.Availability(r.Context(), from, spec.cell, spec.n)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"range": rng, "from": from, "cell": spec.cell, "n": spec.n,
+		"down_loss_pct": store.DownLossPct, "links": links})
 }
 
 func (a *API) matrix(w http.ResponseWriter, r *http.Request) {

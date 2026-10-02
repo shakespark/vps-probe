@@ -386,3 +386,43 @@ func TestSourceIP(t *testing.T) {
 	at(t0+20, "2001:db8::1")
 	check("2001:db8::1", t0+20)
 }
+
+func TestAvailability(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().Truncate(time.Hour).Add(-2 * time.Hour)
+	start := now.Add(-time.Hour).Unix()
+	bad := now.Add(-30 * time.Minute).Unix() // one 5m period at 50% loss
+	for ts := start; ts < now.Unix(); ts += 10 {
+		p := &pb.Ping{Target: "b", Sent: 10, Lost: 0, Min: 5, Avg: 10, Max: 20}
+		if ts >= bad && ts < bad+300 {
+			p.Lost, p.Avg = 5, 20
+		}
+		write(t, s, "a", &pb.Report{Ts: ts, Pings: []*pb.Ping{p, {Target: "void", Sent: 10, Lost: 10}}}, time.Unix(ts, 0))
+	}
+	if err := s.Rollup(time.Unix(start, 0)); err != nil {
+		t.Fatal(err)
+	}
+	links, err := s.Availability(ctx, start, 1800, 3) // the third cell has no data
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 2 || links[0].Dst != "b" || links[1].Dst != "void" {
+		t.Fatalf("links: %+v", links)
+	}
+	b := links[0]
+	c := b.Cells
+	if b.Periods != 12 || b.Down != 1 || c.Periods[0] != 6 || c.Down[0] != 0 || c.Down[1] != 1 || c.Periods[2] != 0 {
+		t.Fatalf("periods: %+v %+v", b, c)
+	}
+	if *b.AvailPct != 100*11.0/12 || b.Sent != 3600 || b.Lost != 150 {
+		t.Fatalf("totals: avail %v sent %d lost %d", *b.AvailPct, b.Sent, b.Lost)
+	}
+	// Cell 1: 150 replies at 20 ms and 1500 at 10 ms.
+	if got := *c.Avg[1]; got < 10.9 || got > 10.91 || *c.Avg[0] != 10 || c.Avg[2] != nil {
+		t.Fatalf("cell avg: %v %v %v", *c.Avg[0], got, c.Avg[2])
+	}
+	v := links[1]
+	if *v.AvailPct != 0 || v.Down != 12 || v.Avg != nil || v.Cells.Avg[0] != nil {
+		t.Fatalf("dead link: %+v", v)
+	}
+}

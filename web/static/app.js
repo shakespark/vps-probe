@@ -482,27 +482,55 @@ function latClass(link) {
   return 'lat' + lvl;
 }
 
+const WINDOWS = [['5m', '5 分钟'], ['15m', '15 分钟'], ['1h', '1 小时']];
+const AVAIL_RANGES = [['24h', '24 小时'], ['7d', '7 天'], ['30d', '30 天']];
+const availFilter = { range: '24h', src: '' };
+const AVAIL_EVERY = 60000; // the strips come from 5m rollups; no need to poll them every 10s
+
 function matrixPage() {
   const wrap = h('div', { class: 'table-wrap' });
+  const quality = h('div', { class: 'quality' });
+  const strips = h('div', { class: 'avail' });
+  const srcSel = picker(v => { availFilter.src = v; rerender(); });
+  const windowText = WINDOWS.find(([v]) => v === matrixWindow)[1];
+  const rangeText = AVAIL_RANGES.find(([v]) => v === availFilter.range)[1];
+  let avail = null, availAt = 0;
   const el = h('div', null,
-    h('div', { class: 'row' }, h('h1', { text: '时延矩阵' }), h('span', { class: 'spacer' }),
+    h('div', { class: 'row' }, h('h1', { text: '时延' }), h('span', { class: 'spacer' }),
       h('span', { class: 'muted', text: '统计窗口' }),
-      seg([['5m', '5 分钟'], ['15m', '15 分钟'], ['1h', '1 小时']], matrixWindow, v => { matrixWindow = v; rerender(); })),
-    h('div', { class: 'panel section' }, wrap,
+      seg(WINDOWS, matrixWindow, v => { matrixWindow = v; rerender(); })),
+    h('div', { class: 'panel section' }, h('h2', { text: '网络质量' }), quality),
+    h('div', { class: 'panel section' }, h('h2', { text: `时延矩阵（最近 ${windowText}）` }), wrap,
       h('div', { class: 'legend muted' },
         h('span', { class: 'l0', text: '< 30 ms' }), h('span', { class: 'l1', text: '< 80 ms' }),
         h('span', { class: 'l2', text: '< 150 ms' }), h('span', { class: 'l3', text: '< 250 ms 或丢包 ≥ 5%' }),
         h('span', { class: 'l4', text: '更高 / 丢包 ≥ 20% / 不通' }),
-        h('span', { text: '行 = 发起方，列 = 目标；点击格子查看历史' }))));
+        h('span', { text: '行 = 发起方，列 = 目标；点击格子查看历史' }))),
+    h('div', { class: 'panel section' },
+      h('div', { class: 'row filters' }, h('h2', { text: '链路可用性' }), h('span', { class: 'spacer' }),
+        seg(AVAIL_RANGES, availFilter.range, v => { availFilter.range = v; rerender(); }), srcSel),
+      strips,
+      h('div', { class: 'legend muted' },
+        h('span', { class: 'a-up', text: '正常' }), h('span', { class: 'a-lossy', text: '丢包 ≥ 1%' }),
+        h('span', { class: 'a-part', text: '部分时段不可用' }), h('span', { class: 'a-down', text: '一半以上时段不可用' }),
+        h('span', { class: 'a-none', text: '无数据' }),
+        h('span', { text: '某个 5 分钟丢包 ≥ 20% 记为不可用；可用率 = 可用的 5 分钟 / 有数据的 5 分钟' }))));
   return {
     nav: 'ping',
     el,
     async refresh() {
-      const [data, nodes] = await Promise.all([api('/api/ping/matrix?window=' + matrixWindow), api('/api/nodes')]);
+      const stale = Date.now() - availAt >= AVAIL_EVERY;
+      const [data, nodes, av] = await Promise.all([api('/api/ping/matrix?window=' + matrixWindow), api('/api/nodes'),
+        stale ? api('/api/ping/availability?range=' + availFilter.range) : avail]);
+      if (stale) { avail = av; availAt = Date.now(); }
       const names = new Map(nodes.map(n => [n.id, n.name]));
+      const nameOf = id => names.get(id) || id;
       const links = new Map(data.links.map(l => [l.src + '\n' + l.dst, l]));
-      const extra = [...new Set(data.links.map(l => l.dst).filter(d => !names.has(d)))].sort();
+      const extra = [...new Set([...data.links, ...avail.links].map(l => l.dst).filter(d => !names.has(d)))].sort();
       const cols = [...data.nodes, ...extra];
+      renderQuality(quality, data.links, avail, nameOf, windowText, rangeText);
+      srcSel.fill([['', '全部发起方'], ...data.nodes.map(id => [id, nameOf(id)])], availFilter.src);
+      renderStrips(strips, avail, data.nodes, cols, nameOf);
       if (!data.links.length) {
         wrap.replaceChildren(h('div', { class: 'empty', text: '这个窗口内没有时延数据' }));
         return;
@@ -518,13 +546,81 @@ function matrixPage() {
           const tip = `${src} → ${dst}\n平均 ${fmtMs(l.avg)}  最小 ${fmtMs(l.min)}  最大 ${fmtMs(l.max)}\n` +
             `抖动 ${fmtMs(l.jitter)}  丢包 ${fmtPct(l.loss_pct)}（${l.lost}/${l.sent}）`;
           return h('td', { class: 'cell ' + latClass(l), title: tip,
-            onclick: () => { location.hash = `#/ping/${enc(src)}/${enc(dst)}`; } },
+            onclick: () => { location.hash = linkHref(src, dst); } },
           h('span', { class: 'ms', text: l.avg == null ? '不通' : fmtMs(l.avg) }),
           l.loss_pct > 0 && l.avg != null ? h('span', { class: 'loss', text: '丢包 ' + fmtPct(l.loss_pct, 0) }) : null);
         })));
       wrap.replaceChildren(h('table', { class: 'matrix' }, h('thead', null, head), h('tbody', null, rows)));
     },
   };
+}
+
+const linkHref = (src, dst) => `#/ping/${enc(src)}/${enc(dst)}`;
+
+// Top three links by a few measures: what to look at first.
+function renderQuality(box, links, avail, nameOf, windowText, rangeText) {
+  const linkText = l => `${nameOf(l.src)} → ${nameOf(l.dst)}`;
+  const col = (title, items, empty) => h('div', { class: 'q-col' }, h('div', { class: 'k', text: title }),
+    items.length ? items.map(([l, v, cls]) => h('a', { class: 'q-item', href: linkHref(l.src, l.dst) },
+      h('span', { class: 'q-name', text: linkText(l) }), h('span', { class: 'num' + (cls ? ' ' + cls : ''), text: v })))
+      : h('div', { class: 'muted', text: empty }));
+  const top = (arr, key) => arr.filter(l => key(l) > 0).sort((a, b) => key(b) - key(a)).slice(0, 3);
+  // Only links still measured: a link dropped by no_ping keeps old data in the range.
+  const live = new Set(links.map(l => l.src + '\n' + l.dst));
+  box.replaceChildren(
+    col(`丢包最多（${windowText}）`, top(links, l => l.loss_pct).map(l =>
+      [l, l.avg == null ? '不通' : '丢包 ' + fmtPct(l.loss_pct, 1), l.loss_pct >= 20 ? 'bad' : 'warn']), '没有丢包'),
+    col(`抖动最大（${windowText}）`, top(links.filter(l => l.jitter != null), l => l.jitter).map(l =>
+      [l, '抖动 ' + fmtMs(l.jitter), null]), '没有数据'),
+    col(`可用率最低（${rangeText}）`, top(avail.links.filter(a => a.avail_pct != null && live.has(a.src + '\n' + a.dst)), a => 100 - a.avail_pct).map(a =>
+      [a, '可用 ' + fmtAvail(a.avail_pct), a.avail_pct < 99 ? 'bad' : 'warn']), '全部 100%'));
+}
+
+// Rounded down so that 99.996% doesn't show as 100%.
+const fmtAvail = v => v == null ? '—' : v >= 100 ? '100%' : (Math.floor(v * 100) / 100).toFixed(2) + '%';
+
+function availClass(c, i) {
+  const p = c.periods[i], d = c.down[i];
+  if (!p) return 'a-none';
+  if (d * 2 >= p) return 'a-down';
+  if (d > 0) return 'a-part';
+  return c.lost[i] * 100 >= c.sent[i] ? 'a-lossy' : 'a-up';
+}
+
+// One row per link: a strip of cells like a status page's heartbeat bar.
+function renderStrips(box, avail, nodes, cols, nameOf) {
+  const order = (arr, v) => { const i = arr.indexOf(v); return i < 0 ? arr.length : i; };
+  const links = avail.links.filter(a => !availFilter.src || a.src === availFilter.src)
+    .sort((a, b) => order(nodes, a.src) - order(nodes, b.src) || order(cols, a.dst) - order(cols, b.dst));
+  if (!links.length) {
+    box.replaceChildren(h('div', { class: 'empty', text: '这段时间内没有时延数据' }));
+    return;
+  }
+  const short = { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false };
+  const when = i => {
+    const a = new Date((avail.from + i * avail.cell) * 1000), b = new Date((avail.from + (i + 1) * avail.cell) * 1000);
+    return `${a.toLocaleString('zh-CN', short)} – ${b.toLocaleString('zh-CN', short)}`;
+  };
+  const out = [];
+  let src = null;
+  for (const a of links) {
+    if (a.src !== src) {
+      src = a.src;
+      out.push(h('div', { class: 'avail-src', text: nameOf(src) + ' →' }));
+    }
+    const c = a.cells;
+    const cells = c.periods.map((p, i) => h('span', { class: availClass(c, i), title: p
+      ? `${when(i)}\n可用 ${p - c.down[i]} / ${p} 个 5 分钟\n丢包 ${fmtPct(100 * c.lost[i] / c.sent[i], 2)}  平均 ${fmtMs(c.avg[i])}`
+      : `${when(i)}\n无数据` }));
+    out.push(h('a', { class: 'avail-row', href: linkHref(a.src, a.dst) },
+      h('span', { class: 'avail-name', text: nameOf(a.dst), title: `${a.src} → ${a.dst}` }),
+      h('span', { class: 'strip' }, cells),
+      h('span', { class: 'avail-stats num' },
+        h('span', { class: a.avail_pct < 99 ? 'bad' : a.avail_pct < 100 ? 'warn' : null, text: fmtAvail(a.avail_pct) }),
+        h('span', { class: 'muted', text: '丢包 ' + (a.sent ? fmtPct(100 * a.lost / a.sent, 2) : '—') }),
+        h('span', { class: 'muted', text: fmtMs(a.avg) }))));
+  }
+  box.replaceChildren(...out);
 }
 
 function linkPage(src, dst) {
