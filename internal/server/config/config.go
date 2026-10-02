@@ -17,6 +17,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"vpsprobe/internal/echo"
 	"vpsprobe/internal/wire"
 )
 
@@ -56,8 +57,18 @@ type Node struct {
 	ResetDay  int    `yaml:"reset_day"`
 	ResetTime string `yaml:"reset_time"` // HH:MM, default 00:00
 	// Node ids this node and those nodes don't ping, in either direction.
-	NoPing     []string `yaml:"no_ping"`
-	DisplayIdx int      `yaml:"-"` // position in the file
+	NoPing []string `yaml:"no_ping"`
+	// Non-node targets this node pings, e.g. 1.1.1.1 through a tunnel.
+	ExtraPeers []ExtraPeer `yaml:"extra_peers"`
+	DisplayIdx int         `yaml:"-"` // position in the file
+}
+
+// ExtraPeer is copied into the node's agent.yml ping.peers as is.
+type ExtraPeer struct {
+	Name string `yaml:"name"`
+	Addr string `yaml:"addr"`
+	Type string `yaml:"type"` // icmp (default) | dns | echo; addr is host:port for dns and echo
+	Key  string `yaml:"key"`  // echo: the responder's key
 }
 
 type Retention struct {
@@ -344,6 +355,33 @@ func (c *Config) validate() error {
 				bad("nodes[%s].no_ping: %q listed twice", n.ID, p)
 			}
 			seen[p] = true
+		}
+		for _, p := range n.ExtraPeers {
+			switch {
+			case !wire.ValidNode(p.Name):
+				bad("nodes[%s].extra_peers: name %q: must be 1-%d chars of letters, digits, '.', '_', '-'", n.ID, p.Name, wire.MaxNodeLen)
+			case ids[p.Name]:
+				bad("nodes[%s].extra_peers: %q is a node id; its latency would mix into that node's column", n.ID, p.Name)
+			case seen[p.Name]:
+				bad("nodes[%s].extra_peers: %q listed twice", n.ID, p.Name)
+			case p.Type == "" || p.Type == "icmp":
+				if !validHost(p.Addr) {
+					bad("nodes[%s].extra_peers[%s].addr %q: want an IP address or hostname, without port", n.ID, p.Name, p.Addr)
+				}
+			case p.Type == "dns" || p.Type == "echo":
+				host, port, err := net.SplitHostPort(p.Addr)
+				if pn, perr := strconv.ParseUint(port, 10, 16); err != nil || perr != nil || pn == 0 || !validHost(host) {
+					bad("nodes[%s].extra_peers[%s].addr %q: a %s peer wants host:port", n.ID, p.Name, p.Addr, p.Type)
+				}
+			default:
+				bad("nodes[%s].extra_peers[%s].type %q: want icmp, dns or echo", n.ID, p.Name, p.Type)
+			}
+			if p.Type == "echo" && len(p.Key) < echo.MinKeyLen {
+				bad("nodes[%s].extra_peers[%s].key: an echo peer needs the responder's key, at least %d characters", n.ID, p.Name, echo.MinKeyLen)
+			} else if p.Type != "echo" && p.Key != "" {
+				bad("nodes[%s].extra_peers[%s].key: only echo peers take a key", n.ID, p.Name)
+			}
+			seen[p.Name] = true
 		}
 	}
 

@@ -17,7 +17,10 @@ nodes:
   # token 用 `vps-probe-server gen-token` 生成，每台一个。
   # addr：其他节点 ping 它用的地址；reset_day：流量周期起始日（默认 1）；
   # reset_time：周期在当天几点开始（"HH:MM"，默认 00:00，按 timezone 计）；
-  # no_ping：与哪些节点互不 ping（双向，写在任意一方即可）。
+  # no_ping：与哪些节点互不 ping（双向，写在任意一方即可）；
+  # extra_peers：该节点额外 ping 的非节点目标（name 不能与节点 id 重名），
+  #   type: dns / echo 时 addr 写 host:port，测 UDP DNS 查询或隧道回显往返
+  #   （用于端口转发隧道，需 agent ≥ 0.1.4；echo 还要写应答端的 key）。
   # 这几项只用于 `vps-probe-server agent-config` 生成 agent.yml。
   - id: hk-1
     name: 香港 1
@@ -29,6 +32,10 @@ nodes:
     name: 日本 1
     token: "REPLACE-WITH-ANOTHER-gen-token-OUTPUT-01"
     # no_ping: [hk-1]          # 可选：hk-1 和 jp-1 互不 ping
+    # extra_peers:              # 可选：经隧道到 1.1.1.1 的时延
+    #   - { name: cf-vpn, addr: 1.1.1.1 }                          # VPN 型隧道，路由要走隧道
+    #   - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }   # 本地端口经转发到 1.1.1.1:53
+    #   - { name: hk1-via-sgp, addr: "127.0.0.1:39527", type: echo, key: "<hk-1 上 echo.yml 的 key>" }
 
 # 超过这么久没有新报文，页面上就显示离线，约为 agent interval 的 3 倍。
 # 离线告警由下面的 offline 规则决定（默认 60s），所以页面先变红、稍后才发告警，这是正常的。

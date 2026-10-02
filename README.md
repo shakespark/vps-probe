@@ -103,6 +103,12 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
 - 默认自动识别物理网卡（有 `/sys/class/net/<网卡>/device` 的）。识别不到时在 agent.yml 里写 `interfaces: [eth0]`。
 - 新增节点后，想让已有节点也 ping 它：给这些节点重新生成 agent.yml，再各自 `./install.sh agent --config ...`。
 - 某些节点之间不想互 ping：在其中一方写 `no_ping: [对方 id, ...]`（双向生效），然后给涉及的节点重新生成 agent.yml 并安装。
+- 测经隧道的时延：在发起探测的节点下写 `extra_peers`，再重新生成它的 agent.yml。
+  - VPN 型隧道：`{ name: cf-vpn, addr: 1.1.1.1 }`，到目标的路由要走隧道。
+  - TCP/UDP 转发型隧道（realm 等），两种方式（需 agent ≥ 0.1.4）：
+    - **隧道回显（推荐）**：隧道远端指向某台机器的 `39527/udp`，在那台机器上 `./install.sh echo --config echo.yml`（`key` 用 `gen-token` 生成，见 `examples/echo.example.yml`），探测方写 `{ name: hk2-via-sgp, addr: "127.0.0.1:本地转发端口", type: echo, key: 同一个 key }`。测的是隧道本身，不经任何公共服务。
+    - **DNS**：隧道远端指向 `1.1.1.1:53`，写 `{ name: cf-relay, addr: "127.0.0.1:本地转发端口", type: dns }`。
+  - 本地转发规则只监听 `127.0.0.1`；转发到 DNS 的端口如果监听 `0.0.0.0`，就成了公网开放的 DNS 中继。
 - 服务端那台机器本身也可以装 agent，`-server` 写 `127.0.0.1:9527` 即可。
 
 ## 5. 告警与 Telegram
@@ -124,6 +130,7 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
 ```sh
 ./install.sh server      # 服务端
 ./install.sh agent       # 每台 VPS
+./install.sh echo        # 装了隧道探测应答端的机器
 ```
 
 agent 停止前会把流量最后读一次并保存，升级不会丢月流量；服务端数据库结构有变化时启动时自动升级（只加表，不删数据）。建议升级服务端前先做一次备份（见下节）。
@@ -160,6 +167,7 @@ agent 停止前会把流量最后读一次并保存，升级不会丢月流量�
 ```sh
 ./install.sh uninstall agent            # 保留配置和流量状态
 ./install.sh uninstall server           # 保留配置和数据库
+./install.sh uninstall echo             # 隧道探测应答端
 ./install.sh uninstall agent --purge    # 连同配置、流量状态、系统用户一起删除
 ./install.sh uninstall server --purge   # 连同配置、数据库、备份、系统用户一起删除
 ```

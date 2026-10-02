@@ -1,0 +1,19 @@
+# vps-probe-echo config. Install as /etc/vps-probe/echo.yml,
+# owner root:vps-probe-echo, mode 0640 (it contains the key).
+#
+# The responder answers tunnel probes: an agent peer with `type: echo` sends
+# requests signed with this key (usually through a port forward that ends
+# here) and times the replies. Anything else gets no reply at all.
+
+listen: ":39527"            # UDP, IPv4 + IPv6
+
+# Shared with every agent peer that probes this responder.
+# Generate with `vps-probe-server gen-token`.
+key: "<key>"
+
+# Optional: only answer these source IPs / CIDRs, e.g. the egress IPs of the
+# relays in front of this node. Empty = any source with a valid signature.
+allow: []
+
+# Replies per second, at most (default 1000).
+# max_pps: 1000

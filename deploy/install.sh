@@ -3,7 +3,9 @@
 #
 #   ./install.sh agent  [--config FILE]     install or upgrade the agent
 #   ./install.sh server [--config FILE]     install or upgrade the server
-#   ./install.sh uninstall agent|server [--purge]
+#   ./install.sh echo   [--config FILE]     install or upgrade the tunnel-probe
+#                                           responder (only where a tunnel ends)
+#   ./install.sh uninstall agent|server|echo [--purge]
 #
 # Safe to run again: upgrades replace the binary and unit and restart the
 # service; an existing config is kept unless --config is given. Uninstall
@@ -21,7 +23,7 @@ warn() { printf 'warning: %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-	sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 	exit 2
 }
 
@@ -30,6 +32,7 @@ set_role() {
 	case "$1" in
 	agent) NAME=vps-probe-agent USER_=vps-probe STATE=/var/lib/vps-probe CONF=$ETC/agent.yml CHECK="-check -config" VER=-version ;;
 	server) NAME=vps-probe-server USER_=vps-probe-server STATE=/var/lib/vps-probe-server CONF=$ETC/server.yml CHECK="check -config" VER=version ;;
+	echo) NAME=vps-probe-echo USER_=vps-probe-echo STATE=/var/lib/vps-probe-echo CONF=$ETC/echo.yml CHECK="-check -config" VER=-version ;;
 	*) usage ;;
 	esac
 }
@@ -191,6 +194,15 @@ cmd_install() {
 			  - web UI: publish http://localhost:8080 through cloudflared + Access
 		EOF
 	fi
+	if [ "$NAME" = vps-probe-echo ]; then
+		cat <<-EOF
+
+			Next steps (see README):
+			  - allow the UDP port in $CONF to this machine (cloud security group / firewall)
+			  - point the tunnel's far end at this port, and add an echo peer with the
+			    same key to the probing node (server.yml extra_peers, then agent-config)
+		EOF
+	fi
 }
 
 cmd_uninstall() {
@@ -215,7 +227,7 @@ cmd_uninstall() {
 
 [ $# -ge 1 ] || usage
 case "$1" in
-agent | server)
+agent | server | echo)
 	ROLE=$1
 	set_role "$ROLE"
 	shift

@@ -6,9 +6,10 @@ import (
 	"strings"
 )
 
-// AgentConfig renders agent.yml for one node: its token, and every other
-// node that has an addr as a ping peer, except those paired by no_ping. The result is a local file for the
-// agent; nothing is ever pushed to agents.
+// AgentConfig renders agent.yml for one node: its token, every other node
+// that has an addr as a ping peer, except those paired by no_ping, and its
+// extra_peers. The result is a local file for the agent; nothing is ever
+// pushed to agents.
 func (c *Config) AgentConfig(id, serverAddr string) (string, error) {
 	n, ok := c.Node(id)
 	if !ok {
@@ -40,6 +41,18 @@ func (c *Config) AgentConfig(id, serverAddr string) (string, error) {
 			missing = append(missing, p.ID)
 		default:
 			peers = append(peers, fmt.Sprintf("    - { name: %q, addr: %q }\n", p.ID, p.Addr))
+		}
+	}
+	for _, p := range n.ExtraPeers {
+		// Older agents reject the type and key keys, so they're only
+		// written when needed.
+		switch p.Type {
+		case "", "icmp":
+			peers = append(peers, fmt.Sprintf("    - { name: %q, addr: %q }\n", p.Name, p.Addr))
+		case "echo":
+			peers = append(peers, fmt.Sprintf("    - { name: %q, addr: %q, type: %q, key: %q }\n", p.Name, p.Addr, p.Type, p.Key))
+		default:
+			peers = append(peers, fmt.Sprintf("    - { name: %q, addr: %q, type: %q }\n", p.Name, p.Addr, p.Type))
 		}
 	}
 	if len(peers) == 0 {

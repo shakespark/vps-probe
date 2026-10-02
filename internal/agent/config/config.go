@@ -9,11 +9,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
+	"vpsprobe/internal/echo"
 	"vpsprobe/internal/wire"
 )
 
@@ -52,6 +54,12 @@ type Ping struct {
 type Peer struct {
 	Name string `yaml:"name"`
 	Addr string `yaml:"addr"`
+	// icmp (default): echo to addr. For paths that only forward TCP/UDP,
+	// addr is host:port and: dns sends a DNS query (e.g. to a relay port
+	// forwarded to 1.1.1.1:53); echo sends a request signed with key to a
+	// vps-probe-echo responder.
+	Type string `yaml:"type"`
+	Key  string `yaml:"key"`
 }
 
 const MinTokenLen = 32
@@ -143,8 +151,22 @@ func (c *Config) validate() error {
 			bad("ping.peers: name and addr are required (%+v)", p)
 		case seen[p.Name]:
 			bad("ping.peers: duplicate name %q", p.Name)
+		case p.Type != "" && p.Type != "icmp" && p.Type != "dns" && p.Type != "echo":
+			bad("ping.peers[%s].type %q: want icmp, dns or echo", p.Name, p.Type)
+		case (p.Type == "dns" || p.Type == "echo") && !validHostPort(p.Addr):
+			bad("ping.peers[%s].addr %q: a %s peer wants host:port, e.g. 127.0.0.1:39527", p.Name, p.Addr, p.Type)
+		case p.Type == "echo" && len(p.Key) < echo.MinKeyLen:
+			bad("ping.peers[%s].key: an echo peer needs the responder's key, at least %d characters", p.Name, echo.MinKeyLen)
+		case p.Type != "echo" && p.Key != "":
+			bad("ping.peers[%s].key: only echo peers take a key", p.Name)
 		}
 		seen[p.Name] = true
 	}
 	return errors.Join(errs...)
+}
+
+func validHostPort(s string) bool {
+	host, port, err := net.SplitHostPort(s)
+	n, perr := strconv.ParseUint(port, 10, 16)
+	return err == nil && host != "" && perr == nil && n > 0
 }

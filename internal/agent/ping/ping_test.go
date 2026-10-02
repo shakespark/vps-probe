@@ -6,9 +6,12 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/netip"
 	"testing"
 	"time"
+
+	"vpsprobe/internal/echo"
 )
 
 var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -120,8 +123,8 @@ func TestFailedResolveBacksOff(t *testing.T) {
 		return netip.Addr{}, errors.New("dns down")
 	}
 	p := &Pinger{log: discard, peers: []*peerState{
-		{Peer: Peer{Name: "bad", Addr: "bad.example"}},
-		{Peer: Peer{Name: "good", Addr: "good.example"}},
+		{Peer: Peer{Name: "bad", Addr: "bad.example"}, host: "bad.example"},
+		{Peer: Peer{Name: "good", Addr: "good.example"}, host: "good.example"},
 	}}
 	now := time.Now()
 	p.maybeResolve(context.Background(), now)
@@ -145,5 +148,144 @@ func TestFailedResolveBacksOff(t *testing.T) {
 	}
 	if p.peers[1].ip != netip.MustParseAddr("192.0.2.10") {
 		t.Fatalf("good peer ip = %v", p.peers[1].ip)
+	}
+}
+
+// fakeResolver answers every query on a loopback UDP port, echoing the ID
+// with the response bit set, unless mute is set.
+func fakeResolver(t *testing.T, mute bool) string {
+	t.Helper()
+	c, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, from, err := c.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if mute || n < 12 {
+				continue
+			}
+			resp := append([]byte(nil), buf[:n]...)
+			resp[2] |= 0x80
+			c.WriteTo([]byte{0, 0, 0}, from) // garbage is ignored
+			c.WriteTo(resp, from)
+		}
+	}()
+	return c.LocalAddr().String()
+}
+
+func runFor(p *Pinger, d time.Duration) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx)
+		close(done)
+	}()
+	time.Sleep(d)
+	cancel()
+	<-done
+}
+
+func TestDNS(t *testing.T) {
+	addr := fakeResolver(t, false)
+	// DNS peers need no ICMP socket, so this runs everywhere.
+	p, err := New([]Peer{{Name: "cf", Addr: addr, Type: TypeDNS}}, 100*time.Millisecond, 500*time.Millisecond, discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.v4 != nil || p.v6 != nil {
+		t.Fatal("ICMP socket opened for DNS-only peers")
+	}
+	runFor(p, 1200*time.Millisecond)
+	s := p.Snapshot(time.Now())[0]
+	if s.Target != "cf" || s.Addr != addr {
+		t.Fatalf("got %+v", s)
+	}
+	if s.Sent < 5 || s.Lost != 0 {
+		t.Fatalf("sent=%d lost=%d", s.Sent, s.Lost)
+	}
+	if s.Min <= 0 || s.Avg < s.Min || s.Max < s.Avg || s.Max > 100 {
+		t.Fatalf("implausible rtt: %+v", s)
+	}
+	// At most the query sent just before shutdown is unanswered.
+	if n := len(p.peers[0].udpWait); n > 1 {
+		t.Fatalf("answered queries still waiting: %d", n)
+	}
+}
+
+func TestDNSNoAnswerIsLost(t *testing.T) {
+	addr := fakeResolver(t, true)
+	p, err := New([]Peer{{Name: "cf", Addr: addr, Type: TypeDNS}}, 50*time.Millisecond, 200*time.Millisecond, discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runFor(p, 300*time.Millisecond)
+	s := p.Snapshot(time.Now().Add(time.Second))[0]
+	if s.Sent < 3 || s.Lost != s.Sent || s.Avg != 0 {
+		t.Fatalf("got %+v", s)
+	}
+	if len(p.peers[0].udpWait) != 0 {
+		t.Fatalf("timed-out queries still waiting: %d", len(p.peers[0].udpWait))
+	}
+}
+
+func TestDNSBadAddr(t *testing.T) {
+	for _, a := range []string{"1.1.1.1", "1.1.1.1:0", "1.1.1.1:dns", "1.1.1.1:70000"} {
+		if _, err := New([]Peer{{Name: "x", Addr: a, Type: TypeDNS}}, time.Second, time.Second, discard); err == nil {
+			t.Errorf("%q accepted", a)
+		}
+	}
+}
+
+func TestDNSQuery(t *testing.T) {
+	q := dnsQuery(0xabcd)
+	if len(q) != 33 || q[0] != 0xab || q[1] != 0xcd || q[2]&0x80 != 0 || q[5] != 1 {
+		t.Fatalf("query % x", q)
+	}
+}
+
+func TestEcho(t *testing.T) {
+	key := []byte("abcdefghijklmnopqrstuvwxyz0123456789")
+	c, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go (&echo.Responder{Key: key, Log: discard}).Serve(c)
+	t.Cleanup(func() { c.Close() })
+	addr := c.LocalAddr().String()
+
+	p, err := New([]Peer{
+		{Name: "tun", Addr: addr, Type: TypeEcho, Key: string(key)},
+		{Name: "wrong-key", Addr: addr, Type: TypeEcho, Key: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"},
+	}, 100*time.Millisecond, 500*time.Millisecond, discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runFor(p, 1200*time.Millisecond)
+	st := p.Snapshot(time.Now().Add(time.Second))
+	// Lost <= 1: the request sent just before shutdown never gets its reply.
+	if s := st[0]; s.Sent < 5 || s.Lost > 1 || s.Addr != addr || s.Min <= 0 || s.Max > 100 {
+		t.Fatalf("tun: %+v", s)
+	}
+	// The responder ignores a request signed with another key.
+	if s := st[1]; s.Sent < 5 || s.Lost != s.Sent {
+		t.Fatalf("wrong-key: %+v", s)
+	}
+}
+
+func TestBadPeers(t *testing.T) {
+	for name, pr := range map[string]Peer{
+		"type":      {Name: "x", Addr: "1.1.1.1", Type: "tcp"},
+		"short key": {Name: "x", Addr: "127.0.0.1:39527", Type: TypeEcho, Key: "short"},
+		"echo port": {Name: "x", Addr: "127.0.0.1", Type: TypeEcho, Key: "abcdefghijklmnopqrstuvwxyz0123456789"},
+	} {
+		if _, err := New([]Peer{pr}, time.Second, time.Second, discard); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }

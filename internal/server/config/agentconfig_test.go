@@ -96,3 +96,71 @@ nodes:
 		}
 	}
 }
+
+func TestExtraPeers(t *testing.T) {
+	c, err := Parse([]byte(`
+nodes:
+  - id: a
+    token: ` + tokA + `
+    extra_peers:
+      - {name: cf-ppp, addr: 1.1.1.1}
+      - {name: cf-relay, addr: "127.0.0.1:15353", type: dns}
+      - {name: tun, addr: "127.0.0.1:39527", type: echo, key: ` + tokB + `}
+  - {id: b, token: ` + tokB + `, addr: b.example.com}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := c.AgentConfig("a", "198.51.100.1:9527")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := agentconfig.Parse([]byte(out))
+	if err != nil {
+		t.Fatalf("generated config does not load: %v\n%s", err, out)
+	}
+	want := []agentconfig.Peer{
+		{Name: "b", Addr: "b.example.com"},
+		{Name: "cf-ppp", Addr: "1.1.1.1"},
+		{Name: "cf-relay", Addr: "127.0.0.1:15353", Type: "dns"},
+		{Name: "tun", Addr: "127.0.0.1:39527", Type: "echo", Key: tokB},
+	}
+	if len(a.Ping.Peers) != len(want) {
+		t.Fatalf("peers %+v", a.Ping.Peers)
+	}
+	for i := range want {
+		if a.Ping.Peers[i] != want[i] {
+			t.Fatalf("peer %d = %+v, want %+v", i, a.Ping.Peers[i], want[i])
+		}
+	}
+	if strings.Contains(out, `"icmp"`) {
+		t.Fatalf("type written for an icmp peer (older agents reject it):\n%s", out)
+	}
+	// Extra peers are only this node's.
+	out, _ = c.AgentConfig("b", "198.51.100.1:9527")
+	if strings.Contains(out, "cf-") {
+		t.Fatalf("b got a's extra peers:\n%s", out)
+	}
+}
+
+func TestBadExtraPeers(t *testing.T) {
+	for name, p := range map[string]string{
+		"node id":     "{name: b, addr: 1.1.1.1}",
+		"bad name":    "{name: 'a b', addr: 1.1.1.1}",
+		"icmp port":   "{name: x, addr: '1.1.1.1:53'}",
+		"dns no port": "{name: x, addr: 1.1.1.1, type: dns}",
+		"dns port 0":  "{name: x, addr: '1.1.1.1:0', type: dns}",
+		"type":        "{name: x, addr: 1.1.1.1, type: tcp}",
+		"echo no key": "{name: x, addr: '1.1.1.1:39527', type: echo}",
+		"key on dns":  "{name: x, addr: '1.1.1.1:53', type: dns, key: " + tokB + "}",
+	} {
+		cfg := "nodes:\n  - {id: a, token: " + tokA + ", extra_peers: [" + p + "]}\n  - {id: b, token: " + tokB + "}\n"
+		if _, err := Parse([]byte(cfg)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	dup := "nodes:\n  - {id: a, token: " + tokA + ", extra_peers: [{name: x, addr: 1.1.1.1}, {name: x, addr: 8.8.8.8}]}\n"
+	if _, err := Parse([]byte(dup)); err == nil {
+		t.Error("duplicate accepted")
+	}
+}

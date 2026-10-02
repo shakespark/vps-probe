@@ -46,11 +46,13 @@ ping:
   peers:
     - { name: jp-1, addr: 203.0.113.5 }
     - { name: us-1, addr: us1.example.com }
+    - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }
+    - { name: hk2-tun, addr: "127.0.0.1:39527", type: echo, key: abcdefghijklmnopqrstuvwxyz0123456789 }
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Interval != 5*time.Second || c.Traffic.ResetDay != 15 || c.Traffic.ResetHour != 18 || c.Traffic.ResetMinute != 21 || len(c.Ping.Peers) != 2 || c.Interfaces[0] != "eth0" {
+	if c.Interval != 5*time.Second || c.Traffic.ResetDay != 15 || c.Traffic.ResetHour != 18 || c.Traffic.ResetMinute != 21 || len(c.Ping.Peers) != 4 || c.Ping.Peers[2].Type != "dns" || c.Ping.Peers[3].Key == "" || c.Interfaces[0] != "eth0" {
 		t.Fatalf("got %+v", c)
 	}
 }
@@ -70,6 +72,12 @@ func TestErrors(t *testing.T) {
 		"dup peer":        minimal + "ping:\n  peers:\n    - {name: a, addr: 1.1.1.1}\n    - {name: a, addr: 8.8.8.8}\n",
 		"peer no addr":    minimal + "ping:\n  peers:\n    - {name: a}\n",
 		"interval":        minimal + "interval: 100ms\n",
+		"peer type":       minimal + "ping:\n  peers:\n    - {name: a, addr: 1.1.1.1, type: tcp}\n",
+		"dns no port":     minimal + "ping:\n  peers:\n    - {name: a, addr: 1.1.1.1, type: dns}\n",
+		"dns port 0":      minimal + "ping:\n  peers:\n    - {name: a, addr: \"1.1.1.1:0\", type: dns}\n",
+		"echo no key":     minimal + "ping:\n  peers:\n    - {name: a, addr: \"1.1.1.1:39527\", type: echo}\n",
+		"echo short key":  minimal + "ping:\n  peers:\n    - {name: a, addr: \"1.1.1.1:39527\", type: echo, key: short}\n",
+		"key on icmp":     minimal + "ping:\n  peers:\n    - {name: a, addr: 1.1.1.1, key: abcdefghijklmnopqrstuvwxyz0123456789}\n",
 	}
 	for name, cfg := range cases {
 		if _, err := Parse([]byte(cfg)); err == nil {

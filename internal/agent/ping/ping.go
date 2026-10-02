@@ -1,6 +1,9 @@
-// Package ping measures ICMP echo latency to a fixed set of peers.
+// Package ping measures latency to a fixed set of peers: ICMP echo, or a
+// UDP request and reply for paths that only carry TCP/UDP, such as a port
+// forward: a DNS query when the far end is a resolver (e.g. 1.1.1.1:53), or
+// an authenticated echo request when it is a vps-probe-echo responder.
 //
-// It prefers unprivileged datagram ICMP sockets (net.ipv4.ping_group_range),
+// ICMP prefers unprivileged datagram sockets (net.ipv4.ping_group_range),
 // falling back to raw sockets, which need CAP_NET_RAW. With datagram sockets
 // the kernel rewrites the echo ID and filters replies per socket, so replies
 // are matched on sequence number and source address only.
@@ -8,6 +11,7 @@ package ping
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,12 +19,15 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+
+	"vpsprobe/internal/echo"
 )
 
 const (
@@ -33,16 +40,25 @@ const (
 	payloadSize  = 16
 )
 
+// Peer types; the zero value is ICMP.
+const (
+	TypeICMP = ""
+	TypeDNS  = "dns"  // DNS query over UDP to addr
+	TypeEcho = "echo" // vps-probe-echo request over UDP to addr, signed with Key
+)
+
 // Peer is a configured target.
 type Peer struct {
 	Name string
-	Addr string // IP literal or hostname
+	Addr string // IP literal or hostname; host:port for the UDP types
+	Type string
+	Key  string // echo only
 }
 
 // Stats summarizes the probes to one peer that completed in a window.
 type Stats struct {
 	Target string
-	Addr   string // resolved IP, empty if unresolved
+	Addr   string // resolved IP (ip:port for UDP types), empty if unresolved
 	Sent   int
 	Lost   int
 	Min    float64 // milliseconds, over replies only
@@ -61,9 +77,21 @@ type probe struct {
 
 type peerState struct {
 	Peer
+	host       string // Addr without the port
+	port       uint16 // UDP types only
 	ip         netip.Addr
 	resolvedAt time.Time
 	probes     []*probe
+
+	// UDP types only: how to build a request and recognize its reply, a
+	// socket connected to ip:port, so the kernel drops datagrams from
+	// anywhere else, and the requests awaiting a reply.
+	udp     bool
+	request func(seq uint16) []byte
+	reply   func([]byte) (seq uint16, ok bool)
+	conn    *net.UDPConn
+	connIP  netip.Addr
+	udpWait map[uint16]*probe
 }
 
 type family struct {
@@ -85,6 +113,7 @@ type Pinger struct {
 	v4, v6   *family
 	seq      uint16
 	inflight map[inflightKey]*probe
+	udpWG    sync.WaitGroup // UDP receivers
 }
 
 type inflightKey struct {
@@ -93,7 +122,7 @@ type inflightKey struct {
 }
 
 // New opens the ICMP sockets needed for the peers. It fails only if no
-// socket could be opened for any address family in use.
+// ICMP socket could be opened and no peer could be probed without one.
 func New(peers []Peer, interval, timeout time.Duration, log *slog.Logger) (*Pinger, error) {
 	p := &Pinger{
 		interval: interval,
@@ -102,10 +131,39 @@ func New(peers []Peer, interval, timeout time.Duration, log *slog.Logger) (*Ping
 		id:       os.Getpid() & 0xffff,
 		inflight: map[inflightKey]*probe{},
 	}
+	var icmpPeers, udpPeers int
 	for _, pr := range peers {
-		p.peers = append(p.peers, &peerState{Peer: pr})
+		ps := &peerState{Peer: pr, host: pr.Addr}
+		switch pr.Type {
+		case TypeICMP:
+			icmpPeers++
+		case TypeDNS, TypeEcho:
+			host, port, err := net.SplitHostPort(pr.Addr)
+			n, perr := strconv.ParseUint(port, 10, 16)
+			if err != nil || perr != nil || n == 0 {
+				return nil, fmt.Errorf("ping: peer %s: addr %q: want host:port", pr.Name, pr.Addr)
+			}
+			ps.host, ps.port, ps.udp, ps.udpWait = host, uint16(n), true, map[uint16]*probe{}
+			if pr.Type == TypeDNS {
+				ps.request, ps.reply = dnsQuery, dnsReply
+			} else {
+				if len(pr.Key) < echo.MinKeyLen {
+					return nil, fmt.Errorf("ping: peer %s: echo key must be at least %d characters", pr.Name, echo.MinKeyLen)
+				}
+				key := []byte(pr.Key)
+				ps.request = func(seq uint16) []byte { return echo.Request(key, seq, time.Now()) }
+				ps.reply = func(b []byte) (uint16, bool) { return echo.ParseReply(key, b) }
+			}
+			udpPeers++
+		default:
+			return nil, fmt.Errorf("ping: peer %s: unknown type %q", pr.Name, pr.Type)
+		}
+		p.peers = append(p.peers, ps)
 	}
 	p.maybeResolve(context.Background(), time.Now())
+	if icmpPeers == 0 {
+		return p, nil
+	}
 
 	var errs []error
 	if f, err := openFamily(false); err == nil {
@@ -123,19 +181,26 @@ func New(peers []Peer, interval, timeout time.Duration, log *slog.Logger) (*Ping
 		}
 	}
 	if p.v4 == nil && p.v6 == nil {
-		return nil, fmt.Errorf("ping: no ICMP socket available (check net.ipv4.ping_group_range or grant CAP_NET_RAW): %w", errors.Join(errs...))
+		err := fmt.Errorf("ping: no ICMP socket available (check net.ipv4.ping_group_range or grant CAP_NET_RAW): %w", errors.Join(errs...))
+		if udpPeers == 0 {
+			return nil, err
+		}
+		log.Error("ICMP peers disabled, UDP peers still probed", "err", err)
 	}
 	return p, nil
 }
 
 func (p *Pinger) needV6() bool {
 	for _, ps := range p.peers {
+		if ps.udp {
+			continue
+		}
 		if ps.ip.Is6() && !ps.ip.Is4In6() {
 			return true
 		}
 		// Unresolved hostnames might resolve to v6 later.
 		if !ps.ip.IsValid() {
-			if _, err := netip.ParseAddr(ps.Addr); err != nil {
+			if _, err := netip.ParseAddr(ps.host); err != nil {
 				return true
 			}
 		}
@@ -203,7 +268,15 @@ func (p *Pinger) Run(ctx context.Context) {
 					f.conn.Close()
 				}
 			}
+			p.mu.Lock()
+			for _, ps := range p.peers {
+				if ps.conn != nil {
+					ps.conn.Close()
+				}
+			}
+			p.mu.Unlock()
 			wg.Wait()
+			p.udpWG.Wait()
 			return
 		case <-t.C:
 		}
@@ -227,7 +300,7 @@ func (p *Pinger) maybeResolve(ctx context.Context, now time.Time) {
 			wait = resolveRetry
 		}
 		if ps.resolvedAt.IsZero() || now.Sub(ps.resolvedAt) >= wait {
-			jobs = append(jobs, job{ps, ps.Addr, ps.ip})
+			jobs = append(jobs, job{ps, ps.host, ps.ip})
 		}
 	}
 	p.mu.Unlock()
@@ -278,6 +351,10 @@ func (p *Pinger) sendAll() {
 	defer p.mu.Unlock()
 	for _, ps := range p.peers {
 		if !ps.ip.IsValid() {
+			continue
+		}
+		if ps.udp {
+			p.sendUDP(ps)
 			continue
 		}
 		f := p.v4
@@ -353,6 +430,84 @@ func (p *Pinger) receive(f *family) {
 	}
 }
 
+// sendUDP sends one request to a UDP peer; p.mu is held. The socket is
+// (re)connected when the peer's address changes.
+func (p *Pinger) sendUDP(ps *peerState) {
+	p.seq++
+	pr := &probe{ip: ps.ip, seq: p.seq, sent: time.Now()}
+	ps.probes = append(ps.probes, pr)
+	if ps.conn == nil || ps.connIP != ps.ip {
+		if ps.conn != nil {
+			ps.conn.Close()
+		}
+		ps.conn = nil
+		c, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(ps.ip, ps.port)))
+		if err != nil {
+			p.log.Debug("ping: udp dial failed", "peer", ps.Name, "err", err)
+			return // sent-and-lost, like a failed ICMP send
+		}
+		ps.conn, ps.connIP = c, ps.ip
+		p.udpWG.Add(1)
+		go p.receiveUDP(ps, c)
+	}
+	ps.udpWait[pr.seq] = pr // replaces a stale probe if seq wrapped
+	if _, err := ps.conn.Write(ps.request(pr.seq)); err != nil {
+		p.log.Debug("ping: udp send failed", "peer", ps.Name, "err", err)
+	}
+}
+
+// dnsQuery asks for one.one.one.one A: 1.1.1.1 is authoritative for it and
+// any resolver has it cached, so the answer times the path, not the
+// resolver. (The root SOA, tried first, had 40ms cache-miss spikes.)
+func dnsQuery(id uint16) []byte {
+	q := []byte{
+		byte(id >> 8), byte(id), // ID
+		0x01, 0x00, // flags: RD
+		0, 1, 0, 0, 0, 0, 0, 0, // QDCOUNT 1, no other sections
+	}
+	for range 4 {
+		q = append(q, 3, 'o', 'n', 'e')
+	}
+	return append(q, 0, 0, 1, 0, 1) // root label, QTYPE A, QCLASS IN
+}
+
+// dnsReply accepts any response, whatever its rcode: an answer came back
+// over the path.
+func dnsReply(b []byte) (uint16, bool) {
+	if len(b) < 12 || b[2]&0x80 == 0 { // too short, or not a response
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(b), true
+}
+
+func (p *Pinger) receiveUDP(ps *peerState, c *net.UDPConn) {
+	defer p.udpWG.Done()
+	buf := make([]byte, 1500)
+	for {
+		n, err := c.Read(buf)
+		now := time.Now()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// e.g. ECONNREFUSED after an ICMP port unreachable; the probe
+			// times out on its own.
+			p.log.Debug("ping: udp read", "peer", ps.Name, "err", err)
+			continue
+		}
+		seq, ok := ps.reply(buf[:n])
+		if !ok {
+			continue
+		}
+		p.mu.Lock()
+		if pr := ps.udpWait[seq]; pr != nil {
+			pr.got, pr.rtt = true, now.Sub(pr.sent)
+			delete(ps.udpWait, seq)
+		}
+		p.mu.Unlock()
+	}
+}
+
 // Snapshot returns stats for probes that are complete at now: replied, or
 // older than the timeout. Pending probes carry over to the next snapshot.
 func (p *Pinger) Snapshot(now time.Time) []Stats {
@@ -363,6 +518,9 @@ func (p *Pinger) Snapshot(now time.Time) []Stats {
 		st := Stats{Target: ps.Name}
 		if ps.ip.IsValid() {
 			st.Addr = ps.ip.String()
+			if ps.udp {
+				st.Addr = netip.AddrPortFrom(ps.ip, ps.port).String()
+			}
 		}
 		var rtts []float64
 		keep := ps.probes[:0]
@@ -374,7 +532,11 @@ func (p *Pinger) Snapshot(now time.Time) []Stats {
 			case now.Sub(pr.sent) >= p.timeout:
 				st.Sent++
 				st.Lost++
-				if p.inflight[inflightKey{pr.ip, pr.seq}] == pr {
+				if ps.udp {
+					if ps.udpWait[pr.seq] == pr {
+						delete(ps.udpWait, pr.seq)
+					}
+				} else if p.inflight[inflightKey{pr.ip, pr.seq}] == pr {
 					delete(p.inflight, inflightKey{pr.ip, pr.seq})
 				}
 			default:

@@ -86,7 +86,11 @@ func New(cfg *config.Config, sink Sink, version string, dryRun bool, log *slog.L
 	if len(cfg.Ping.Peers) > 0 {
 		peers := make([]ping.Peer, len(cfg.Ping.Peers))
 		for i, p := range cfg.Ping.Peers {
-			peers[i] = ping.Peer{Name: p.Name, Addr: p.Addr}
+			typ := p.Type
+			if typ == "icmp" {
+				typ = ping.TypeICMP
+			}
+			peers[i] = ping.Peer{Name: p.Name, Addr: p.Addr, Type: typ, Key: p.Key}
 		}
 		// Latency is one feature among several; run without it rather than
 		// not at all.

@@ -31,3 +31,9 @@ ping:
   peers:
     - { name: jp-1, addr: 203.0.113.5 }
     - { name: us-1, addr: 198.51.100.7 }
+    # type: dns sends a UDP DNS query to host:port instead of an ICMP echo, for
+    # tunnels that only forward TCP/UDP: forward a local port to 1.1.1.1:53.
+    # - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }
+    # type: echo sends a signed request to a vps-probe-echo responder at the
+    # tunnel's far end; key is that responder's key.
+    # - { name: hk2-via-sgp, addr: "127.0.0.1:39527", type: echo, key: "<responder key>" }

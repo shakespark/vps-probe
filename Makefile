@@ -7,7 +7,7 @@ ARCHES := amd64 arm64
 all: test build
 
 build:
-	@for arch in $(ARCHES); do for cmd in vps-probe-agent vps-probe-server; do \
+	@for arch in $(ARCHES); do for cmd in vps-probe-agent vps-probe-server vps-probe-echo; do \
 		echo "build $$cmd linux/$$arch"; \
 		CGO_ENABLED=0 GOOS=linux GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" \
 			-o dist/$$cmd-linux-$$arch ./cmd/$$cmd || exit 1; \
@@ -21,9 +21,10 @@ dist: build
 		mkdir -p $$d/bin $$d/systemd $$d/examples; \
 		cp dist/vps-probe-agent-linux-$$arch $$d/bin/vps-probe-agent; \
 		cp dist/vps-probe-server-linux-$$arch $$d/bin/vps-probe-server; \
+		cp dist/vps-probe-echo-linux-$$arch $$d/bin/vps-probe-echo; \
 		cp deploy/install.sh $$d/; chmod 0755 $$d/install.sh; \
 		cp deploy/*.service $$d/systemd/; \
-		cp deploy/agent.example.yml deploy/server.example.yml deploy/cloudflared.example.yml $$d/examples/; \
+		cp deploy/agent.example.yml deploy/server.example.yml deploy/echo.example.yml deploy/cloudflared.example.yml $$d/examples/; \
 		cp README.md $$d/; \
 		(cd $$d && sha256sum bin/* install.sh systemd/* examples/* README.md > SHA256SUMS); \
 		tar -C dist -czf $$d.tar.gz --owner=0 --group=0 vps-probe-$(VERSION)-linux-$$arch; \

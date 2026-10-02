@@ -26,6 +26,8 @@
 7. **Telegram Bot 只发不收**：不设置 webhook、不调用 getUpdates，不存在通过 TG 下达指令的通道。
 8. **每台 agent 独立 token**：token 派生出该节点的加密密钥（§5.3），一台的 token 泄露只影响该节点的数据。服务端需要用 token 解密，因此服务端配置文件中保存 token 明文，文件权限 0600。
 
+9. **隧道探测应答端与 agent 分离**：需要被探测的隧道终点另装 `vps-probe-echo`（§5.2），它是独立的程序和系统用户，只回应用共享密钥签名的请求，其他包静默丢弃；agent 本身仍不监听任何端口。
+
 最坏情况分析：服务端被攻破 → 攻击者能看到/篡改监控数据、能用 TG bot 发消息，但**无法在任何 agent 上执行代码**。
 
 ## 2. 总体架构
@@ -152,7 +154,7 @@
 | 网络 | 各物理网卡 rx/tx 速率 | `/proc/net/dev` 差分 | 10s |
 | 流量 | 当前/上一周期累计 | 见 §4 | 10s |
 | 系统 | uptime、内核版本、主机名、CPU 核数 | `/proc/uptime` 等 | 启动时 + 每小时 |
-| 时延 | 每个 peer 的 sent/lost/min/avg/max/jitter | ICMP | 每秒 1 包，10s 汇总 |
+| 时延 | 每个 peer 的 sent/lost/min/avg/max/jitter | ICMP，或 UDP DNS 查询 / 隧道回显 | 每秒 1 包，10s 汇总 |
 
 CPU steal 单独记录，便于发现超售的机器。
 
@@ -165,6 +167,17 @@ CPU steal 单独记录，便于发现超售的机器。
 - peers 在 agent 本地配置，既可以是其他 VPS，也可以是外部目标（如 `1.1.1.1`）。
 - IPv4/IPv6 均支持，按配置的地址族决定。
 - 后续可选：TCP 连接时延。测量时连接对端**已有的端口**（如 SSH 22）即可，不需要新开监听端口。首版不做。
+
+**DNS 探测（`type: dns`）**：经 TCP/UDP 端口转发（realm 等）的隧道过不了 ICMP，而用户态转发程序会在本地完成 TCP 握手，TCP connect 时延只反映到转发入口的一段。所以在隧道上加一条转发到 `1.1.1.1:53` 的规则，agent 向 `addr`（`host:port`）每秒发一个 UDP DNS 查询（`one.one.one.one A`：1.1.1.1 是它的权威，其他递归解析器也必有缓存；最初用的 `. IN SOA` 在 1.1.1.1 上偶有 40ms 的缓存未命中尖峰），以收到响应的时间为 RTT，超时算丢包；任何 rcode 都算收到。每个 DNS peer 一个 connect 过的 UDP socket（内核丢弃其他来源的包，也让转发程序保持同一个会话），按 DNS ID 匹配响应，不需要任何特权。结果与 ICMP 一样上报为 `Ping`，`addr` 字段为 `ip:port`，服务端无需改动。UDP 与 ICMP 在同一路径上的时延可能不同（实测同一台机器直连 1.1.1.1，DNS 比 ICMP 低 1–10ms 不等，随源端口变化），只宜与同类型的数据比较。若到 53 端口的路径上有透明 DNS 劫持，测到的是劫持者的时延，无法从响应里分辨。
+
+**隧道回显（`type: echo`）**：不经公共服务、直接测隧道本身。隧道远端指向某台机器上的 `vps-probe-echo`（默认 `39527/udp`），agent 经隧道发请求，应答端原样签名回应：
+
+- 包固定 31 字节：`"VPE1"` | 类型（0 请求 / 1 应答）| seq（2）| 发送时刻 unix 纳秒（8）| HMAC-SHA256(key, 前面全部) 的前 16 字节。应答是把类型改为 1 并重算 MAC，**不比请求大**；应答端不回应应答包，两个应答端无法被利用互相弹包。
+- 应答端只回应 MAC 正确、时间戳与本机时钟相差 ≤ 5 分钟（限制截获重放的窗口）的请求，其余一律静默丢弃，端口扫描看不出它开着；另有全局每秒回包上限（默认 1000）。时间戳超窗的合法请求说明两端时钟不一致，每分钟最多记一条日志。可选 `allow` 只回应指定来源（如中转机出口 IP）。
+- agent 侧与 DNS 探测共用同一套 UDP 机制（每个 peer 一个 connect 过的 socket，按 seq 匹配，超时算丢包），只验证应答的 MAC。密钥写在该 peer 的配置里，同一应答端的所有探测方共用一个密钥。
+- `vps-probe-echo` 以独立系统用户 `vps-probe-echo` 运行，无任何 capability，不写文件，`install.sh echo` 安装。
+
+VPN 型隧道（tun 设备）直接用 ICMP peer 即可，前提是到目标的路由走隧道。注意隧道进程退出、设备消失后，路由会回落到默认出口，测到的就变成直连时延。
 
 ### 5.3 上报协议
 
@@ -246,6 +259,7 @@ ping:
   peers:                    # name 要写成对端在服务端登记的节点 id，时延矩阵才能对上
     - { name: jp-1, addr: 203.0.113.5 }
     - { name: us-1, addr: 198.51.100.7 }
+    - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }   # 经端口转发到 1.1.1.1:53
 ```
 
 ### 5.6 systemd 加固
@@ -302,7 +316,7 @@ backup:
 - 启动时不等待公钥：取到之前所有请求都 403，后台每 30s 重试（fail closed）。
 - 拒绝原因按类别限频写日志。开启后在服务器上直接 `curl 127.0.0.1:8080` 也会 403，属预期。
 
-节点的 `addr`（其他节点 ping 它的地址）、`no_ping`（与哪些节点互不 ping，双向生效）、`reset_day` 和 `reset_time` 只供 `vps-probe-server agent-config` 生成 agent.yml 使用；agent 自己的配置文件仍是唯一依据，agent 不从服务端获取任何配置。
+节点的 `addr`（其他节点 ping 它的地址）、`no_ping`（与哪些节点互不 ping，双向生效）、`extra_peers`（该节点额外的非节点目标，原样写进它的 `ping.peers`，`name` 不能与节点 id 重名）、`reset_day` 和 `reset_time` 只供 `vps-probe-server agent-config` 生成 agent.yml 使用；agent 自己的配置文件仍是唯一依据，agent 不从服务端获取任何配置。
 
 提供 `vps-probe-server gen-token` 子命令：生成 32 字节随机 token（base64url），同一个值同时填进 agent 和服务端配置。服务端启动时检查配置文件权限：其他用户可读或组可写则拒绝启动。推荐 `root:vps-probe-server 0640`，服务能读但不能改。
 
@@ -457,16 +471,18 @@ Telegram：
 cmd/
   vps-probe-agent/      main.go（含 -dry-run）
   vps-probe-server/     main.go（serve / check / backup / test-telegram / agent-config / gen-token）
+  vps-probe-echo/       main.go：隧道探测应答端（可选，只装在隧道终点）
 proto/probe/v1/         probe.proto
 internal/
   proto/probev1/        生成的 protobuf 代码（已提交）
   wire/                 加密包格式，agent 与 server 共用
+  echo/                 隧道回显协议与应答端，agent 与 vps-probe-echo 共用
   agent/
     agent.go            采样主循环
     config/
     collect/            cpu、mem、load、disk、net、sys 采集
     traffic/            流量累计与持久化（§4）
-    ping/               ICMP 互测
+    ping/               ICMP 互测、DNS / 隧道回显探测
     report/             拆包、UDP 发送、ACK、补传
   server/
     config/             服务端配置、权限检查
@@ -482,8 +498,10 @@ deploy/
   agent.example.yml
   vps-probe-server.service
   server.example.yml
+  vps-probe-echo.service
+  echo.example.yml
   cloudflared.example.yml   本地配置方式的隧道示例
-  install.sh              安装 / 升级 / 卸载（agent、server）
+  install.sh              安装 / 升级 / 卸载（agent、server、echo）
 VERSION                   版本号；`make dist` 生成发布包
 docs/
   DESIGN.md
@@ -511,7 +529,7 @@ docs/
 
 ## 12. 暂不做
 
-- TCP/UDP 时延（后续可做 TCP connect 到对端已有端口）
+- TCP 时延（后续可做 TCP connect 到对端已有端口）；经端口转发隧道的时延已由 DNS 探测和隧道回显覆盖
 - 容器型 VPS（OpenVZ/LXC 的 venet 网卡识别）
 - 多用户 / 权限体系（依赖 CF Access）
 - agent 自动更新（安全原则 2）

@@ -1,0 +1,46 @@
+[Unit]
+Description=VPS probe echo responder (answers signed tunnel probes, nothing else)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vps-probe-echo -config /etc/vps-probe/echo.yml
+Restart=always
+RestartSec=5
+
+User=vps-probe-echo
+Group=vps-probe-echo
+UMask=0077
+
+# Hardening. The responder reads its config and answers on one UDP port
+# (above 1024, so no capabilities); it writes nothing.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+MemoryMax=32M
+
+[Install]
+WantedBy=multi-user.target
