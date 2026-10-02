@@ -163,3 +163,7 @@ td.self { color: var(--muted); }
 }
 .top .status.error { color: var(--bad); }
 table.plain th, table.plain td { text-align: left; }
+
+/* Alert history filters */
+.filters { margin-bottom: 10px; }
+.filters h2 { margin: 0; }

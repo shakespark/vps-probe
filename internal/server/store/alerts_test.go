@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -73,8 +74,53 @@ func TestAlertStateAndHistory(t *testing.T) {
 	if err != nil || len(st) != 1 || st[0] != quota {
 		t.Fatalf("states: %+v %v", st, err)
 	}
-	h, err := s.AlertHistory(ctx, now-60, now+1, 10)
+	h, err := s.AlertHistory(ctx, now-60, now+1, AlertFilter{}, 10)
 	if err != nil || len(h) != 2 || h[0].Message != "new" {
 		t.Fatalf("history: %+v %v", h, err)
+	}
+}
+
+func TestAlertHistoryFilter(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().Unix()
+	err := s.SaveAlerts(nil, nil, []AlertEvent{
+		{TS: now - 30, Rule: "cpu", Node: "a", Event: "firing", Message: "1"},
+		{TS: now - 20, Rule: "cpu", Node: "a", Event: "repeat", Message: "2"},
+		{TS: now - 10, Rule: "offline", Node: "b", Event: "firing", Message: "3"},
+		{TS: now, Rule: "cpu", Node: "a", Event: "recovered", Message: "4"},
+		{TS: now - 7200, Rule: "disk", Node: "c", Event: "firing", Message: "old"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := func(f AlertFilter) string {
+		h, err := s.AlertHistory(ctx, now-60, now+1, f, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m []string
+		for _, e := range h {
+			m = append(m, e.Message)
+		}
+		return strings.Join(m, ",")
+	}
+	for _, c := range []struct {
+		f    AlertFilter
+		want string
+	}{
+		{AlertFilter{}, "4,3,2,1"},
+		{AlertFilter{Node: "a"}, "4,2,1"},
+		{AlertFilter{Rule: "offline"}, "3"},
+		{AlertFilter{Events: []string{"firing", "repeat"}}, "3,2,1"},
+		{AlertFilter{Node: "a", Events: []string{"firing"}}, "1"},
+		{AlertFilter{Node: "zz"}, ""},
+	} {
+		if got := msgs(c.f); got != c.want {
+			t.Errorf("%+v: got %q, want %q", c.f, got, c.want)
+		}
+	}
+	nodes, rules, err := s.AlertFacets(ctx, now-60, now+1)
+	if err != nil || strings.Join(nodes, ",") != "a,b" || strings.Join(rules, ",") != "cpu,offline" {
+		t.Fatalf("facets %v %v %v", nodes, rules, err)
 	}
 }

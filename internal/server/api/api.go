@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -241,8 +242,12 @@ func (a *API) daily(w http.ResponseWriter, r *http.Request) {
 
 const maxAlertHistory = 500
 
+var alertEvents = []string{"firing", "repeat", "recovered", "level"}
+
 // alertsView: current alerts, history in ?from&to (default: last 7 days,
-// newest first, at most 500) and the rules in effect.
+// newest first, at most 500) narrowed by ?node, ?rule and ?event (comma-
+// separated), the nodes and rules with history in the range (for filter
+// menus), and the rules in effect.
 func (a *API) alertsView(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	if q.Get("from") == "" {
@@ -253,13 +258,30 @@ func (a *API) alertsView(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	hist, err := a.store.AlertHistory(r.Context(), from, to+1, maxAlertHistory)
+	f := store.AlertFilter{Node: q.Get("node"), Rule: q.Get("rule")}
+	if v := q.Get("event"); v != "" {
+		f.Events = strings.Split(v, ",")
+		for _, e := range f.Events {
+			if !slices.Contains(alertEvents, e) {
+				http.Error(w, "event: want a comma-separated list of "+strings.Join(alertEvents, ", "), http.StatusBadRequest)
+				return
+			}
+		}
+	}
+	hist, err := a.store.AlertHistory(r.Context(), from, to+1, f, maxAlertHistory)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	writeJSON(w, map[string]any{"active": a.alerts.Active(), "history": hist, "rules": a.cfg.Alerts,
-		"telegram": a.cfg.Telegram.Enabled()})
+	nodes, rules, err := a.store.AlertFacets(r.Context(), from, to+1)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"active": a.alerts.Active(), "history": hist,
+		"truncated": len(hist) == maxAlertHistory,
+		"facets":    map[string]any{"nodes": nodes, "rules": rules},
+		"rules":     a.cfg.Alerts, "telegram": a.cfg.Telegram.Enabled()})
 }
 
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {

@@ -92,11 +92,36 @@ func (s *Store) PruneAlertStates(rules []string) error {
 	return err
 }
 
-// AlertHistory returns events in [from, to), newest first.
-func (s *Store) AlertHistory(ctx context.Context, from, to int64, limit int) ([]AlertEvent, error) {
+// AlertFilter narrows AlertHistory. Empty fields match everything.
+type AlertFilter struct {
+	Node   string
+	Rule   string
+	Events []string // any of these
+}
+
+// AlertHistory returns events in [from, to) that match f, newest first.
+func (s *Store) AlertHistory(ctx context.Context, from, to int64, f AlertFilter, limit int) ([]AlertEvent, error) {
+	q := `SELECT ts, rule, node, target, event, COALESCE(value, 0), message FROM alert_history
+		WHERE ts >= ? AND ts < ?`
+	args := []any{from, to}
+	if f.Node != "" {
+		q += ` AND node = ?`
+		args = append(args, f.Node)
+	}
+	if f.Rule != "" {
+		q += ` AND rule = ?`
+		args = append(args, f.Rule)
+	}
+	if len(f.Events) > 0 {
+		q += ` AND event IN (?` + strings.Repeat(", ?", len(f.Events)-1) + `)`
+		for _, e := range f.Events {
+			args = append(args, e)
+		}
+	}
+	q += ` ORDER BY ts DESC, id DESC LIMIT ?`
+	args = append(args, limit)
 	out := []AlertEvent{}
-	err := s.each(ctx, `SELECT ts, rule, node, target, event, COALESCE(value, 0), message FROM alert_history
-		WHERE ts >= ? AND ts < ? ORDER BY ts DESC, id DESC LIMIT ?`, []any{from, to, limit}, func(r *sql.Rows) error {
+	err := s.each(ctx, q, args, func(r *sql.Rows) error {
 		var e AlertEvent
 		if err := r.Scan(&e.TS, &e.Rule, &e.Node, &e.Target, &e.Event, &e.Value, &e.Message); err != nil {
 			return err
@@ -105,4 +130,29 @@ func (s *Store) AlertHistory(ctx context.Context, from, to int64, limit int) ([]
 		return nil
 	})
 	return out, err
+}
+
+// AlertFacets returns the distinct nodes and rules with events in
+// [from, to), sorted, for the history filter menus. It includes rules no
+// longer configured, so their old events stay reachable.
+func (s *Store) AlertFacets(ctx context.Context, from, to int64) (nodes, rules []string, err error) {
+	nodes, rules = []string{}, []string{}
+	for _, c := range []struct {
+		col string
+		out *[]string
+	}{{"node", &nodes}, {"rule", &rules}} {
+		err = s.each(ctx, `SELECT DISTINCT `+c.col+` FROM alert_history WHERE ts >= ? AND ts < ? ORDER BY 1`,
+			[]any{from, to}, func(r *sql.Rows) error {
+				var v string
+				if err := r.Scan(&v); err != nil {
+					return err
+				}
+				*c.out = append(*c.out, v)
+				return nil
+			})
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return nodes, rules, nil
 }

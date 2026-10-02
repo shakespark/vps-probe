@@ -43,6 +43,25 @@ function bar(pct) {
   return h('div', { class: 'bar' + (p >= 90 ? ' bad' : p >= 80 ? ' warn' : '') }, fill);
 }
 
+// A <select> over [value, label] pairs. fill() only rebuilds the options when
+// they change, so the periodic refresh doesn't close an open menu.
+function picker(onPick) {
+  const el = h('select', { onchange: () => onPick(el.value) });
+  let key = '';
+  el.fill = (options, current) => {
+    const k = JSON.stringify([options, current]);
+    if (k === key) return;
+    key = k;
+    el.replaceChildren(...options.map(([value, label]) => {
+      const o = h('option', { text: label });
+      o.value = value;
+      return o;
+    }));
+    el.value = current;
+  };
+  return el;
+}
+
 function seg(options, current, onPick) {
   return h('div', { class: 'seg' }, options.map(([value, label]) =>
     h('button', { class: value === current ? 'active' : null, text: label, onclick: () => onPick(value) })));
@@ -573,9 +592,21 @@ function ruleText(r) {
   return t;
 }
 
+const ALERT_RANGES = [['1d', '24 小时', 86400], ['7d', '7 天', 7 * 86400], ['30d', '30 天', 30 * 86400],
+  ['90d', '90 天', 90 * 86400]];
+const EVENT_FILTERS = [['', '全部事件'], ['firing,repeat', '告警'], ['recovered', '恢复'], ['level', '流量档位']];
+const alertFilter = { range: '7d', node: '', rule: '', event: '' };
+
 function alertsPage() {
   const active = h('div', { class: 'table-wrap' });
   const history = h('div', { class: 'table-wrap' });
+  const histCount = h('span', { class: 'muted' });
+  const setFilter = (k, v) => { alertFilter[k] = v; rerender(); };
+  const nodeSel = picker(v => setFilter('node', v));
+  const ruleSel = picker(v => setFilter('rule', v));
+  const eventSel = picker(v => setFilter('event', v));
+  const filtered = alertFilter.node || alertFilter.rule || alertFilter.event;
+  const range = ALERT_RANGES.find(r => r[0] === alertFilter.range);
   const rules = h('div', { class: 'table-wrap' });
   const tg = h('span', { class: 'badge' });
   const table = (cols, rows) => h('table', { class: 'plain' },
@@ -586,10 +617,21 @@ function alertsPage() {
     el: h('div', null,
       h('div', { class: 'row' }, h('h1', { text: '告警' }), tg),
       h('div', { class: 'panel section' }, h('h2', { text: '当前告警' }), active),
-      h('div', { class: 'panel section' }, h('h2', { text: '最近 7 天' }), history),
+      h('div', { class: 'panel section' },
+        h('div', { class: 'row filters' }, h('h2', { text: '告警历史' }), histCount, h('span', { class: 'spacer' }),
+          seg(ALERT_RANGES.map(([v, label]) => [v, label]), alertFilter.range, v => setFilter('range', v)),
+          nodeSel, ruleSel, eventSel,
+          filtered ? seg([['clear', '清除筛选']], null, () => {
+            Object.assign(alertFilter, { node: '', rule: '', event: '' });
+            rerender();
+          }) : null),
+        history),
       h('div', { class: 'panel section' }, h('h2', { text: '规则' }), rules)),
     async refresh() {
-      const [d, nodes] = await Promise.all([api('/api/alerts'), api('/api/nodes')]);
+      const to = nowSec();
+      const q = new URLSearchParams({ from: to - range[2], to });
+      for (const k of ['node', 'rule', 'event']) if (alertFilter[k]) q.set(k, alertFilter[k]);
+      const [d, nodes] = await Promise.all([api('/api/alerts?' + q), api('/api/nodes')]);
       const names = new Map(nodes.map(n => [n.id, n.name]));
       const nodeText = id => names.get(id) || id;
       const metricOf = new Map(d.rules.map(r => [r.name, r.metric]));
@@ -604,6 +646,15 @@ function alertsPage() {
           cell(fmtRuleValue(a.metric, a.value)), cell(fmtTime(a.since)))))
         : h('div', { class: 'empty', text: '没有告警' }));
 
+      // Keep the current choice listed even when the range no longer has it.
+      const withCur = (vals, cur) => cur && !vals.includes(cur) ? [...vals, cur] : vals;
+      nodeSel.fill([['', '全部节点'], ...withCur(d.facets.nodes, alertFilter.node).map(id => [id, nodeText(id)])],
+        alertFilter.node);
+      ruleSel.fill([['', '全部规则'], ...withCur(d.facets.rules, alertFilter.rule).map(r => [r, r])], alertFilter.rule);
+      eventSel.fill(EVENT_FILTERS, alertFilter.event);
+      histCount.textContent = d.truncated ? `只显示最近 ${d.history.length} 条，缩小范围查看更早的`
+        : `共 ${d.history.length} 条`;
+
       history.replaceChildren(d.history.length
         ? table(['时间', '事件', '规则', '节点', '对象', '值'], d.history.map(e => h('tr', { title: e.message },
           cell(fmtTime(e.ts)),
@@ -611,7 +662,7 @@ function alertsPage() {
             text: EVENTS[e.event] || e.event })),
           cell(e.rule), cell(nodeText(e.node)), cell(e.target || '—'),
           cell(e.event === 'level' ? e.value + '%' : fmtRuleValue(metricOf.get(e.rule), e.value)))))
-        : h('div', { class: 'empty', text: '最近 7 天没有告警' }));
+        : h('div', { class: 'empty', text: filtered ? '没有符合条件的告警' : `最近 ${range[1]}没有告警` }));
 
       rules.replaceChildren(d.rules.length
         ? table(['名称', '条件', '节点', '重复提醒', '恢复通知'], d.rules.map(r => h('tr', null,

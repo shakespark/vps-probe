@@ -382,7 +382,7 @@ backup:
 | `GET /api/ping/{src}/{dst}?from&to` | 单条链路的历史 |
 | `GET /api/traffic?periods=N` | 各节点最近 N 个周期的总量（默认 24，含各网卡明细） |
 | `GET /api/traffic/{id}/daily?period=...` | 某节点周期内每日流量 |
-| `GET /api/alerts?from&to` | 当前告警、告警历史（默认最近 7 天）、生效的规则 |
+| `GET /api/alerts?from&to&node&rule&event` | 当前告警、告警历史（默认最近 7 天，最多 500 条，可按节点 / 规则 / 事件筛选，`event` 逗号分隔）、该时间段内出现过的节点和规则（供筛选菜单）、生效的规则 |
 
 - 按时间跨度自动选表：≤ 6h 用 raw，≤ 7d 用 5m，更长用 1h；再在 SQL 里按 `ts / step` 分组，每条曲线最多约 1000 个点。
 - ping 矩阵的列是各 peer 的 `name`；与节点 id 不一致的 name 也会显示为单独一列。

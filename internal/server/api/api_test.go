@@ -68,22 +68,24 @@ func TestReadOnlyRoutes(t *testing.T) {
 		}
 	}
 	for path, want := range map[string]int{
-		"/api/nodes":                           200,
-		"/api/nodes/hk-1/metrics":              200,
-		"/api/nodes/nope/metrics":              404,
-		"/api/nodes/hk-1/metrics?from=x":       400,
-		"/api/nodes/hk-1/metrics?from=10&to=5": 400,
-		"/api/nodes/hk-1/net":                  200,
-		"/api/nodes/hk-1/disks":                200,
-		"/api/ping/matrix?window=10h":          400,
-		"/api/ping/hk-1/jp-1":                  200,
-		"/api/ping/nope/jp-1":                  404,
-		"/api/traffic":                         200,
-		"/api/traffic/hk-1/daily?period=bad":   400,
-		"/api/stats":                           200,
-		"/api/alerts":                          200,
-		"/api/alerts?from=x":                   400,
-		"/api/other":                           404,
+		"/api/nodes":                                         200,
+		"/api/nodes/hk-1/metrics":                            200,
+		"/api/nodes/nope/metrics":                            404,
+		"/api/nodes/hk-1/metrics?from=x":                     400,
+		"/api/nodes/hk-1/metrics?from=10&to=5":               400,
+		"/api/nodes/hk-1/net":                                200,
+		"/api/nodes/hk-1/disks":                              200,
+		"/api/ping/matrix?window=10h":                        400,
+		"/api/ping/hk-1/jp-1":                                200,
+		"/api/ping/nope/jp-1":                                404,
+		"/api/traffic":                                       200,
+		"/api/traffic/hk-1/daily?period=bad":                 400,
+		"/api/stats":                                         200,
+		"/api/alerts":                                        200,
+		"/api/alerts?from=x":                                 400,
+		"/api/alerts?node=hk-1&rule=cpu&event=firing,repeat": 200,
+		"/api/alerts?event=bogus":                            400,
+		"/api/other":                                         404,
 	} {
 		rec := get(t, h, "GET", path)
 		if rec.Code != want {
@@ -169,5 +171,36 @@ func TestUI(t *testing.T) {
 	}
 	if rec := get(t, h, "POST", "/"); rec.Code != 405 {
 		t.Errorf("POST / = %d", rec.Code)
+	}
+}
+
+func TestAlertsFilter(t *testing.T) {
+	h, st := setup(t)
+	now := time.Now().Unix()
+	if err := st.SaveAlerts(nil, nil, []store.AlertEvent{
+		{TS: now - 20, Rule: "cpu_high", Node: "hk-1", Event: "firing", Message: "a"},
+		{TS: now - 10, Rule: "offline", Node: "jp-1", Event: "firing", Message: "b"},
+		{TS: now, Rule: "cpu_high", Node: "hk-1", Event: "recovered", Message: "c"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		History []store.AlertEvent `json:"history"`
+		Facets  struct {
+			Nodes []string `json:"nodes"`
+			Rules []string `json:"rules"`
+		} `json:"facets"`
+		Truncated bool `json:"truncated"`
+	}
+	rec := get(t, h, "GET", "/api/alerts?node=hk-1&event=firing,repeat")
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err, rec.Body.String())
+	}
+	if len(got.History) != 1 || got.History[0].Message != "a" || got.Truncated {
+		t.Fatalf("history %+v truncated=%v", got.History, got.Truncated)
+	}
+	// Facets cover the whole range, not just the filtered rows.
+	if strings.Join(got.Facets.Nodes, ",") != "hk-1,jp-1" || strings.Join(got.Facets.Rules, ",") != "cpu_high,offline" {
+		t.Fatalf("facets %+v", got.Facets)
 	}
 }
