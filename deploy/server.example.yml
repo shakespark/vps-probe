@@ -28,6 +28,10 @@ nodes:
     traffic_quota_gb: 1000      # 可选，GB 按 1024³ 字节计；0 或不写表示不限
     traffic_quota_mode: sum     # sum(收+发) | max(取大) | tx | rx
     addr: 203.0.113.5
+    # 可选：套餐信息，显示在总览卡片上，到期前按 expiry 规则提醒。
+    expire_at: 2027-03-15       # 到期日，按 timezone 计
+    renew_months: 12            # 可选：自动续费周期（月），过了到期日自动顺延；不写则过期后显示「已过期」
+    price: "$10/年"             # 可选：只用于显示
   - id: jp-1
     name: 日本 1
     token: "REPLACE-WITH-ANOTHER-gen-token-OUTPUT-01"
@@ -55,7 +59,7 @@ offline_after: 30s
 #   aud: "0123...（64 位十六进制 AUD tag）"
 
 # 告警规则，见 docs/DESIGN.md §7。整段不写 = 使用下面这组默认规则；写 `alerts: []` = 不告警。
-# metric: cpu | steal | load1 | mem | swap | disk | offline | ping_loss | ping_avg | traffic
+# metric: cpu | steal | load1 | mem | swap | disk | offline | ping_loss | ping_avg | traffic | expiry | ip_change
 alerts:
   - name: offline
     metric: offline
@@ -87,6 +91,14 @@ alerts:
   - name: traffic_quota
     metric: traffic           # 只对设置了 traffic_quota_gb 的节点生效
     levels: [80, 90, 100]     # 每个周期每档只提醒一次
+  - name: expiry
+    metric: expiry            # 只对写了 expire_at 的节点生效
+    levels: [7, 1]            # 到期前几天提醒（0 = 当天），每个到期日每档一次
+  # 不在默认规则里：上报来源 IP 变了就通知一次（第一次看到的 IP 只记录）。
+  # 动态 IP 的节点会经常触发，可用 nodes 只选固定 IP 的节点。
+  # - name: ip_change
+  #   metric: ip_change
+  #   nodes: [hk-1]
 
 retention:
   raw: 48h                  # 10s 原始数据

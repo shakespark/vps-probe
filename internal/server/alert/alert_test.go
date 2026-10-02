@@ -71,12 +71,14 @@ type harness struct {
 
 func setup(t *testing.T, rules string) *harness {
 	t.Helper()
-	cfg, err := config.Parse([]byte(`
-nodes:
-  - {id: a, name: 香港, token: ` + tokA + `, traffic_quota_gb: 100}
-  - {id: b, token: ` + tokB + `}
-alerts:
-` + rules))
+	return setupNodes(t, `
+  - {id: a, name: 香港, token: `+tokA+`, traffic_quota_gb: 100}
+  - {id: b, token: `+tokB+`}`, rules)
+}
+
+func setupNodes(t *testing.T, nodes, rules string) *harness {
+	t.Helper()
+	cfg, err := config.Parse([]byte("nodes:" + nodes + "\nalerts:\n" + rules))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,5 +400,81 @@ func TestTickJitter(t *testing.T) {
 	h.step(10*time.Second-time.Millisecond, hot)
 	if h.msgs() != 1 {
 		t.Fatalf("did not fire at ~20s: %v", h.n.msgs)
+	}
+}
+
+func TestExpiryLevels(t *testing.T) {
+	// The clock starts at 2026-09-30 20:00 in Shanghai: a is 10 days out,
+	// b expired 5 days ago, b2 renews monthly and is due today.
+	h := setupNodes(t, `
+  - {id: a, token: `+tokA+`, expire_at: 2026-10-10, price: $5/月}
+  - {id: b, token: `+tokB+`, expire_at: 2026-09-25}
+  - {id: b2, token: `+tokA+`x, expire_at: 2026-08-30, renew_months: 1}
+  - {id: c, token: `+tokB+`x}`,
+		`  - {name: expiry, metric: expiry, levels: [7, 1]}`)
+	h.step(0, nil)
+	// Already past every level: one message for the most urgent.
+	if h.msgs() != 1 || !strings.Contains(h.n.msgs[0], "b\n已于 2026-09-25 到期（5 天前）") ||
+		!strings.Contains(h.n.msgs[0], "b2\n今天（2026-09-30）到期（自动续费，每 1 个月）") {
+		t.Fatalf("first round: %q", h.n.msgs)
+	}
+	h.step(10*time.Second, nil)
+	if h.msgs() != 1 {
+		t.Fatalf("repeated: %q", h.n.msgs)
+	}
+	h.step(3*24*time.Hour, nil) // a: 7 days left; b2 rolled to 2026-10-30
+	if h.msgs() != 2 || !strings.Contains(h.n.msgs[1], "将于 2026-10-10 到期，还剩 7 天，价格 $5/月") ||
+		strings.Contains(h.n.msgs[1], "b2") {
+		t.Fatalf("7 days: %q", h.n.msgs)
+	}
+	if ev := h.src.events[len(h.src.events)-1]; ev.Event != "level" || ev.Value != 7 || ev.Target != "2026-10-10" {
+		t.Fatalf("event: %+v", ev)
+	}
+	if _, ok := h.src.states[key{"expiry", "b2", "2026-09-30"}]; ok {
+		t.Fatal("state of the passed renewal date kept")
+	}
+	if len(h.e.Active()) != 0 {
+		t.Fatalf("active: %+v", h.e.Active())
+	}
+	h.newEvaluator()
+	h.step(24*time.Hour, nil) // a: 6 days
+	if h.msgs() != 2 {
+		t.Fatalf("after restart: %q", h.n.msgs)
+	}
+	h.step(5*24*time.Hour, nil) // a: 1 day
+	if h.msgs() != 3 || !strings.Contains(h.n.msgs[2], "还剩 1 天") {
+		t.Fatalf("1 day: %q", h.n.msgs)
+	}
+}
+
+func TestIPChange(t *testing.T) {
+	h := setup(t, `  - {name: ip, metric: ip_change}`)
+	from := func(node, ip string) func() {
+		return func() {
+			h.report(node, 1)
+			h.src.status[node].IP, h.src.status[node].IPSince = ip, h.now.Unix()
+		}
+	}
+	h.step(0, from("a", "198.51.100.1"))
+	h.step(10*time.Second, from("a", "198.51.100.1"))
+	if h.msgs() != 0 || len(h.e.Active()) != 0 {
+		t.Fatalf("first sighting: %q", h.n.msgs)
+	}
+	h.newEvaluator()
+	h.step(10*time.Second, from("a", "203.0.113.9"))
+	if h.msgs() != 1 || !strings.Contains(h.n.msgs[0], "198.51.100.1 → 203.0.113.9") {
+		t.Fatalf("change: %q", h.n.msgs)
+	}
+	if ev := h.src.events[0]; ev.Event != "changed" || ev.Target != "203.0.113.9" {
+		t.Fatalf("event: %+v", ev)
+	}
+	if len(h.src.states) != 1 {
+		t.Fatalf("states: %+v", h.src.states)
+	}
+	h.step(10*time.Second, from("a", "203.0.113.9"))
+	h.newEvaluator()
+	h.step(10*time.Second, from("a", "203.0.113.9"))
+	if h.msgs() != 1 {
+		t.Fatalf("repeated: %q", h.n.msgs)
 	}
 }

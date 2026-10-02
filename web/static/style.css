@@ -98,6 +98,14 @@ h2 { font-size: 15px; margin: 0 0 10px; font-weight: 600; }
 .badge { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 4px; background: var(--bar); color: var(--muted); }
 .badge.warn { color: var(--warn); }
 .badge.bad { color: var(--bad); }
+.num.warn { color: var(--warn); }
+.num.bad { color: var(--bad); }
+
+/* Overview summary */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 20px; }
+.stat { min-width: 0; }
+.stat .k { font-size: 12px; color: var(--muted); }
+.stat .v { font-size: 17px; font-weight: 600; white-space: pre; overflow: hidden; text-overflow: ellipsis; }
 
 /* Buttons */
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
@@ -157,6 +165,7 @@ td.self { color: var(--muted); }
   .top { padding: 8px 12px; gap: 10px; }
   .top .status { margin-left: 0; width: 100%; }
   .cards { grid-template-columns: 1fr; }
+  .stat .v { font-size: 15px; }
   .charts { grid-template-columns: 1fr; }
   .chart { height: 220px; }
   .metric { grid-template-columns: 38px minmax(30px, 1fr) 126px; font-size: 12.5px; gap: 6px; }

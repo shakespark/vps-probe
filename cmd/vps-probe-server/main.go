@@ -266,7 +266,7 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("web ui: %w", err)
 	}
-	handler := api.New(cfg, st, in, ev, log).Handler(ui)
+	handler := api.New(cfg, st, in, ev, version, log).Handler(ui)
 	var access *cfaccess.Verifier
 	if cfg.CFAccess.Enabled() {
 		access = cfaccess.New(cfg.CFAccess.TeamDomain, cfg.CFAccess.AUD, log)

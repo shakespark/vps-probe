@@ -52,6 +52,10 @@ func TestRejects(t *testing.T) {
 		"raw too short":   "retention: {raw: 1h}\nnodes:\n  - {id: a, token: " + tokA + "}\n",
 		"retention order": "retention: {raw: 10d, m5: 5d}\nnodes:\n  - {id: a, token: " + tokA + "}\n",
 		"bad listen":      "listen: {web: 8080}\nnodes:\n  - {id: a, token: " + tokA + "}\n",
+		"bad expire_at":   "nodes:\n  - {id: a, token: " + tokA + ", expire_at: 2026-02-30}\n",
+		"renew alone":     "nodes:\n  - {id: a, token: " + tokA + ", renew_months: 1}\n",
+		"long price":      "nodes:\n  - {id: a, token: " + tokA + ", price: '" + strings.Repeat("x", MaxPriceLen+1) + "'}\n",
+		"price newline":   "nodes:\n  - {id: a, token: " + tokA + ", price: \"a\\nb\"}\n",
 	} {
 		if _, err := Parse([]byte(yml)); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -118,6 +122,13 @@ func TestBadAlertRules(t *testing.T) {
 		"offline no for":    "  - {name: x, metric: offline}",
 		"traffic no levels": "  - {name: x, metric: traffic}",
 		"traffic unsorted":  "  - {name: x, metric: traffic, levels: [90, 80]}",
+		"expiry no levels":  "  - {name: x, metric: expiry}",
+		"expiry threshold":  "  - {name: x, metric: expiry, levels: [7], op: '<', threshold: 7}",
+		"expiry fraction":   "  - {name: x, metric: expiry, levels: [1.5]}",
+		"expiry duplicate":  "  - {name: x, metric: expiry, levels: [7, 1, 7]}",
+		"expiry negative":   "  - {name: x, metric: expiry, levels: [-1]}",
+		"ip_change for":     "  - {name: x, metric: ip_change, for: 1m}",
+		"ip_change levels":  "  - {name: x, metric: ip_change, levels: [1]}",
 		"unknown node":      "  - {name: x, metric: cpu, op: '>', threshold: 1, nodes: [zz]}",
 		"nodes typo":        "  - {name: x, metric: cpu, op: '>', threshold: 1, nodes: everyone}",
 		"short repeat":      "  - {name: x, metric: cpu, op: '>', threshold: 1, repeat: 10s}",
@@ -146,5 +157,50 @@ func TestCFAccess(t *testing.T) {
 		if _, err := Parse([]byte(base + bad + "\n")); err == nil {
 			t.Errorf("accepted: %s", bad)
 		}
+	}
+}
+
+func TestExpiry(t *testing.T) {
+	sh, _ := time.LoadLocation("Asia/Shanghai")
+	at := func(s string) time.Time { // a UTC instant
+		t.Helper()
+		v, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	for _, c := range []struct {
+		expire string
+		renew  int
+		now    time.Time
+		date   string
+		days   int
+	}{
+		{"2026-10-10", 0, at("2026-09-30T12:00:00Z"), "2026-10-10", 10},
+		{"2026-10-10", 0, at("2026-10-10T15:59:00Z"), "2026-10-10", 0}, // 23:59 in Shanghai
+		{"2026-10-10", 0, at("2026-10-10T16:00:00Z"), "2026-10-10", -1},
+		{"2026-01-31", 1, at("2026-02-15T00:00:00Z"), "2026-02-28", 13}, // clamped
+		{"2026-01-31", 1, at("2026-03-01T00:00:00Z"), "2026-03-31", 30}, // from the anchor, not from Feb 28
+		{"2026-01-31", 1, at("2026-01-30T18:00:00Z"), "2026-01-31", 0},  // the day itself is not past
+		{"2020-02-29", 12, at("2026-03-01T00:00:00Z"), "2027-02-28", 364},
+		{"2024-03-15", 3, at("2026-09-30T00:00:00Z"), "2026-12-15", 76},
+	} {
+		n := Node{ExpireAt: c.expire, RenewMonths: c.renew}
+		n.expire, _ = time.Parse(time.DateOnly, c.expire)
+		date, days, ok := n.Expiry(c.now, sh)
+		if !ok || date != c.date || days != c.days {
+			t.Errorf("%s every %d at %s: %s, %d days; want %s, %d", c.expire, c.renew, c.now, date, days, c.date, c.days)
+		}
+	}
+	if _, _, ok := (&Node{}).Expiry(time.Now(), sh); ok {
+		t.Error("no expire_at: ok")
+	}
+	c, err := Parse([]byte("nodes:\n  - {id: a, token: " + tokA + ", expire_at: 2027-03-15, renew_months: 12, price: $10/年}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if date, _, ok := c.Nodes[0].Expiry(at("2026-10-01T00:00:00Z"), c.Location); !ok || date != "2027-03-15" || c.Nodes[0].Price != "$10/年" {
+		t.Fatalf("parsed: %s %+v", date, c.Nodes[0])
 	}
 }

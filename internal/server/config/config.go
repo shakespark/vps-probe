@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 
@@ -60,8 +62,16 @@ type Node struct {
 	NoPing []string `yaml:"no_ping"`
 	// Non-node targets this node pings, e.g. 1.1.1.1 through a tunnel.
 	ExtraPeers []ExtraPeer `yaml:"extra_peers"`
-	DisplayIdx int         `yaml:"-"` // position in the file
+	// Plan details, shown on the overview and used by expiry rules.
+	ExpireAt    string `yaml:"expire_at"`    // YYYY-MM-DD in the server timezone
+	RenewMonths int    `yaml:"renew_months"` // auto-renewing plan: a passed expiry moves forward by this many months
+	Price       string `yaml:"price"`        // display only, e.g. "$10/年"
+	DisplayIdx  int    `yaml:"-"`            // position in the file
+
+	expire time.Time // ExpireAt parsed, midnight UTC (a calendar date)
 }
+
+const MaxPriceLen = 64
 
 // ExtraPeer is copied into the node's agent.yml ping.peers as is.
 type ExtraPeer struct {
@@ -124,11 +134,13 @@ const (
 	MetricPingLoss = "ping_loss"
 	MetricPingAvg  = "ping_avg"
 	MetricTraffic  = "traffic"
+	MetricExpiry   = "expiry"
+	MetricIPChange = "ip_change"
 )
 
 var (
 	metrics = []string{MetricCPU, MetricSteal, MetricLoad1, MetricMem, MetricSwap, MetricDisk,
-		MetricOffline, MetricPingLoss, MetricPingAvg, MetricTraffic}
+		MetricOffline, MetricPingLoss, MetricPingAvg, MetricTraffic, MetricExpiry, MetricIPChange}
 	ops = []string{">", ">=", "<", "<="}
 )
 
@@ -193,6 +205,7 @@ func DefaultRules() []Rule {
 		{Name: "disk_full", Metric: MetricDisk, Op: ">", Threshold: ptr(90), For: Duration(10 * time.Minute)},
 		{Name: "link_loss", Metric: MetricPingLoss, Op: ">", Threshold: ptr(20), For: Duration(3 * time.Minute)},
 		{Name: "traffic_quota", Metric: MetricTraffic, Levels: []float64{80, 90, 100}},
+		{Name: "expiry", Metric: MetricExpiry, Levels: []float64{7, 1}},
 	}
 }
 
@@ -341,6 +354,21 @@ func (c *Config) validate() error {
 		if !slices.Contains(quotaModes, n.QuotaMode) {
 			bad("nodes[%s].traffic_quota_mode %q: want one of %v", n.ID, n.QuotaMode, quotaModes)
 		}
+		if n.ExpireAt != "" {
+			if t, err := time.Parse(time.DateOnly, n.ExpireAt); err != nil {
+				bad("nodes[%s].expire_at %q: want YYYY-MM-DD", n.ID, n.ExpireAt)
+			} else {
+				n.expire = t
+			}
+		}
+		if n.RenewMonths < 0 || n.RenewMonths > 120 {
+			bad("nodes[%s].renew_months: must be 0-120", n.ID)
+		} else if n.RenewMonths > 0 && n.ExpireAt == "" {
+			bad("nodes[%s].renew_months: needs expire_at", n.ID)
+		}
+		if len([]rune(n.Price)) > MaxPriceLen || strings.ContainsFunc(n.Price, unicode.IsControl) {
+			bad("nodes[%s].price: at most %d characters on one line", n.ID, MaxPriceLen)
+		}
 	}
 
 	for _, n := range c.Nodes {
@@ -444,6 +472,18 @@ func (c *Config) validate() error {
 			if len(r.Levels) == 0 || !slices.IsSorted(r.Levels) || r.Levels[0] <= 0 || r.Levels[len(r.Levels)-1] > 1000 {
 				bad("%s: levels: want ascending percentages, e.g. [80, 90, 100]", where)
 			}
+		case MetricExpiry:
+			if r.Op != "" || r.Threshold != nil || r.For != 0 || r.Repeat != 0 {
+				bad("%s: expiry takes levels (days before expiry), not op/threshold/for/repeat", where)
+			}
+			if len(r.Levels) == 0 || slices.ContainsFunc(r.Levels, func(l float64) bool { return l < 0 || l > 365 || l != math.Trunc(l) }) ||
+				len(slices.Compact(slices.Sorted(slices.Values(r.Levels)))) != len(r.Levels) {
+				bad("%s: levels: want distinct whole days 0-365, e.g. [7, 1] (0 = on the day)", where)
+			}
+		case MetricIPChange:
+			if r.Op != "" || r.Threshold != nil || r.Levels != nil || r.For != 0 || r.Repeat != 0 {
+				bad("%s: ip_change takes only nodes", where)
+			}
 		default:
 			if !slices.Contains(ops, r.Op) {
 				bad("%s: op %q: want one of %v", where, r.Op, ops)
@@ -509,4 +549,29 @@ func (c *Config) NoPing(a, b string) bool {
 	na, okA := c.Node(a)
 	nb, okB := c.Node(b)
 	return okA && slices.Contains(na.NoPing, b) || okB && slices.Contains(nb.NoPing, a)
+}
+
+// Expiry returns the node's next expiry date as of now and the whole days
+// left until it, counted in loc's calendar (0 = today, negative = past).
+// With renew_months, a passed date moves forward by whole cycles, each
+// counted from expire_at and clamped to the end of shorter months.
+// ok is false when the node has no expire_at.
+func (n *Node) Expiry(now time.Time, loc *time.Location) (date string, days int, ok bool) {
+	if n.expire.IsZero() {
+		return "", 0, false
+	}
+	y, m, d := now.In(loc).Date()
+	today := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	exp := n.expire
+	for k := 1; n.RenewMonths > 0 && exp.Before(today); k++ {
+		exp = addMonths(n.expire, k*n.RenewMonths)
+	}
+	return exp.Format(time.DateOnly), int(exp.Sub(today).Hours() / 24), true
+}
+
+// addMonths keeps t's day of month, or the month's last day if it is shorter.
+func addMonths(t time.Time, months int) time.Time {
+	first := time.Date(t.Year(), t.Month()+time.Month(months), 1, 0, 0, 0, 0, time.UTC)
+	last := first.AddDate(0, 1, -1).Day()
+	return first.AddDate(0, 0, min(t.Day(), last)-1)
 }

@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -10,7 +11,7 @@ import (
 
 // A v1 database (as deployed before alerts existed) upgrades in place and
 // keeps its data.
-func TestMigrateV1ToV2(t *testing.T) {
+func TestMigrateV1ToLatest(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "probe.db")
 	db, err := sql.Open("sqlite", dsn(path, false))
 	if err != nil {
@@ -24,14 +25,19 @@ func TestMigrateV1ToV2(t *testing.T) {
 	db.Exec(`INSERT INTO meta(key, value) VALUES ('schema_version', '1')`)
 	db.Exec(`INSERT INTO nodes(id, name) VALUES (1, 'a')`)
 	db.Exec(`INSERT INTO traffic_period(node, iface, start, rx, tx, ts) VALUES (1, 'eth0', '2026-09-01', 777, 1, 1)`)
+	db.Exec(`INSERT INTO node_status(node, max_ts, fresh_at, skew) VALUES (1, 100, 100, 0)`)
 	db.Close()
 
 	s := open(t, path)
 	defer s.Close()
 	var v string
 	s.w.QueryRow(`SELECT value FROM meta WHERE key = 'schema_version'`).Scan(&v)
-	if v != "2" {
+	if v != strconv.Itoa(schemaVersion) {
 		t.Fatalf("schema_version = %s", v)
+	}
+	s.SyncNodes([]string{"a"})
+	if st, err := s.Status(ctx, "a"); err != nil || st == nil || st.MaxTS != 100 || st.IP != "" {
+		t.Fatalf("v1 status after upgrade: %+v %v", st, err)
 	}
 	p, err := s.Periods(ctx, "a", 1)
 	if err != nil || len(p) != 1 || p[0].RX != 777 {

@@ -35,16 +35,17 @@ type Alerts interface {
 }
 
 type API struct {
-	cfg    *config.Config
-	store  *store.Store
-	ingest Stats
-	alerts Alerts
-	log    *slog.Logger
-	now    func() time.Time
+	cfg     *config.Config
+	store   *store.Store
+	ingest  Stats
+	alerts  Alerts
+	version string
+	log     *slog.Logger
+	now     func() time.Time
 }
 
-func New(cfg *config.Config, st *store.Store, ingest Stats, alerts Alerts, log *slog.Logger) *API {
-	return &API{cfg: cfg, store: st, ingest: ingest, alerts: alerts, log: log, now: time.Now}
+func New(cfg *config.Config, st *store.Store, ingest Stats, alerts Alerts, version string, log *slog.Logger) *API {
+	return &API{cfg: cfg, store: st, ingest: ingest, alerts: alerts, version: version, log: log, now: time.Now}
 }
 
 // CSP for the UI: no inline script or style, no third-party origins, no
@@ -90,12 +91,18 @@ func secure(h http.Handler) http.Handler {
 }
 
 type nodeView struct {
-	ID        string        `json:"id"`
-	Name      string        `json:"name"`
-	Online    bool          `json:"online"`
-	QuotaGB   float64       `json:"traffic_quota_gb,omitempty"`
-	QuotaMode string        `json:"traffic_quota_mode"`
-	Status    *store.Status `json:"status"` // null if it never reported
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	Online    bool    `json:"online"`
+	QuotaGB   float64 `json:"traffic_quota_gb,omitempty"`
+	QuotaMode string  `json:"traffic_quota_mode"`
+	// Next expiry date (rolled forward for renew_months) and days left
+	// in the server timezone; absent without expire_at.
+	ExpireAt    string        `json:"expire_at,omitempty"`
+	ExpireDays  *int          `json:"expire_days,omitempty"`
+	RenewMonths int           `json:"renew_months,omitempty"`
+	Price       string        `json:"price,omitempty"`
+	Status      *store.Status `json:"status"` // null if it never reported
 }
 
 func (a *API) nodes(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +114,11 @@ func (a *API) nodes(w http.ResponseWriter, r *http.Request) {
 			a.fail(w, err)
 			return
 		}
-		v := nodeView{ID: n.ID, Name: n.Name, QuotaGB: n.QuotaGB, QuotaMode: n.QuotaMode, Status: st}
+		v := nodeView{ID: n.ID, Name: n.Name, QuotaGB: n.QuotaGB, QuotaMode: n.QuotaMode,
+			RenewMonths: n.RenewMonths, Price: n.Price, Status: st}
+		if date, days, ok := n.Expiry(now, a.cfg.Location); ok {
+			v.ExpireAt, v.ExpireDays = date, &days
+		}
 		if st != nil {
 			v.Online = now.Sub(time.Unix(st.FreshAt, 0)) < time.Duration(a.cfg.OfflineAfter)
 		}
@@ -242,7 +253,7 @@ func (a *API) daily(w http.ResponseWriter, r *http.Request) {
 
 const maxAlertHistory = 500
 
-var alertEvents = []string{"firing", "repeat", "recovered", "level"}
+var alertEvents = []string{"firing", "repeat", "recovered", "level", "changed"}
 
 // alertsView: current alerts, history in ?from&to (default: last 7 days,
 // newest first, at most 500) narrowed by ?node, ?rule and ?event (comma-
@@ -291,7 +302,7 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"ingest": a.ingest.Stats(), "db_bytes": size, "server_time": a.now().Unix(),
-		"timezone": a.cfg.Timezone})
+		"timezone": a.cfg.Timezone, "version": a.version})
 }
 
 // nodeRange parses {id} plus ?from&to (unix seconds). Default: the last hour.

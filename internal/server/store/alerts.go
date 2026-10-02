@@ -11,7 +11,7 @@ import (
 type AlertState struct {
 	Rule     string  `json:"rule"`
 	Node     string  `json:"node"`
-	Target   string  `json:"target"` // mount, peer name, period start, or ""
+	Target   string  `json:"target"` // mount, peer name, period start, expiry date, IP, or ""
 	State    string  `json:"state"`
 	Since    int64   `json:"since"`
 	Notified int64   `json:"notified"`
@@ -24,7 +24,7 @@ type AlertEvent struct {
 	Rule    string  `json:"rule"`
 	Node    string  `json:"node"`
 	Target  string  `json:"target"`
-	Event   string  `json:"event"` // firing | repeat | recovered | level
+	Event   string  `json:"event"` // firing | repeat | recovered | level | changed
 	Value   float64 `json:"value"`
 	Message string  `json:"message"`
 }

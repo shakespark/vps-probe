@@ -52,7 +52,7 @@ var counterNames = []string{Accepted, Duplicate, Malformed, UnknownNode, AuthFai
 
 // Writer persists an accepted report.
 type Writer interface {
-	Write(node string, rep *pb.Report, arrival time.Time) error
+	Write(node string, rep *pb.Report, from netip.Addr, arrival time.Time) error
 }
 
 type Server struct {
@@ -191,7 +191,7 @@ func (s *Server) handle(pkt []byte, from netip.AddrPort) {
 		s.count(FieldsDropped)
 		s.rateLog("fields:"+h.Node, "ingest: dropped out-of-range values", "node", h.Node, "count", dropped)
 	}
-	if err := s.store.Write(h.Node, rep, now); err != nil {
+	if err := s.store.Write(h.Node, rep, from.Addr(), now); err != nil {
 		s.count(StoreFailed)
 		s.rateLog("store", "ingest: store write failed; not acknowledging so the agent retries", "err", err)
 		return

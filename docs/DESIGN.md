@@ -295,6 +295,9 @@ nodes:
     token: "<node token>"      # 配置文件需为 root:vps-probe-server 0640
     traffic_quota_gb: 1000     # 可选，用于显示进度和告警
     traffic_quota_mode: sum    # sum(收+发) | max(取大) | tx | rx，不同服务商计费方式不同
+    expire_at: 2027-03-15      # 可选：到期日（按 timezone），总览显示剩余天数，expiry 规则提醒
+    renew_months: 12           # 可选：自动续费周期（月），过了到期日按周期顺延
+    price: "$10/年"            # 可选：只用于显示，最多 64 字符
 telegram:                  # 可选；不配置则只记录不发送
   bot_token: "<token>"
   chat_id: "<chat id>"
@@ -316,6 +319,8 @@ backup:
 - 启动时不等待公钥：取到之前所有请求都 403，后台每 30s 重试（fail closed）。
 - 拒绝原因按类别限频写日志。开启后在服务器上直接 `curl 127.0.0.1:8080` 也会 403，属预期。
 
+**到期日**：剩余天数按服务端 `timezone` 的日历日计算（当天为 0，过期为负）。写了 `renew_months` 时，到期日过去后按 `expire_at + k × renew_months` 个月顺延到第一个不早于今天的日期；每次都从 `expire_at` 起算，月底按当月最后一天截断（1-31 起每月续费：2-28、3-31……），不会越算越早。API 和告警共用同一个计算函数，显示的天数与提醒一致。
+
 节点的 `addr`（其他节点 ping 它的地址）、`no_ping`（与哪些节点互不 ping，双向生效）、`extra_peers`（该节点额外的非节点目标，原样写进它的 `ping.peers`，`name` 不能与节点 id 重名）、`reset_day` 和 `reset_time` 只供 `vps-probe-server agent-config` 生成 agent.yml 使用；agent 自己的配置文件仍是唯一依据，agent 不从服务端获取任何配置。
 
 提供 `vps-probe-server gen-token` 子命令：生成 32 字节随机 token（base64url），同一个值同时填进 agent 和服务端配置。服务端启动时检查配置文件权限：其他用户可读或组可写则拒绝启动。推荐 `root:vps-probe-server 0640`，服务能读但不能改。
@@ -336,7 +341,7 @@ backup:
 - WAL 模式：运行中旁边会有 `probe.db-wal` / `-shm`，里面可能有已提交的数据。正常停止时执行 `wal_checkpoint(TRUNCATE)` 并删除它们，停机后只剩 `probe.db` 一个文件。
 - 一个专用写连接（ingest、降采样、清理都走它），另开只读连接池给 Web 查询，避免 `SQLITE_BUSY`。
 - 节点 id 映射为整数（`nodes` 表），各数据表用 `WITHOUT ROWID` + 复合主键，减少体积。
-- schema 有版本号（`meta.schema_version`，当前为 2），升级按版本逐步执行，只加表不删数据；遇到比程序更新的版本拒绝打开。
+- schema 有版本号（`meta.schema_version`，当前为 3），升级按版本逐步执行，只加表不删数据；遇到比程序更新的版本拒绝打开。
 
 | 表 | 主键 | 内容 | 保留 |
 |---|---|---|---|
@@ -347,6 +352,7 @@ backup:
 | `traffic_period` | (node, iface, period_start) | rx、tx、ts（latest-ts-wins） | 永久 |
 | `traffic_daily` | (node, iface, day) | 当日最后看到的周期总量 | 永久 |
 | `node_status` | node | 最大报文 ts、最后"新鲜"到达时间、系统信息 | — |
+| `node_addr` | node | 最新报文的来源 IP、从何时起用这个 IP | — |
 | `alert_state` | (rule, node, target) | firing 状态、流量已提醒的档位（target 为挂载点 / peer 名 / 周期起始） | 规则删除时清理 |
 | `alert_history` | id（按 ts 索引） | 告警、重复提醒、恢复、流量档位事件及消息原文 | 跟随 `retention.h1` |
 
@@ -355,6 +361,7 @@ backup:
 - 一份报文可能拆成多个包，共享同一 `ts`。`metrics_raw` 用 `ON CONFLICT DO UPDATE SET col = COALESCE(excluded.col, col)` 合并；其他表的行天然由各自主键区分。全部写入都是幂等的，重复包不会产生重复数据。
 - **在线判断**：只有 `ts` 大于该节点已见最大 `ts` 的报文才更新"最后新鲜到达时间"；在线 = 该时间在 `offline_after`（默认 30s）内。重放的旧包不会让离线节点显示在线；agent 时钟偏快也不会让它在死后一直显示在线。这两个值持久化在 `node_status`，服务端重启后恢复。
 - 服务端内存里保留近 2h 已处理的包 id：重放/重传的包直接回 ACK，不再写库。
+- **来源 IP**：与"新鲜到达时间"同一条件，只有抬高了 `max_ts` 的报文才记录其来源 IP（IPv4-mapped 地址还原为 IPv4，不记端口）。服务端重启后已处理 id 清空，截获的旧包从别处重放仍能通过认证，但它不会比已见的最新报文新，所以改不了记录的 IP，也触发不了 IP 变化通知。
 
 降采样与清理：
 
@@ -374,7 +381,7 @@ backup:
 
 | 路径 | 内容 |
 |---|---|
-| `GET /api/nodes` | 节点列表 + 最新状态 |
+| `GET /api/nodes` | 节点列表 + 最新状态（含来源 IP）+ 到期日（已按续费周期顺延）、剩余天数、价格 |
 | `GET /api/nodes/{id}/metrics?from&to` | 自动按时间跨度选择 raw/1m/5m |
 | `GET /api/nodes/{id}/disks?from&to` | 磁盘用量 |
 | `GET /api/nodes/{id}/net?from&to` | 各网卡速率 |
@@ -386,7 +393,7 @@ backup:
 
 - 按时间跨度自动选表：≤ 6h 用 raw，≤ 7d 用 5m，更长用 1h；再在 SQL 里按 `ts / step` 分组，每条曲线最多约 1000 个点。
 - ping 矩阵的列是各 peer 的 `name`；与节点 id 不一致的 name 也会显示为单独一列。
-- `GET /api/stats`：ingest 各丢弃原因的计数、数据库大小。
+- `GET /api/stats`：ingest 各丢弃原因的计数、数据库大小、服务端版本。
 
 所有接口都是 GET，服务端不注册任何写接口。
 
@@ -397,7 +404,7 @@ backup:
 ```yaml
 alerts:
   - name: cpu_high
-    metric: cpu            # cpu | mem | swap | disk | load1 | steal | offline | ping_loss | ping_avg | traffic
+    metric: cpu            # cpu | mem | swap | disk | load1 | steal | offline | ping_loss | ping_avg | traffic | expiry | ip_change
     op: ">"
     threshold: 90
     for: 5m                # 持续多久才触发
@@ -420,6 +427,11 @@ alerts:
   - name: traffic_quota
     metric: traffic        # 按配额百分比，每个周期每个档位只提醒一次
     levels: [80, 90, 100]
+  - name: expiry
+    metric: expiry         # 到期前几天提醒，0 = 当天
+    levels: [7, 1]
+  - name: ip_change
+    metric: ip_change      # 只接受 nodes
 ```
 
 - 状态机：`ok → pending（满足条件但未达到 for）→ firing → ok`；进入 firing 和恢复时各发一条 TG 消息。
@@ -429,10 +441,12 @@ alerts:
   - ping_loss、ping_avg 按 (src, dst) 链路取最近 60s 的汇总（单个 10s 样本只有 10 个包，太抖）；
   - offline = 超过 `for` 没有新鲜报文（从未上报的节点也算），不经过 pending；
   - 目标节点已离线（超过 `offline_after` 没有新鲜报文）且有 offline 规则覆盖它时，指向它的链路不评估 ping_loss / ping_avg：节点宕机时其他节点必然全部 ping 不通，离线告警已经说明了，不再每条链路各报一次。目标还在上报、只是 ping 不通时照常告警；没有 offline 规则覆盖的目标也照常告警。
+  - expiry 只评估写了 `expire_at` 的节点：剩余天数 ≤ 某档且该档比已提醒过的更紧迫时提醒一次（一轮跨过多档只发最紧迫的一档，首次配置时已过期也只发一条）。状态按 (规则, 节点, 到期日) 记录，续费改了 `expire_at` 或按 `renew_months` 顺延后是新的到期日，重新计档，旧日期的状态删除。
+  - ip_change：最新报文的来源 IP 与记录的不同时通知一次「旧 → 新」，没有告警中/恢复状态；某节点第一次看到的 IP 只记录不通知（升级后不会每个节点报一遍）。当前 IP 存在 `alert_state.target`，重启不重复。agent 重新解析服务端地址时换了地址族（v4 ↔ v6）也会算作变化。
   - traffic 按节点的 `traffic_quota_mode` 计算已用量，没设配额的节点跳过；状态按 (规则, 节点, 周期起始) 记录，每个周期每个档位只提醒一次，下个周期自动重新计。
 - **数据缺失**（节点离线、没有对应数据）时：firing 的告警保持不动，不发恢复；pending 的归零。
 - 服务端启动后的前 2 分钟不评估 offline，避免服务端重启时误报所有节点离线。
-- 未配置 `alerts` 时使用默认规则：offline 60s、cpu > 90% 5m、mem > 90% 5m、disk > 90% 10m、ping_loss > 20% 3m、traffic [80, 90, 100]。写了 `alerts` 就只用写的规则。
+- 未配置 `alerts` 时使用默认规则：offline 60s、cpu > 90% 5m、mem > 90% 5m、disk > 90% 10m、ping_loss > 20% 3m、traffic [80, 90, 100]、expiry [7, 1]。ip_change 不在默认规则里（动态 IP 的节点会频繁触发）。写了 `alerts` 就只用写的规则。
 - firing 状态和流量档位持久化在 `alert_state`，服务端重启不会重复告警；`alert_history` 保留 400 天（跟随 `retention.h1`）。配置里删掉的规则，其状态在启动时清理。
 
 Telegram：
@@ -447,7 +461,7 @@ Telegram：
 
 ## 8. 前端页面
 
-1. **总览**：每个节点一张卡片，显示在线状态、CPU/内存/磁盘进度条、实时网速、本周期流量/配额进度、运行时长。
+1. **总览**：顶部汇总条：在线数、在线节点实时网速之和、各节点本周期流量之和（各自按自己的周期起始日）、最近到期的节点。每个节点一张卡片，显示在线状态、CPU/内存/磁盘进度条、实时网速、本周期流量/配额进度、运行时长、到期日/剩余天数/价格（7 天内到期或已过期时标题旁加角标）。agent 版本低于其他节点中最新的 agent 版本时显示「agent 可升级」：与 agent 互相比较而不是与服务端比较，因为只改服务端的版本不需要升级 agent；`dev` 等无法解析的版本不比较。节点详情另显示上报来源 IP。
 2. **节点详情**：时间范围可选 1h / 6h / 24h / 7d / 30d / 自定义；图表包括 CPU（含 steal）、负载、内存/Swap、磁盘、各网卡速率，以及该节点到各 peer 的时延。
 3. **时延矩阵**：N×N 热力图（颜色表示 avg，角标表示丢包），点击格子查看该链路的历史曲线（min/avg/max 区间带 + 丢包柱）。
 4. **流量**：各节点本周期/历史周期的收、发、合计与配额表格，以及本周期每日流量柱状图。

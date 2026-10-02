@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -32,16 +33,18 @@ var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
 type fakeWriter struct {
 	mu   sync.Mutex
 	reps []*pb.Report
+	from []netip.Addr
 	fail bool
 }
 
-func (f *fakeWriter) Write(node string, rep *pb.Report, _ time.Time) error {
+func (f *fakeWriter) Write(node string, rep *pb.Report, from netip.Addr, _ time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail {
 		return fmt.Errorf("disk full")
 	}
 	f.reps = append(f.reps, rep)
+	f.from = append(f.from, from)
 	return nil
 }
 
@@ -151,6 +154,9 @@ func TestAcceptAndAck(t *testing.T) {
 	}
 	if w.count() != 1 {
 		t.Fatalf("writes = %d", w.count())
+	}
+	if !w.from[0].IsLoopback() {
+		t.Fatalf("source address %v", w.from[0])
 	}
 	st := s.Stats()
 	if st[Accepted] != 1 || st[Duplicate] != 1 {

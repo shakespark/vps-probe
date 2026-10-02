@@ -110,10 +110,12 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
     - **DNS**：隧道远端指向 `1.1.1.1:53`，写 `{ name: cf-relay, addr: "127.0.0.1:本地转发端口", type: dns }`。
   - 本地转发规则只监听 `127.0.0.1`；转发到 DNS 的端口如果监听 `0.0.0.0`，就成了公网开放的 DNS 中继。
 - 服务端那台机器本身也可以装 agent，`-server` 写 `127.0.0.1:9527` 即可。
+- 可选：在节点下写 `expire_at`（到期日）、`renew_months`（自动续费周期，月）、`price`（显示用），总览会显示剩余天数，默认的 `expiry` 规则在到期前 7 天和 1 天提醒（写法见 `examples/server.example.yml`）。只改服务端配置，重启服务端即可。
 
 ## 5. 告警与 Telegram
 
-- 规则写在 `server.yml` 的 `alerts` 里（示例见 `examples/server.example.yml`，完整说明见 `docs/DESIGN.md` §7）。不写则用默认规则：离线 60s、CPU/内存 > 90% 持续 5 分钟、磁盘 > 90% 持续 10 分钟、链路丢包 > 20% 持续 3 分钟、流量配额 80/90/100%。
+- 规则写在 `server.yml` 的 `alerts` 里（示例见 `examples/server.example.yml`，完整说明见 `docs/DESIGN.md` §7）。不写则用默认规则：离线 60s、CPU/内存 > 90% 持续 5 分钟、磁盘 > 90% 持续 10 分钟、链路丢包 > 20% 持续 3 分钟、流量配额 80/90/100%、到期前 7/1 天。已经写了 `alerts` 的，要到期提醒需自己加上 `expiry` 规则。
+- 上报来源 IP 变化通知（`metric: ip_change`）不在默认规则里，需要时自己加，动态 IP 的节点建议用 `nodes` 排除。
 - Telegram：在 @BotFather 用 `/newbot` 建一个**专用** bot，给它发一条消息，再打开 `https://api.telegram.org/bot<TOKEN>/getUpdates` 找 `"chat":{"id":` 后面的数字。填进 `telegram.bot_token` / `telegram.chat_id`，然后：
 
   ```sh

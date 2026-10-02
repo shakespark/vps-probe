@@ -20,6 +20,8 @@ type Status struct {
 	FreshAt int64    `json:"fresh_at"`   // server time that report arrived
 	Skew    int64    `json:"clock_skew"` // server minus agent clock, seconds
 	Sys     *SysInfo `json:"sys"`
+	IP      string   `json:"ip,omitempty"`       // source address of the newest report
+	IPSince int64    `json:"ip_since,omitempty"` // first report from it
 
 	MetricsTS int64    `json:"metrics_ts,omitempty"`
 	CPU       *float64 `json:"cpu"`
@@ -82,14 +84,17 @@ func (s *Store) Status(ctx context.Context, node string) (*Status, error) {
 		return nil, nil
 	}
 	st := &Status{}
-	var sys sql.NullString
-	err := s.r.QueryRowContext(ctx, `SELECT max_ts, fresh_at, skew, sys FROM node_status WHERE node = ?`, rid).
-		Scan(&st.MaxTS, &st.FreshAt, &st.Skew, &sys)
+	var sys, ip sql.NullString
+	var ipSince sql.NullInt64
+	err := s.r.QueryRowContext(ctx, `SELECT s.max_ts, s.fresh_at, s.skew, s.sys, a.ip, a.since
+		FROM node_status s LEFT JOIN node_addr a ON a.node = s.node WHERE s.node = ?`, rid).
+		Scan(&st.MaxTS, &st.FreshAt, &st.Skew, &sys, &ip, &ipSince)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
 	}
+	st.IP, st.IPSince = ip.String, ipSince.Int64
 	if sys.Valid {
 		st.Sys = &SysInfo{}
 		if err := json.Unmarshal([]byte(sys.String), st.Sys); err != nil {

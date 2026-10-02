@@ -39,7 +39,8 @@ func held(since, now time.Time, d time.Duration) bool { return now.Sub(since)+sl
 const (
 	statePending = "pending"
 	stateFiring  = "firing"
-	stateLevel   = "level" // traffic: highest quota level notified this period
+	stateLevel   = "level" // traffic: highest quota level notified this period; expiry: lowest day level
+	stateSeen    = "seen"  // ip_change: the node's last known IP, kept in the target
 )
 
 // Source is what the evaluator needs from the store.
@@ -136,7 +137,7 @@ func (e *Evaluator) Active() []Active {
 	defer e.mu.Unlock()
 	out := []Active{}
 	for k, in := range e.inst {
-		if in.state == stateLevel {
+		if in.state == stateLevel || in.state == stateSeen {
 			continue
 		}
 		r := e.rule(k.rule)
@@ -207,11 +208,28 @@ func (e *Evaluator) Tick(ctx context.Context) error {
 		put = append(put, store.AlertState{Rule: k.rule, Node: k.node, Target: k.target, State: in.state,
 			Since: in.since.Unix(), Notified: in.notified.Unix(), Value: in.value})
 	}
+	// drop forgets the rule's other states for k's node, e.g. an expiry
+	// date that has been renewed or an IP that is no longer current.
+	drop := func(k key) {
+		for o := range e.inst {
+			if o.rule == k.rule && o.node == k.node && o.target != k.target {
+				delete(e.inst, o)
+				del = append(del, store.AlertState{Rule: o.rule, Node: o.node, Target: o.target})
+			}
+		}
+	}
 
 	for i := range e.cfg.Alerts {
 		r := &e.cfg.Alerts[i]
-		if r.Metric == config.MetricTraffic {
+		switch r.Metric {
+		case config.MetricTraffic:
 			e.traffic(r, snap, now, emit, persist)
+			continue
+		case config.MetricExpiry:
+			e.expiry(r, now, emit, persist, drop)
+			continue
+		case config.MetricIPChange:
+			e.ipChange(r, snap, now, emit, persist, drop)
 			continue
 		}
 		seen := map[key]bool{}
@@ -458,6 +476,88 @@ func (e *Evaluator) traffic(r *config.Rule, snap *snapshot, now time.Time,
 			now.In(e.cfg.Location).Format("2006-01-02 15:04:05"))
 		emit(k, "level", level, msg)
 		persist(k, in)
+	}
+}
+
+// expiry reminds once per level (days before the date) per expiry date.
+// A renewed or rolled-forward date starts over.
+func (e *Evaluator) expiry(r *config.Rule, now time.Time,
+	emit func(key, string, float64, string), persist func(key, *instance), drop func(key)) {
+	for i := range e.cfg.Nodes {
+		n := &e.cfg.Nodes[i]
+		date, days, ok := n.Expiry(now, e.cfg.Location)
+		if !r.Nodes.Has(n.ID) || !ok {
+			continue
+		}
+		k := key{r.Name, n.ID, date}
+		drop(k)
+		in := e.inst[k]
+		prev := math.Inf(1)
+		if in != nil {
+			prev = in.value
+		}
+		level := math.Inf(1) // the most urgent level reached and not yet sent
+		for _, l := range r.Levels {
+			if float64(days) <= l && l < prev {
+				level = min(level, l)
+			}
+		}
+		if math.IsInf(level, 1) {
+			continue
+		}
+		if in == nil {
+			in = &instance{state: stateLevel, since: now}
+			e.inst[k] = in
+		}
+		in.value, in.notified = level, now
+		var when string
+		switch {
+		case days > 0:
+			when = fmt.Sprintf("将于 %s 到期，还剩 %d 天", date, days)
+		case days == 0:
+			when = fmt.Sprintf("今天（%s）到期", date)
+		default:
+			when = fmt.Sprintf("已于 %s 到期（%d 天前）", date, -days)
+		}
+		if n.Price != "" {
+			when += "，价格 " + n.Price
+		}
+		if n.RenewMonths > 0 {
+			when += fmt.Sprintf("（自动续费，每 %d 个月）", n.RenewMonths)
+		}
+		emit(k, "level", float64(days), fmt.Sprintf("⏰ 到期 %s · %s\n%s\n%s",
+			r.Name, e.nodeName(n.ID), when, now.In(e.cfg.Location).Format("2006-01-02 15:04:05")))
+		persist(k, in)
+	}
+}
+
+// ipChange notices when a node's reports start coming from another IP.
+// The first IP seen for a node is recorded silently.
+func (e *Evaluator) ipChange(r *config.Rule, snap *snapshot, now time.Time,
+	emit func(key, string, float64, string), persist func(key, *instance), drop func(key)) {
+	for _, n := range e.cfg.Nodes {
+		st := snap.status[n.ID]
+		if !r.Nodes.Has(n.ID) || st == nil || st.IP == "" {
+			continue
+		}
+		k := key{r.Name, n.ID, st.IP}
+		if e.inst[k] != nil {
+			continue
+		}
+		var old string
+		for o := range e.inst {
+			if o.rule == r.Name && o.node == n.ID {
+				old = o.target
+			}
+		}
+		drop(k)
+		in := &instance{state: stateSeen, since: time.Unix(st.IPSince, 0), notified: now}
+		e.inst[k] = in
+		persist(k, in)
+		if old != "" {
+			emit(k, "changed", 0, fmt.Sprintf("🔁 IP 变化 %s · %s\n%s → %s\n%s",
+				r.Name, e.nodeName(n.ID), old, st.IP, now.In(e.cfg.Location).Format("2006-01-02 15:04:05")))
+		}
 	}
 }
 

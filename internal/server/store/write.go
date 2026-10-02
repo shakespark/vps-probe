@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/netip"
 	"time"
 
 	pb "vpsprobe/internal/proto/probev1"
@@ -13,7 +14,9 @@ import (
 // Write stores one (already validated) report piece in a single transaction.
 // Every statement is idempotent, so duplicates and replays change nothing,
 // and pieces of a split report sharing one ts merge into the same rows.
-func (s *Store) Write(node string, rep *pb.Report, arrival time.Time) error {
+// from is the packet's source address; it is recorded only when the report
+// is the node's newest.
+func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time.Time) error {
 	rid, ok := s.nodeID(node)
 	if !ok {
 		return fmt.Errorf("store: unknown node %q", node)
@@ -25,11 +28,21 @@ func (s *Store) Write(node string, rep *pb.Report, arrival time.Time) error {
 	defer tx.Rollback()
 	ts := rep.Ts
 
-	if _, err := tx.Exec(`INSERT INTO node_status(node, max_ts, fresh_at, skew) VALUES (?, ?, ?, ?)
+	res, err := tx.Exec(`INSERT INTO node_status(node, max_ts, fresh_at, skew) VALUES (?, ?, ?, ?)
 		ON CONFLICT(node) DO UPDATE SET max_ts = excluded.max_ts, fresh_at = excluded.fresh_at, skew = excluded.skew
 		WHERE excluded.max_ts > node_status.max_ts`,
-		rid, ts, arrival.Unix(), arrival.Unix()-ts); err != nil {
+		rid, ts, arrival.Unix(), arrival.Unix()-ts)
+	if err != nil {
 		return err
+	}
+	if fresh, err := res.RowsAffected(); err != nil {
+		return err
+	} else if fresh > 0 && from.IsValid() {
+		if _, err := tx.Exec(`INSERT INTO node_addr(node, ip, since) VALUES (?, ?, ?)
+			ON CONFLICT(node) DO UPDATE SET ip = excluded.ip, since = excluded.since WHERE ip <> excluded.ip`,
+			rid, from.Unmap().String(), arrival.Unix()); err != nil {
+			return err
+		}
 	}
 	if rep.Sys != nil {
 		y := rep.Sys

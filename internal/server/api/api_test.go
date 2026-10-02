@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,7 +31,8 @@ func setup(t *testing.T) (http.Handler, *store.Store) {
 	t.Helper()
 	cfg, err := config.Parse([]byte(`
 nodes:
-  - {id: hk-1, name: 香港, token: abcdefghijklmnopqrstuvwxyz0123456789, traffic_quota_gb: 1000}
+  - {id: hk-1, name: 香港, token: abcdefghijklmnopqrstuvwxyz0123456789, traffic_quota_gb: 1000,
+     expire_at: 2099-01-01, renew_months: 12, price: "$10/年"}
   - {id: jp-1, token: bcdefghijklmnopqrstuvwxyz0123456789a}
 `))
 	if err != nil {
@@ -50,7 +52,7 @@ nodes:
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(cfg, st, noStats{}, noAlerts{}, log).Handler(ui), st
+	return New(cfg, st, noStats{}, noAlerts{}, "9.9.9", log).Handler(ui), st
 }
 
 func get(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
@@ -101,15 +103,19 @@ func TestNodesView(t *testing.T) {
 	h, st := setup(t)
 	now := time.Now()
 	st.Write("hk-1", &pb.Report{Ts: now.Unix(), Cpu: &pb.CPU{Usage: 50},
-		Traffic: []*pb.IfaceTraffic{{Iface: "eth0", Cur: &pb.Period{Start: "2026-09-01", Rx: 10, Tx: 20}}}}, now)
+		Traffic: []*pb.IfaceTraffic{{Iface: "eth0", Cur: &pb.Period{Start: "2026-09-01", Rx: 10, Tx: 20}}}}, netip.MustParseAddr("192.0.2.7"), now)
 
 	var nodes []struct {
 		ID      string  `json:"id"`
 		Name    string  `json:"name"`
 		Online  bool    `json:"online"`
 		QuotaGB float64 `json:"traffic_quota_gb"`
+		Expire  string  `json:"expire_at"`
+		Days    *int    `json:"expire_days"`
+		Price   string  `json:"price"`
 		Status  *struct {
 			CPU     *float64 `json:"cpu"`
+			IP      string   `json:"ip"`
 			Traffic *struct{ RX, TX int64 }
 		} `json:"status"`
 	}
@@ -120,11 +126,18 @@ func TestNodesView(t *testing.T) {
 	if len(nodes) != 2 || nodes[0].ID != "hk-1" || nodes[0].Name != "香港" || !nodes[0].Online || nodes[0].QuotaGB != 1000 {
 		t.Fatalf("nodes: %s", rec.Body)
 	}
-	if *nodes[0].Status.CPU != 50 || nodes[0].Status.Traffic.TX != 20 {
+	if *nodes[0].Status.CPU != 50 || nodes[0].Status.Traffic.TX != 20 || nodes[0].Status.IP != "192.0.2.7" {
 		t.Fatalf("status: %s", rec.Body)
 	}
-	if nodes[1].Online || nodes[1].Status != nil || nodes[1].Name != "jp-1" {
+	if nodes[0].Expire != "2099-01-01" || nodes[0].Days == nil || *nodes[0].Days < 20000 || nodes[0].Price != "$10/年" {
+		t.Fatalf("plan: %s", rec.Body)
+	}
+	if nodes[1].Online || nodes[1].Status != nil || nodes[1].Name != "jp-1" || nodes[1].Days != nil {
 		t.Fatalf("silent node: %s", rec.Body)
+	}
+
+	if rec = get(t, h, "GET", "/api/stats"); !strings.Contains(rec.Body.String(), `"version":"9.9.9"`) {
+		t.Fatalf("stats: %s", rec.Body)
 	}
 
 	rec = get(t, h, "GET", "/api/traffic/hk-1/daily")

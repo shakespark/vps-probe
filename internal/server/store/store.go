@@ -17,7 +17,7 @@ import (
 	_ "modernc.org/sqlite" // pure Go, keeps CGO_ENABLED=0 builds
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Rollup buckets, in seconds.
 const (
@@ -144,7 +144,16 @@ func (s *Store) step(version int, stmts []string) error {
 }
 
 // migrations[i] takes the schema from version i to i+1.
-var migrations = [][]string{schemaV1, schemaV2}
+var migrations = [][]string{schemaV1, schemaV2, schemaV3}
+
+var schemaV3 = []string{
+	// The source IP of the node's newest report, and when it first
+	// reported from it. Only reports that raise max_ts update it, so a
+	// replayed packet from elsewhere can't.
+	`CREATE TABLE IF NOT EXISTS node_addr (
+		node INTEGER PRIMARY KEY, ip TEXT NOT NULL, since INTEGER NOT NULL
+	)`,
+}
 
 var schemaV2 = []string{
 	// Firing alerts and notified traffic levels, so a restart neither

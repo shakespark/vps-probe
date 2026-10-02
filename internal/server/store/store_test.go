@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -37,9 +38,11 @@ func newStore(t *testing.T) *Store {
 	return s
 }
 
+var testIP = netip.MustParseAddr("192.0.2.1")
+
 func write(t *testing.T, s *Store, node string, rep *pb.Report, arrival time.Time) {
 	t.Helper()
-	if err := s.Write(node, rep, arrival); err != nil {
+	if err := s.Write(node, rep, testIP, arrival); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -347,10 +350,39 @@ func TestDailyBackupRotation(t *testing.T) {
 
 func TestUnknownNodeRejected(t *testing.T) {
 	s := newStore(t)
-	if err := s.Write("zzz", &pb.Report{Ts: 1}, time.Now()); err == nil {
+	if err := s.Write("zzz", &pb.Report{Ts: 1}, testIP, time.Now()); err == nil {
 		t.Fatal("write for unknown node succeeded")
 	}
 	if st, err := s.Status(ctx, "b"); st != nil || err != nil {
 		t.Fatalf("never-reported node: %v %v", st, err)
 	}
+}
+
+// The source IP follows the newest report only: a replayed older packet
+// from another address leaves it alone.
+func TestSourceIP(t *testing.T) {
+	s := newStore(t)
+	t0 := time.Now().Unix()
+	at := func(ts int64, ip string) {
+		t.Helper()
+		if err := s.Write("a", &pb.Report{Ts: ts}, netip.MustParseAddr(ip), time.Unix(ts, 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(ip string, since int64) {
+		t.Helper()
+		st, err := s.Status(ctx, "a")
+		if err != nil || st.IP != ip || st.IPSince != since {
+			t.Fatalf("ip = %q since %d, want %q since %d (%v)", st.IP, st.IPSince, ip, since, err)
+		}
+	}
+	at(t0, "::ffff:198.51.100.1") // IPv4 through a dual-stack socket
+	check("198.51.100.1", t0)
+	at(t0+10, "198.51.100.1")
+	check("198.51.100.1", t0)
+	at(t0-10, "203.0.113.9") // replay of an older report
+	at(t0+10, "203.0.113.9") // same ts as the newest: not newer
+	check("198.51.100.1", t0)
+	at(t0+20, "2001:db8::1")
+	check("2001:db8::1", t0+20)
 }

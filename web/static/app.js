@@ -101,6 +101,33 @@ function billable(rx, tx, mode) {
 }
 const quotaBytes = gb => gb * 1024 ** 3; // traffic_quota_gb counts 1024³ bytes
 
+// expire_days is counted by the server in its timezone: 0 = today.
+function fmtExpiry(days) {
+  if (days > 0) return `剩 ${days} 天`;
+  return days === 0 ? '今天到期' : `已过期 ${-days} 天`;
+}
+const expiryClass = days => days <= 0 ? 'bad' : days <= 7 ? 'warn' : null;
+
+// Agent versions like "0.1.4"; anything else (e.g. "dev") is not compared.
+function parseVer(v) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(v || '');
+  return m ? m.slice(1).map(Number) : null;
+}
+function cmpVer(a, b) {
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return 0;
+}
+// The newest agent version among the nodes. Server-only releases don't
+// change agents, so agents are compared with each other, not the server.
+function newestAgent(nodes) {
+  let best = null;
+  for (const n of nodes) {
+    const v = parseVer(n.status && n.status.sys && n.status.sys.agent_version);
+    if (v && (!best || cmpVer(v, best) > 0)) best = v;
+  }
+  return best;
+}
+
 // ---------- API ----------
 
 async function api(path) {
@@ -222,24 +249,55 @@ function rerender() { navigate(); }
 
 function overviewPage() {
   const grid = h('div', { class: 'cards' });
-  const count = h('span', { class: 'muted' });
+  const stats = h('div', { class: 'stats panel' });
   return {
     nav: 'overview',
-    el: h('div', null, h('div', { class: 'row' }, h('h1', { text: '总览' }), count), h('div', { class: 'section' }, grid)),
+    el: h('div', null, h('h1', { text: '总览' }), h('div', { class: 'section' }, stats), h('div', { class: 'section' }, grid)),
     async refresh() {
       const nodes = await api('/api/nodes');
-      count.textContent = `${nodes.filter(n => n.online).length} / ${nodes.length} 在线`;
-      grid.replaceChildren(...nodes.map(nodeCard));
+      stats.replaceChildren(...overviewStats(nodes));
+      const newest = newestAgent(nodes);
+      grid.replaceChildren(...nodes.map(n => nodeCard(n, newest)));
     },
   };
+}
+
+function overviewStats(nodes) {
+  const stat = (k, v, cls, title) => h('div', { class: 'stat', title },
+    h('div', { class: 'k', text: k }), h('div', { class: 'v num' + (cls ? ' ' + cls : ''), text: v }));
+  const online = nodes.filter(n => n.online);
+  let rx = 0, tx = 0, trx = 0, ttx = 0;
+  for (const n of online) for (const x of n.status.net || []) { rx += x.rx; tx += x.tx; }
+  for (const n of nodes) {
+    const t = n.status && n.status.traffic;
+    if (t) { trx += t.rx; ttx += t.tx; }
+  }
+  const out = [
+    stat('在线', `${online.length} / ${nodes.length}`, online.length < nodes.length ? 'warn' : null),
+    stat('实时网速', `↓ ${fmtRate(rx)}   ↑ ${fmtRate(tx)}`, null, '在线节点各物理网卡之和'),
+    stat('本周期流量合计', `↓ ${fmtBytes(trx)}   ↑ ${fmtBytes(ttx)}`, null, '各节点按各自的周期起始日计算后相加'),
+  ];
+  // The nearest upcoming date; an already expired node only when none is upcoming,
+  // so one kept in the config for its history doesn't pin this forever.
+  const dated = nodes.filter(n => n.expire_days != null);
+  const upcoming = dated.filter(n => n.expire_days >= 0);
+  const due = (upcoming.length ? upcoming : dated).sort((a, b) => Math.abs(a.expire_days) - Math.abs(b.expire_days));
+  if (due.length) {
+    const n = due[0];
+    out.push(stat('最近到期', `${n.name} · ${fmtExpiry(n.expire_days)}`, expiryClass(n.expire_days), n.expire_at));
+  }
+  return out;
 }
 
 function rootDisk(disks) {
   return (disks || []).find(d => d.mount === '/') || (disks || [])[0];
 }
 
-function nodeCard(n) {
+function nodeCard(n, newest) {
   const s = n.status;
+  const ver = s && s.sys && s.sys.agent_version;
+  const pv = parseVer(ver);
+  const stale = pv && newest && cmpVer(pv, newest) < 0;
   const head = h('div', { class: 'card-head' },
     h('span', { class: 'dot ' + (n.online ? 'on' : 'off'), title: n.online ? '在线' : '离线' }),
     h('span', { class: 'name', text: n.name }),
@@ -247,9 +305,18 @@ function nodeCard(n) {
     h('span', { class: 'spacer' }),
     !s ? h('span', { class: 'badge', text: '从未上报' })
       : !n.online ? h('span', { class: 'badge bad', text: '离线 ' + fmtDur(nowSec() - s.fresh_at) }) : null,
-    s && Math.abs(s.clock_skew) > 60 ? h('span', { class: 'badge warn', text: `时钟偏差 ${s.clock_skew}s` }) : null);
+    s && Math.abs(s.clock_skew) > 60 ? h('span', { class: 'badge warn', text: `时钟偏差 ${s.clock_skew}s` }) : null,
+    n.expire_days != null && n.expire_days <= 7
+      ? h('span', { class: 'badge ' + expiryClass(n.expire_days), text: fmtExpiry(n.expire_days) }) : null,
+    stale ? h('span', { class: 'badge warn', text: 'agent 可升级', title: `agent ${ver}，最新 ${newest.join('.')}` }) : null);
   const card = h('a', { class: 'card panel' + (n.online ? '' : ' offline'), href: '#/node/' + enc(n.id) }, head);
-  if (!s) return card;
+  const expiry = n.expire_at ? h('div', { class: 'kv' }, h('span', { class: 'k', text: '到期' }),
+    h('span', { class: 'num' + (expiryClass(n.expire_days) ? ' ' + expiryClass(n.expire_days) : ''),
+      text: [n.expire_at, fmtExpiry(n.expire_days), n.price].filter(Boolean).join(' · ') })) : null;
+  if (!s) {
+    if (expiry) card.append(expiry);
+    return card;
+  }
 
   const sys = s.sys;
   card.append(h('div', { class: 'card-sub muted', text: sys
@@ -282,6 +349,7 @@ function nodeCard(n) {
       card.append(metric('配额', 100 * used / q, `${fmtBytes(used)} / ${fmtBytes(q)}`));
     }
   }
+  if (expiry) card.append(expiry);
   return card;
 }
 
@@ -396,7 +464,10 @@ function renderNodeHead(n, title, dot, sub, summary) {
     kv('内存', s.mem_total ? `${fmtBytes(s.mem_used)} / ${fmtBytes(s.mem_total)}` : '—'),
     kv('磁盘 /', d ? `${fmtBytes(d.used)} / ${fmtBytes(d.total)}` : '—'),
     kv('时钟偏差', s.clock_skew + ' s'),
-    kv('本周期流量', s.traffic ? `↓ ${fmtBytes(s.traffic.rx)} ↑ ${fmtBytes(s.traffic.tx)}` : '—'));
+    kv('本周期流量', s.traffic ? `↓ ${fmtBytes(s.traffic.rx)} ↑ ${fmtBytes(s.traffic.tx)}` : '—'),
+    kv('上报来源 IP', s.ip ? `${s.ip}（${fmtTime(s.ip_since)} 起）` : '—'),
+    ...(n.expire_at ? [kv('到期', [n.expire_at, fmtExpiry(n.expire_days),
+      n.renew_months ? `每 ${n.renew_months} 个月自动续费` : null, n.price].filter(Boolean).join(' · '))] : []));
 }
 
 // ---------- latency matrix ----------
@@ -573,8 +644,11 @@ function trafficPage() {
 // ---------- alerts ----------
 
 const METRICS = { cpu: 'CPU', steal: 'Steal', load1: '负载(1m)', mem: '内存', swap: 'Swap', disk: '磁盘',
-  offline: '离线', ping_loss: '丢包', ping_avg: '时延', traffic: '流量配额' };
-const EVENTS = { firing: '告警', repeat: '仍在告警', recovered: '恢复', level: '流量档位' };
+  offline: '离线', ping_loss: '丢包', ping_avg: '时延', traffic: '流量配额', expiry: '到期', ip_change: 'IP 变化' };
+const EVENTS = { firing: '告警', repeat: '仍在告警', recovered: '恢复', level: '流量档位', changed: 'IP 变化' };
+// Rules that notify once per event rather than fire and recover.
+const NOTICE_METRICS = ['traffic', 'expiry', 'ip_change'];
+const eventText = (e, metric) => e.event === 'level' && metric === 'expiry' ? '到期提醒' : EVENTS[e.event] || e.event;
 
 function fmtRuleValue(metric, v) {
   if (v == null) return '—';
@@ -584,9 +658,20 @@ function fmtRuleValue(metric, v) {
   return fmtPct(v);
 }
 
+// metric is undefined for events of rules no longer configured.
+function historyValue(e, metric) {
+  if (e.event === 'changed') return '—';
+  if (e.event === 'level') return metric === 'expiry' ? fmtExpiry(e.value) : e.value + '%';
+  return fmtRuleValue(metric, e.value);
+}
+
 function ruleText(r) {
   if (r.metric === 'offline') return `超过 ${r.for} 没有上报`;
   if (r.metric === 'traffic') return `达到配额 ${r.levels.join(' / ')}%（每周期每档一次）`;
+  if (r.metric === 'expiry') {
+    return `到期前 ${[...r.levels].sort((a, b) => b - a).map(l => l || '当').join(' / ')} 天提醒（每个到期日每档一次）`;
+  }
+  if (r.metric === 'ip_change') return '上报来源 IP 变化时通知';
   let t = `${METRICS[r.metric] || r.metric} ${r.op} ${fmtRuleValue(r.metric, r.threshold)}`;
   if (r.for !== '0s') t += `，持续 ${r.for}`;
   return t;
@@ -594,7 +679,8 @@ function ruleText(r) {
 
 const ALERT_RANGES = [['1d', '24 小时', 86400], ['7d', '7 天', 7 * 86400], ['30d', '30 天', 30 * 86400],
   ['90d', '90 天', 90 * 86400]];
-const EVENT_FILTERS = [['', '全部事件'], ['firing,repeat', '告警'], ['recovered', '恢复'], ['level', '流量档位']];
+const EVENT_FILTERS = [['', '全部事件'], ['firing,repeat', '告警'], ['recovered', '恢复'], ['level', '流量档位 / 到期提醒'],
+  ['changed', 'IP 变化']];
 const alertFilter = { range: '7d', node: '', rule: '', event: '' };
 
 function alertsPage() {
@@ -658,18 +744,18 @@ function alertsPage() {
       history.replaceChildren(d.history.length
         ? table(['时间', '事件', '规则', '节点', '对象', '值'], d.history.map(e => h('tr', { title: e.message },
           cell(fmtTime(e.ts)),
-          h('td', null, h('span', { class: 'badge ' + (e.event === 'recovered' ? '' : e.event === 'level' ? 'warn' : 'bad'),
-            text: EVENTS[e.event] || e.event })),
+          h('td', null, h('span', { class: 'badge ' + (e.event === 'recovered' ? '' : e.event === 'firing' || e.event === 'repeat' ? 'bad' : 'warn'),
+            text: eventText(e, metricOf.get(e.rule)) })),
           cell(e.rule), cell(nodeText(e.node)), cell(e.target || '—'),
-          cell(e.event === 'level' ? e.value + '%' : fmtRuleValue(metricOf.get(e.rule), e.value)))))
+          cell(historyValue(e, metricOf.get(e.rule))))))
         : h('div', { class: 'empty', text: filtered ? '没有符合条件的告警' : `最近 ${range[1]}没有告警` }));
 
       rules.replaceChildren(d.rules.length
         ? table(['名称', '条件', '节点', '重复提醒', '恢复通知'], d.rules.map(r => h('tr', null,
           cell(r.name), cell(ruleText(r)),
           cell(r.nodes === 'all' ? '全部' : r.nodes.map(nodeText).join('、')),
-          cell(r.repeat === '0s' ? '不重复' : '每 ' + r.repeat),
-          cell(r.metric === 'traffic' ? '—' : r.notify_recovery === false ? '否' : '是'))))
+          cell(NOTICE_METRICS.includes(r.metric) ? '—' : r.repeat === '0s' ? '不重复' : '每 ' + r.repeat),
+          cell(NOTICE_METRICS.includes(r.metric) ? '—' : r.notify_recovery === false ? '否' : '是'))))
         : h('div', { class: 'empty', text: '没有配置告警规则' }));
     },
   };
@@ -686,7 +772,7 @@ async function refreshFooter() {
       `上报 ${i.accepted} 个包（重传 ${i.duplicate}）· `,
       dropped.length ? h('span', { class: 'badge warn', text: '丢弃 ' + dropped.map(([k, v]) => `${k}=${v}`).join(' ') })
         : '无丢弃',
-      ` · 数据库 ${fmtBytes(s.db_bytes)} · 服务端时间 ${fmtTime(s.server_time)}`);
+      ` · 数据库 ${fmtBytes(s.db_bytes)} · 服务端 ${s.version} · 服务端时间 ${fmtTime(s.server_time)}`);
   } catch {
     // The page's own refresh reports connectivity errors.
   }
