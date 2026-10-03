@@ -13,21 +13,19 @@ import (
 	"time"
 )
 
-// Webhook sends each message as one HTTP request built from a template, so
+// webhook sends each message as one HTTP request built from a template, so
 // any push service with an HTTP API can be a channel (Bark, ntfy, Discord,
-// Slack, Server酱, ...). Like the Telegram client it only sends: the reply's
-// status decides whether to retry, and its body is never used.
+// Slack, Server酱, ...). The reply's status decides whether to retry, and
+// its body is never used.
 //
 // {{title}} is the message's first line, {{message}} the whole text. In
 // the URL they are percent-encoded; in the body they are encoded for the
 // body's content type: a JSON string literal (with its quotes) for JSON,
 // percent-encoded for a form, as is for anything else.
-type Webhook struct {
-	name, method, url, body string
-	headers                 map[string]string
-	client                  *http.Client
-	log                     *slog.Logger
-	queue                   chan string
+type webhook struct {
+	method, url, body string
+	headers           map[string]string
+	client            *http.Client
 }
 
 const (
@@ -37,7 +35,9 @@ const (
 	DefaultWebhookBody = `{"title": {{title}}, "message": {{message}}}`
 )
 
-func NewWebhook(name, method, rawURL string, headers map[string]string, body string, log *slog.Logger) *Webhook {
+// NewWebhook returns a channel that sends HTTP requests. method defaults to
+// POST, and the body of a request that has one to DefaultWebhookBody.
+func NewWebhook(name, method, rawURL string, headers map[string]string, body string, log *slog.Logger) *Channel {
 	if method == "" {
 		method = http.MethodPost
 	}
@@ -51,28 +51,8 @@ func NewWebhook(name, method, rawURL string, headers map[string]string, body str
 	if _, ok := h["Content-Type"]; !ok && body != "" {
 		h["Content-Type"] = "application/json"
 	}
-	return &Webhook{name: name, method: method, url: rawURL, body: body, headers: h,
-		client: &http.Client{Timeout: httpTimout}, log: log, queue: make(chan string, queueCap)}
-}
-
-func (w *Webhook) Notify(text string) {
-	select {
-	case w.queue <- text:
-	default:
-		w.log.Error("webhook: queue full, dropping message", "webhook", w.name, "message", text)
-	}
-}
-
-// Run delivers queued messages in order, like Telegram.Run.
-func (w *Webhook) Run(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg := <-w.queue:
-			deliver(ctx, w.log, "webhook "+w.name, w.Send, msg)
-		}
-	}
+	w := &webhook{method: method, url: rawURL, body: body, headers: h, client: &http.Client{Timeout: httpTimeout}}
+	return newChannel(name, w, 0, log)
 }
 
 func escapeURL(s string) string { return strings.ReplaceAll(url.QueryEscape(s), "+", "%20") }
@@ -82,9 +62,9 @@ func fill(tmpl string, enc func(string) string, text string) string {
 	return strings.NewReplacer(TitleVar, enc(title), MessageVar, enc(text)).Replace(tmpl)
 }
 
-// Send makes one attempt. The URL usually carries a key, so errors name the
-// webhook and never include the URL.
-func (w *Webhook) Send(ctx context.Context, text string) error {
+// send makes one attempt. The URL usually carries a key, so errors never
+// include it.
+func (w *webhook) send(ctx context.Context, text string) error {
 	enc := func(s string) string { return s }
 	switch ct := strings.ToLower(w.headers["Content-Type"]); {
 	case strings.Contains(ct, "json"):
@@ -126,14 +106,5 @@ func (w *Webhook) Send(ctx context.Context, text string) error {
 		return &permanentError{msg: fmt.Sprintf("HTTP %d", resp.StatusCode)}
 	default:
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-}
-
-// Multi sends every message to several channels.
-type Multi []Notifier
-
-func (m Multi) Notify(text string) {
-	for _, n := range m {
-		n.Notify(text)
 	}
 }

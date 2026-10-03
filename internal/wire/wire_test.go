@@ -125,14 +125,14 @@ func TestSealLimits(t *testing.T) {
 	}
 }
 
-func TestValidNode(t *testing.T) {
+func TestValidID(t *testing.T) {
 	for _, s := range []string{"a", "hk-1", "us_west.2", "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"} {
-		if !ValidNode(s) {
+		if !ValidID(s) {
 			t.Errorf("%q rejected", s)
 		}
 	}
 	for _, s := range []string{"", "a b", "中文", "a/b", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456"} {
-		if ValidNode(s) {
+		if ValidID(s) {
 			t.Errorf("%q accepted", s)
 		}
 	}

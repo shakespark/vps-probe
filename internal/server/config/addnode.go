@@ -12,12 +12,31 @@ import (
 // NewNode is what add-node writes; everything else about a node is edited
 // by hand.
 type NewNode struct {
-	ID     string `yaml:"id"`
-	Name   string `yaml:"name,omitempty"`
-	Token  string `yaml:"token"`
-	Addr   string `yaml:"addr,omitempty"`
-	Region string `yaml:"region,omitempty"`
-	Group  string `yaml:"group,omitempty"`
+	ID, Name, Token, Region, Group string
+	PingAddr                       string // where other nodes ping it; none = they don't
+}
+
+// yaml returns the node as a list item's content, block style.
+func (n NewNode) yaml() ([]byte, error) {
+	type ping struct {
+		Addr string `yaml:"addr"`
+	}
+	item := struct {
+		ID     string `yaml:"id"`
+		Name   string `yaml:"name,omitempty"`
+		Token  string `yaml:"token"`
+		Region string `yaml:"region,omitempty"`
+		Group  string `yaml:"group,omitempty"`
+		Ping   *ping  `yaml:"ping,omitempty"`
+	}{ID: n.ID, Name: n.Name, Token: n.Token, Region: n.Region, Group: n.Group}
+	if n.PingAddr != "" {
+		item.Ping = &ping{n.PingAddr}
+	}
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	err := enc.Encode(item)
+	return buf.Bytes(), err
 }
 
 // AddNode returns data with n appended to the nodes list. The file is hand
@@ -62,7 +81,7 @@ func AddNode(data []byte, n NewNode) ([]byte, error) {
 		return nil, errors.New("config: cannot tell how the nodes list is indented; add this node by hand")
 	}
 
-	item, err := yaml.Marshal(n)
+	item, err := n.yaml()
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +133,7 @@ func AddNode(data []byte, n NewNode) ([]byte, error) {
 		return nil, errors.New("config: could not find where the nodes list ends; add this node by hand")
 	}
 	last := c.Nodes[len(c.Nodes)-1]
-	if last.ID != n.ID || last.Token != n.Token || last.Addr != n.Addr {
+	if last.ID != n.ID || last.Token != n.Token || last.Ping.Addr != n.PingAddr {
 		return nil, errors.New("config: could not find where the nodes list ends; add this node by hand")
 	}
 	for i := range old.Nodes {

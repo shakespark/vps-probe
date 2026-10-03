@@ -27,8 +27,8 @@ func maxPlain(node string) int {
 
 // Packetize seals rep into one or more packets. When it doesn't fit in one,
 // its fields are packed greedily into several Reports sharing rep.Ts, each
-// with its own id; the server merges them by (node, ts). Ids are assigned
-// here, overwriting rep.Id.
+// with its own id. Any split is valid: the server merges pieces field by
+// field. Ids are assigned here, overwriting rep.Id.
 func Packetize(aead cipher.AEAD, node string, rep *pb.Report) ([]Packet, error) {
 	limit := maxPlain(node)
 	rep.Id = rand.Uint64()
@@ -42,10 +42,18 @@ func Packetize(aead cipher.AEAD, node string, rep *pb.Report) ([]Packet, error) 
 
 	// Each item adds one field (or one repeated element) to a piece.
 	var items []func(*pb.Report)
-	// The server stores these four in one metrics row.
-	if rep.Cpu != nil || rep.Load != nil || rep.Mem != nil || rep.Sockets != nil {
-		cpu, load, mem, sockets := rep.Cpu, rep.Load, rep.Mem, rep.Sockets
-		items = append(items, func(r *pb.Report) { r.Cpu, r.Load, r.Mem, r.Sockets = cpu, load, mem, sockets })
+	// Small and wanted first: what the overview shows.
+	if rep.Cpu != nil {
+		items = append(items, func(r *pb.Report) { r.Cpu = rep.Cpu })
+	}
+	if rep.Load != nil {
+		items = append(items, func(r *pb.Report) { r.Load = rep.Load })
+	}
+	if rep.Mem != nil {
+		items = append(items, func(r *pb.Report) { r.Mem = rep.Mem })
+	}
+	if rep.Sockets != nil {
+		items = append(items, func(r *pb.Report) { r.Sockets = rep.Sockets })
 	}
 	for _, t := range rep.Traffic {
 		items = append(items, func(r *pb.Report) { r.Traffic = append(r.Traffic, t) })
@@ -54,8 +62,7 @@ func Packetize(aead cipher.AEAD, node string, rep *pb.Report) ([]Packet, error) 
 		items = append(items, func(r *pb.Report) { r.Net = append(r.Net, n) })
 	}
 	if rep.Sys != nil {
-		sys := rep.Sys
-		items = append(items, func(r *pb.Report) { r.Sys = sys })
+		items = append(items, func(r *pb.Report) { r.Sys = rep.Sys })
 	}
 	for _, d := range rep.Disks {
 		items = append(items, func(r *pb.Report) { r.Disks = append(r.Disks, d) })

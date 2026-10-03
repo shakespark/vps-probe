@@ -3,18 +3,20 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/shakespark/vps-probe/internal/wire"
 )
 
 // MaxPoints caps how many buckets one series returns; longer ranges are
 // grouped into wider buckets in SQL.
 const MaxPoints = 1000
 
-// Status is a node's latest known state.
+// Status is a node's latest known state. A metric is null when the agent
+// could not read it.
 type Status struct {
 	MaxTS   int64    `json:"max_ts"`     // newest report ts (agent clock)
 	FreshAt int64    `json:"fresh_at"`   // server time that report arrived
@@ -26,7 +28,7 @@ type Status struct {
 	MetricsTS int64    `json:"metrics_ts,omitempty"`
 	CPU       *float64 `json:"cpu"`
 	Steal     *float64 `json:"steal"`
-	SoftIRQ   *float64 `json:"softirq"` // null before agent 0.1.14
+	SoftIRQ   *float64 `json:"softirq"`
 	Load1     *float64 `json:"load1"`
 	Load5     *float64 `json:"load5"`
 	Load15    *float64 `json:"load15"`
@@ -34,7 +36,7 @@ type Status struct {
 	MemUsed   *int64   `json:"mem_used"`
 	SwapTotal *int64   `json:"swap_total"`
 	SwapUsed  *int64   `json:"swap_used"`
-	TCP       *int64   `json:"tcp"` // sockets and threads: null before agent 0.1.9
+	TCP       *int64   `json:"tcp"`
 	UDP       *int64   `json:"udp"`
 	TCPTW     *int64   `json:"tcp_tw"`
 	Threads   *int64   `json:"threads"`
@@ -44,14 +46,20 @@ type Status struct {
 	Traffic *Period     `json:"traffic"` // current period
 }
 
+// Online reports whether the node counts as online at now: its newest
+// report arrived within wire.OfflineAfter. A node that never reported (a nil
+// Status) is not online. This is the one definition of "online".
+func (s *Status) Online(now time.Time) bool {
+	return s != nil && now.Sub(time.Unix(s.FreshAt, 0)) < wire.OfflineAfter
+}
+
 type SysInfo struct {
 	Hostname     string `json:"hostname"`
 	OS           string `json:"os"`
 	Kernel       string `json:"kernel"`
 	Arch         string `json:"arch"`
 	Cores        uint32 `json:"cores"`
-	BootTime     int64  `json:"boot_time"`
-	Uptime       uint64 `json:"uptime"` // as of the report that carried it
+	BootTime     int64  `json:"boot_time"` // 0 = unknown
 	AgentVersion string `json:"agent_version"`
 }
 
@@ -69,8 +77,11 @@ type Disk struct {
 	InodePct float64 `json:"inode_pct"`
 }
 
+// Period is a billing period [Start, End), unix seconds, and what a node
+// carried in it, summed over its interfaces.
 type Period struct {
-	Start  string        `json:"start"`
+	Start  int64         `json:"start"`
+	End    int64         `json:"end"`
 	RX     int64         `json:"rx"`
 	TX     int64         `json:"tx"`
 	Ifaces []IfaceTotals `json:"ifaces"`
@@ -89,22 +100,21 @@ func (s *Store) Status(ctx context.Context, node string) (*Status, error) {
 		return nil, nil
 	}
 	st := &Status{}
-	var sys, ip sql.NullString
-	var ipSince sql.NullInt64
-	err := s.r.QueryRowContext(ctx, `SELECT s.max_ts, s.fresh_at, s.skew, s.sys, a.ip, a.since
-		FROM node_status s LEFT JOIN node_addr a ON a.node = s.node WHERE s.node = ?`, rid).
-		Scan(&st.MaxTS, &st.FreshAt, &st.Skew, &sys, &ip, &ipSince)
+	var sysTS sql.NullInt64
+	var y SysInfo
+	err := s.r.QueryRowContext(ctx, `SELECT max_ts, fresh_at, skew, COALESCE(ip, ''), COALESCE(ip_since, 0), sys_ts,
+			COALESCE(hostname, ''), COALESCE(os, ''), COALESCE(kernel, ''), COALESCE(arch, ''),
+			COALESCE(cores, 0), COALESCE(boot_time, 0), COALESCE(agent_version, '')
+		FROM node_status WHERE node = ?`, rid).
+		Scan(&st.MaxTS, &st.FreshAt, &st.Skew, &st.IP, &st.IPSince, &sysTS,
+			&y.Hostname, &y.OS, &y.Kernel, &y.Arch, &y.Cores, &y.BootTime, &y.AgentVersion)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
 	}
-	st.IP, st.IPSince = ip.String, ipSince.Int64
-	if sys.Valid {
-		st.Sys = &SysInfo{}
-		if err := json.Unmarshal([]byte(sys.String), st.Sys); err != nil {
-			return nil, err
-		}
+	if sysTS.Valid {
+		st.Sys = &y
 	}
 
 	err = s.r.QueryRowContext(ctx, `SELECT ts, cpu, steal, softirq, load1, load5, load15, mem_total, mem_used, swap_total, swap_used,
@@ -165,16 +175,16 @@ func (s *Store) Periods(ctx context.Context, node string, limit int) ([]Period, 
 		return nil, nil
 	}
 	out := []Period{}
-	err := s.each(ctx, `SELECT start, iface, rx, tx FROM traffic_period
+	err := s.each(ctx, `SELECT start, end, iface, rx, tx FROM traffic_period
 		WHERE node = ?1 AND start IN (SELECT DISTINCT start FROM traffic_period WHERE node = ?1 ORDER BY start DESC LIMIT ?2)
 		ORDER BY start DESC, iface`, []any{rid, limit}, func(r *sql.Rows) error {
-		var start string
+		var start, end int64
 		var t IfaceTotals
-		if err := r.Scan(&start, &t.Iface, &t.RX, &t.TX); err != nil {
+		if err := r.Scan(&start, &end, &t.Iface, &t.RX, &t.TX); err != nil {
 			return err
 		}
 		if len(out) == 0 || out[len(out)-1].Start != start {
-			out = append(out, Period{Start: start})
+			out = append(out, Period{Start: start, End: end})
 		}
 		p := &out[len(out)-1]
 		p.Ifaces = append(p.Ifaces, t)
@@ -191,10 +201,11 @@ type DayTraffic struct {
 	TX  int64  `json:"tx"`
 }
 
-// Daily returns per-day usage within one period: each day's last seen total
-// minus the previous day's, per interface, then summed. A day whose total
-// went down (the agent's state was rebuilt) counts its own total.
-func (s *Store) Daily(ctx context.Context, node, start string) ([]DayTraffic, error) {
+// Daily returns per-day usage within the period beginning at start: each
+// day's last seen total minus the previous day's, per interface, then summed.
+// A day whose total went down (the agent's state was rebuilt) counts its own
+// total. Days are calendar days in the server's timezone.
+func (s *Store) Daily(ctx context.Context, node string, start int64) ([]DayTraffic, error) {
 	rid, ok := s.nodeID(node)
 	if !ok {
 		return nil, nil
@@ -304,8 +315,7 @@ var pingCols = []column{
 	{"lost", "sum(lost)", "sum(lost)"},
 	{"loss_pct", "100.0 * sum(lost) / NULLIF(sum(sent), 0)", "100.0 * sum(lost) / NULLIF(sum(sent), 0)"},
 	{"min", "min(min)", "min(min)"},
-	{"avg", "sum(avg * (sent - lost)) / NULLIF(sum(CASE WHEN avg IS NULL THEN 0 ELSE sent - lost END), 0)",
-		"sum(avg * (sent - lost)) / NULLIF(sum(CASE WHEN avg IS NULL THEN 0 ELSE sent - lost END), 0)"},
+	{"avg", pingAvg, pingAvg},
 	{"max", "max(max)", "max(max)"},
 	{"jitter", "avg(jitter)", "avg(jitter)"},
 }
@@ -317,7 +327,7 @@ type tier struct {
 }
 
 var (
-	tierRaw = tier{"raw", "_raw", 10}
+	tierRaw = tier{"raw", "_raw", int64(wire.Interval / time.Second)}
 	tier5m  = tier{"5m", "_5m", step5m}
 	tier1h  = tier{"1h", "_1h", step1h}
 )
@@ -392,6 +402,17 @@ func (s *Store) Ping(ctx context.Context, src, dst string, from, to int64) (*Ser
 	return m[""], nil
 }
 
+// Pings returns the history of every link from src that has data in the
+// range, keyed by peer name.
+func (s *Store) Pings(ctx context.Context, src string, from, to int64) (map[string]*Series, error) {
+	rid, ok := s.nodeID(src)
+	if !ok {
+		return nil, nil
+	}
+	t, step := s.pickTier(from, to, true)
+	return s.series(ctx, "ping"+t.suffix, "src = ?", []any{rid}, "dst", pingCols, t, step, from, to)
+}
+
 // series runs one bucketed query. key, if set, splits rows into separate
 // series (per interface or mount).
 func (s *Store) series(ctx context.Context, table, where string, args []any, key string,
@@ -413,6 +434,13 @@ func (s *Store) series(ctx context.Context, table, where string, args []any, key
 		keyExpr, step, step, strings.Join(exprs, ", "), table, where, keyGroup, keyGroup)
 	args = append(args, from, to)
 
+	empty := func() *Series {
+		sr := &Series{Tier: t.name, Step: step, TS: []int64{}, Cols: map[string][]*float64{}}
+		for _, c := range cols {
+			sr.Cols[c.name] = []*float64{}
+		}
+		return sr
+	}
 	out := map[string]*Series{}
 	vals := make([]sql.NullFloat64, len(cols))
 	dest := make([]any, 0, len(cols)+2)
@@ -428,10 +456,7 @@ func (s *Store) series(ctx context.Context, table, where string, args []any, key
 		}
 		sr := out[k]
 		if sr == nil {
-			sr = &Series{Tier: t.name, Step: step, TS: []int64{}, Cols: map[string][]*float64{}}
-			for _, c := range cols {
-				sr.Cols[c.name] = []*float64{}
-			}
+			sr = empty()
 			out[k] = sr
 		}
 		sr.TS = append(sr.TS, b)
@@ -449,10 +474,7 @@ func (s *Store) series(ctx context.Context, table, where string, args []any, key
 		return nil, err
 	}
 	if key == "" && out[""] == nil {
-		out[""] = &Series{Tier: t.name, Step: step, TS: []int64{}, Cols: map[string][]*float64{}}
-		for _, c := range cols {
-			out[""].Cols[c.name] = []*float64{}
-		}
+		out[""] = empty()
 	}
 	return out, nil
 }
@@ -476,9 +498,7 @@ type Link struct {
 func (s *Store) Matrix(ctx context.Context, window time.Duration) ([]Link, error) {
 	now := s.now()
 	out := []Link{}
-	err := s.each(ctx, `SELECT src, dst, sum(sent), sum(lost), min(min),
-			sum(avg * (sent - lost)) / NULLIF(sum(CASE WHEN avg IS NULL THEN 0 ELSE sent - lost END), 0),
-			max(max), avg(jitter)
+	err := s.each(ctx, `SELECT src, dst, sum(sent), sum(lost), min(min), `+pingAvg+`, max(max), avg(jitter)
 		FROM ping_raw WHERE ts >= ? AND ts <= ? GROUP BY src, dst ORDER BY src, dst`,
 		[]any{now.Add(-window).Unix(), now.Unix() + 60}, func(r *sql.Rows) error {
 			var rid int64
@@ -502,11 +522,9 @@ func (s *Store) Matrix(ctx context.Context, window time.Duration) ([]Link, error
 
 // NetSum is one sample's rates summed over the node's interfaces.
 type NetSum struct {
-	TS int64
-	RX float64 // bytes/s
-	TX float64
-	// Packets/s; invalid when no interface reported them (agent < 0.1.14).
-	RXPkts, TXPkts sql.NullFloat64
+	TS             int64
+	RX, TX         float64 // bytes/s
+	RXPkts, TXPkts float64 // packets/s
 }
 
 // NetSums lists the node's samples with from <= ts <= to (agent clock),

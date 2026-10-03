@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/shakespark/vps-probe/internal/echo"
+	"github.com/shakespark/vps-probe/internal/peer"
 )
 
 var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -34,7 +35,7 @@ func TestSummarize(t *testing.T) {
 }
 
 func TestLoopback(t *testing.T) {
-	p, err := New([]Peer{{Name: "self", Addr: "127.0.0.1"}}, 100*time.Millisecond, 500*time.Millisecond, discard)
+	p, err := New([]peer.Peer{{Name: "self", Addr: "127.0.0.1"}}, 100*time.Millisecond, 500*time.Millisecond, discard)
 	if err != nil {
 		t.Skipf("no ICMP socket in this environment: %v", err)
 	}
@@ -70,7 +71,7 @@ func TestLoopback(t *testing.T) {
 
 func TestUnreachableCountsAsLost(t *testing.T) {
 	// TEST-NET-1 is never routed to a real host; replies won't come back.
-	p, err := New([]Peer{{Name: "void", Addr: "192.0.2.1"}}, 50*time.Millisecond, 200*time.Millisecond, discard)
+	p, err := New([]peer.Peer{{Name: "void", Addr: "192.0.2.1"}}, 50*time.Millisecond, 200*time.Millisecond, discard)
 	if err != nil {
 		t.Skipf("no ICMP socket: %v", err)
 	}
@@ -100,7 +101,7 @@ func TestUnreachableCountsAsLost(t *testing.T) {
 }
 
 func TestUnresolvableHostname(t *testing.T) {
-	p, err := New([]Peer{{Name: "bad", Addr: "no-such-host.invalid"}, {Name: "self", Addr: "127.0.0.1"}},
+	p, err := New([]peer.Peer{{Name: "bad", Addr: "no-such-host.invalid"}, {Name: "self", Addr: "127.0.0.1"}},
 		time.Second, time.Second, discard)
 	if err != nil {
 		t.Skipf("no ICMP socket: %v", err)
@@ -122,9 +123,9 @@ func TestFailedResolveBacksOff(t *testing.T) {
 		}
 		return netip.Addr{}, errors.New("dns down")
 	}
-	p := &Pinger{log: discard, peers: []*peerState{
-		{Peer: Peer{Name: "bad", Addr: "bad.example"}, host: "bad.example"},
-		{Peer: Peer{Name: "good", Addr: "good.example"}, host: "good.example"},
+	p := &Pinger{log: discard, peers: []*target{
+		{Peer: peer.Peer{Name: "bad", Addr: "bad.example"}, host: "bad.example"},
+		{Peer: peer.Peer{Name: "good", Addr: "good.example"}, host: "good.example"},
 	}}
 	now := time.Now()
 	p.maybeResolve(context.Background(), now)
@@ -194,11 +195,11 @@ func runFor(p *Pinger, d time.Duration) {
 func TestDNS(t *testing.T) {
 	addr := fakeResolver(t, false)
 	// DNS peers need no ICMP socket, so this runs everywhere.
-	p, err := New([]Peer{{Name: "cf", Addr: addr, Type: TypeDNS}}, 100*time.Millisecond, 500*time.Millisecond, discard)
+	p, err := New([]peer.Peer{{Name: "cf", Addr: addr, Type: peer.DNS}}, 100*time.Millisecond, 500*time.Millisecond, discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.v4 != nil || p.v6 != nil {
+	if p.icmp != nil {
 		t.Fatal("ICMP socket opened for DNS-only peers")
 	}
 	runFor(p, 1200*time.Millisecond)
@@ -213,14 +214,14 @@ func TestDNS(t *testing.T) {
 		t.Fatalf("implausible rtt: %+v", s)
 	}
 	// At most the query sent just before shutdown is unanswered.
-	if n := len(p.peers[0].udpWait); n > 1 {
+	if n := len(p.waiting); n > 1 {
 		t.Fatalf("answered queries still waiting: %d", n)
 	}
 }
 
 func TestDNSNoAnswerIsLost(t *testing.T) {
 	addr := fakeResolver(t, true)
-	p, err := New([]Peer{{Name: "cf", Addr: addr, Type: TypeDNS}}, 50*time.Millisecond, 200*time.Millisecond, discard)
+	p, err := New([]peer.Peer{{Name: "cf", Addr: addr, Type: peer.DNS}}, 50*time.Millisecond, 200*time.Millisecond, discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,14 +230,14 @@ func TestDNSNoAnswerIsLost(t *testing.T) {
 	if s.Sent < 3 || s.Lost != s.Sent || s.Avg != 0 {
 		t.Fatalf("got %+v", s)
 	}
-	if len(p.peers[0].udpWait) != 0 {
-		t.Fatalf("timed-out queries still waiting: %d", len(p.peers[0].udpWait))
+	if len(p.waiting) != 0 {
+		t.Fatalf("timed-out queries still waiting: %d", len(p.waiting))
 	}
 }
 
 func TestDNSBadAddr(t *testing.T) {
 	for _, a := range []string{"1.1.1.1", "1.1.1.1:0", "1.1.1.1:dns", "1.1.1.1:70000"} {
-		if _, err := New([]Peer{{Name: "x", Addr: a, Type: TypeDNS}}, time.Second, time.Second, discard); err == nil {
+		if _, err := New([]peer.Peer{{Name: "x", Addr: a, Type: peer.DNS}}, time.Second, time.Second, discard); err == nil {
 			t.Errorf("%q accepted", a)
 		}
 	}
@@ -259,9 +260,9 @@ func TestEcho(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	addr := c.LocalAddr().String()
 
-	p, err := New([]Peer{
-		{Name: "tun", Addr: addr, Type: TypeEcho, Key: string(key)},
-		{Name: "wrong-key", Addr: addr, Type: TypeEcho, Key: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"},
+	p, err := New([]peer.Peer{
+		{Name: "tun", Addr: addr, Type: peer.Echo, Key: string(key)},
+		{Name: "wrong-key", Addr: addr, Type: peer.Echo, Key: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"},
 	}, 100*time.Millisecond, 500*time.Millisecond, discard)
 	if err != nil {
 		t.Fatal(err)
@@ -279,12 +280,12 @@ func TestEcho(t *testing.T) {
 }
 
 func TestBadPeers(t *testing.T) {
-	for name, pr := range map[string]Peer{
+	for name, pr := range map[string]peer.Peer{
 		"type":      {Name: "x", Addr: "1.1.1.1", Type: "tcp"},
-		"short key": {Name: "x", Addr: "127.0.0.1:39527", Type: TypeEcho, Key: "short"},
-		"echo port": {Name: "x", Addr: "127.0.0.1", Type: TypeEcho, Key: "abcdefghijklmnopqrstuvwxyz0123456789"},
+		"short key": {Name: "x", Addr: "127.0.0.1:39527", Type: peer.Echo, Key: "short"},
+		"echo port": {Name: "x", Addr: "127.0.0.1", Type: peer.Echo, Key: "abcdefghijklmnopqrstuvwxyz0123456789"},
 	} {
-		if _, err := New([]Peer{pr}, time.Second, time.Second, discard); err == nil {
+		if _, err := New([]peer.Peer{pr}, time.Second, time.Second, discard); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
@@ -317,7 +318,7 @@ func TestLateReplyIsLost(t *testing.T) {
 	// Replies come back after the timeout but before the next snapshot:
 	// they are losses, not 250 ms round trips.
 	addr := slowResolver(t, 250*time.Millisecond)
-	p, err := New([]Peer{{Name: "cf", Addr: addr, Type: TypeDNS}}, 50*time.Millisecond, 100*time.Millisecond, discard)
+	p, err := New([]peer.Peer{{Name: "cf", Addr: addr, Type: peer.DNS}}, 50*time.Millisecond, 100*time.Millisecond, discard)
 	if err != nil {
 		t.Fatal(err)
 	}

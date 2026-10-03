@@ -16,10 +16,10 @@ import (
 	"github.com/shakespark/vps-probe/internal/wire"
 )
 
-// Tunables; see DESIGN.md §5.3.
 const (
-	queueCap      = 360
-	maxAge        = 2 * time.Hour
+	// An hour of reports are kept for retry; older ones are dropped first,
+	// and any report is given up on after wire.MaxAge.
+	queueCap      = int(time.Hour / wire.Interval)
 	retryAfter    = 5 * time.Second
 	aliveWindow   = 30 * time.Second
 	drainPerTick  = 10 // per pumpEvery, i.e. 20/s
@@ -233,7 +233,7 @@ func (s *Sender) sendLocked(it *item, now time.Time) {
 }
 
 func (s *Sender) trimLocked(now time.Time) {
-	cut := now.Add(-maxAge).Unix()
+	cut := now.Add(-wire.MaxAge).Unix()
 	s.queue = slices.DeleteFunc(s.queue, func(it *item) bool { return it.TS < cut })
 	if over := len(s.queue) - queueCap; over > 0 {
 		clear(s.queue[:over])

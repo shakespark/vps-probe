@@ -43,9 +43,7 @@ func (s *Store) Rollup(since time.Time) error {
 			// avg is weighted by replies received; min/max/avg ignore rows
 			// where nothing came back (stored as NULL).
 			`INSERT OR REPLACE INTO ping` + suffix + ` (src, dst, ts, sent, lost, min, avg, max, jitter)
-			SELECT src, dst, ts / :step * :step, sum(sent), sum(lost), min(min),
-				sum(avg * (sent - lost)) / NULLIF(sum(CASE WHEN avg IS NULL THEN 0 ELSE sent - lost END), 0),
-				max(max), avg(jitter)
+			SELECT src, dst, ts / :step * :step, sum(sent), sum(lost), min(min), ` + pingAvg + `, max(max), avg(jitter)
 			FROM ping_raw WHERE ts >= :from GROUP BY src, dst, ts / :step`,
 		}
 		if step == step1h {
@@ -62,15 +60,10 @@ func (s *Store) Rollup(since time.Time) error {
 	return tx.Commit()
 }
 
-// Retention is how long each resolution is kept.
-type Retention struct {
-	Raw, M5, H1 time.Duration
-}
-
 // Cleanup deletes data older than the retention windows; alert history
 // follows the longest one. Traffic totals and node status are kept forever.
-func (s *Store) Cleanup(r Retention) error {
-	now := s.now()
+func (s *Store) Cleanup() error {
+	now, r := s.now(), s.ret
 	raw, m5, h1 := now.Add(-r.Raw).Unix(), now.Add(-r.M5).Unix(), now.Add(-r.H1).Unix()
 	tx, err := s.w.Begin()
 	if err != nil {

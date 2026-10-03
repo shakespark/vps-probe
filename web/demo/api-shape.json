@@ -5,15 +5,26 @@
   "shape": {
    "[]": {
     "{}": {
-     "expire_at": "string",
-     "expire_days": "number",
      "group": "string",
      "id": "string",
      "name": "string",
      "online": "bool",
-     "price": "string",
+     "plan": {
+      "{}": {
+       "days": "number",
+       "expire_at": "string",
+       "price": "string",
+       "renew_months": "number"
+      }
+     },
+     "quota": {
+      "{}": {
+       "bytes": "number",
+       "mode": "string",
+       "used": "number"
+      }
+     },
      "region": "string",
-     "renew_months": "number",
      "status": {
       "{}": {
        "clock_skew": "number",
@@ -60,8 +71,7 @@
          "cores": "number",
          "hostname": "string",
          "kernel": "string",
-         "os": "string",
-         "uptime": "number"
+         "os": "string"
         }
        },
        "tcp": "number",
@@ -69,6 +79,7 @@
        "threads": "number",
        "traffic": {
         "{}": {
+         "end": "number",
          "ifaces": {
           "[]": {
            "{}": {
@@ -79,15 +90,13 @@
           }
          },
          "rx": "number",
-         "start": "string",
+         "start": "number",
          "tx": "number"
         }
        },
        "udp": "number"
       }
-     },
-     "traffic_quota_gb": "number",
-     "traffic_quota_mode": "string"
+     }
     }
    }
   }
@@ -291,8 +300,51 @@
   }
  },
  {
+  "name": "pings",
+  "path": "/api/nodes/hk-1/ping",
+  "dynamic": [
+   ""
+  ],
+  "shape": {
+   "{*}": {
+    "{}": {
+     "cols": {
+      "{}": {
+       "avg": {
+        "[]": "number"
+       },
+       "jitter": {
+        "[]": "number"
+       },
+       "loss_pct": {
+        "[]": "number"
+       },
+       "lost": {
+        "[]": "number"
+       },
+       "max": {
+        "[]": "number"
+       },
+       "min": {
+        "[]": "number"
+       },
+       "sent": {
+        "[]": "number"
+       }
+      }
+     },
+     "step": "number",
+     "tier": "string",
+     "ts": {
+      "[]": "number"
+     }
+    }
+   }
+  }
+ },
+ {
   "name": "ping",
-  "path": "/api/ping/hk-1/tyo-1",
+  "path": "/api/nodes/hk-1/ping/tyo-1",
   "shape": {
    "{}": {
     "cols": {
@@ -412,6 +464,8 @@
      "periods": {
       "[]": {
        "{}": {
+        "billable": "number",
+        "end": "number",
         "ifaces": {
          "[]": {
           "{}": {
@@ -422,20 +476,25 @@
          }
         },
         "rx": "number",
-        "start": "string",
+        "start": "number",
         "tx": "number"
        }
       }
      },
-     "traffic_quota_gb": "number",
-     "traffic_quota_mode": "string"
+     "quota": {
+      "{}": {
+       "bytes": "number",
+       "mode": "string",
+       "used": "number"
+      }
+     }
     }
    }
   }
  },
  {
   "name": "daily",
-  "path": "/api/traffic/hk-1/daily",
+  "path": "/api/nodes/hk-1/traffic/daily",
   "shape": {
    "{}": {
     "days": {
@@ -447,7 +506,7 @@
       }
      }
     },
-    "period": "string"
+    "period": "number"
    }
   }
  },
@@ -463,6 +522,7 @@
     "ingest": {
      "{*}": "number"
     },
+    "interval": "number",
     "server_time": "number",
     "timezone": "string",
     "version": "string"
@@ -477,13 +537,12 @@
     "active": {
      "[]": {
       "{}": {
-       "metric": "string",
+       "firing": "bool",
        "node": "string",
        "rule": "string",
        "since": "number",
-       "state": "string",
        "target": "string",
-       "value": "number"
+       "value": "string"
       }
      }
     },
@@ -509,29 +568,18 @@
        "rule": "string",
        "target": "string",
        "ts": "number",
-       "value": "number"
+       "value": "string"
       }
      }
     },
     "rules": {
      "[]": {
       "{}": {
-       "at": "string",
-       "exclude": {
-        "[]": "string"
-       },
-       "for": "string",
-       "levels": {
-        "[]": "number"
-       },
-       "metric": "string",
+       "condition": "string",
        "name": "string",
-       "nodes": "any",
-       "notify_recovery": "null",
-       "op": "string",
-       "ratio": "number",
-       "repeat": "string",
-       "threshold": "number"
+       "nodes": "string",
+       "recovery": "string",
+       "repeat": "string"
       }
      }
     },

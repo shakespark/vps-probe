@@ -14,12 +14,15 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
-	Version = 1
+	// Version 2 is the 0.2 report format; packets of any other version are
+	// dropped unread.
+	Version = 2
 
 	TypeReport byte = 1
 	TypeAck    byte = 2
@@ -27,9 +30,26 @@ const (
 	// MaxPacket keeps datagrams below common path MTUs to avoid fragmentation.
 	MaxPacket = 1200
 
-	MaxNodeLen = 32
+	MaxIDLen = 32
+	// MinTokenLen is the shortest token a node may use.
+	MinTokenLen = 32
 
-	keySalt = "vps-probe/v1"
+	keySalt = "vps-probe/v2"
+)
+
+// Timing both sides rely on. They are constants, not settings: the server's
+// storage steps, its alert windows and what it calls offline all follow from
+// how often agents report.
+const (
+	// Interval is how often an agent samples and reports.
+	Interval = 10 * time.Second
+	// OfflineAfter without a fresh report, a node counts as offline.
+	OfflineAfter = 3 * Interval
+	// MaxAge is how long an agent keeps retrying an unacknowledged report.
+	MaxAge = 2 * time.Hour
+	// MaxSkew bounds |server time - report time|: anything further off is a
+	// replay or a badly wrong clock. It leaves room for MaxAge of backlog.
+	MaxSkew = MaxAge + 5*time.Minute
 )
 
 // Overhead is the packet size excluding node name and plaintext.
@@ -43,10 +63,11 @@ var (
 	ErrOpen    = errors.New("wire: authentication failed")
 )
 
-// ValidNode reports whether id is usable as a node id: 1-32 chars of
-// [A-Za-z0-9._-].
-func ValidNode(id string) bool {
-	if len(id) == 0 || len(id) > MaxNodeLen {
+// ValidID reports whether id is usable as an identifier (a node id, a peer
+// or channel name): 1-32 chars of [A-Za-z0-9._-]. Such a string is safe in a
+// packet header, a URL path and a log line.
+func ValidID(id string) bool {
+	if len(id) == 0 || len(id) > MaxIDLen {
 		return false
 	}
 	for i := 0; i < len(id); i++ {
@@ -62,7 +83,7 @@ func ValidNode(id string) bool {
 
 // NewAEAD derives the per-node key from the shared token.
 func NewAEAD(token, node string) (cipher.AEAD, error) {
-	if !ValidNode(node) {
+	if !ValidID(node) {
 		return nil, ErrNode
 	}
 	key, err := hkdf.Key(sha256.New, []byte(token), []byte(keySalt), node, chacha20poly1305.KeySize)
@@ -74,7 +95,7 @@ func NewAEAD(token, node string) (cipher.AEAD, error) {
 
 // Seal builds an encrypted packet.
 func Seal(aead cipher.AEAD, typ byte, node string, plaintext []byte) ([]byte, error) {
-	if !ValidNode(node) {
+	if !ValidID(node) {
 		return nil, ErrNode
 	}
 	hdrLen := 3 + len(node)
@@ -118,7 +139,7 @@ func ParseHeader(pkt []byte) (Header, error) {
 		return Header{}, ErrShort
 	}
 	node := string(pkt[3:hdrLen])
-	if !ValidNode(node) {
+	if !ValidID(node) {
 		return Header{}, ErrNode
 	}
 	return Header{Type: pkt[1], Node: node, aad: pkt[:hdrLen], body: pkt[hdrLen:]}, nil

@@ -72,11 +72,17 @@ func TestSplitPiecesMerge(t *testing.T) {
 	}
 }
 
-func traffic(ts int64, cur string, rx, tx uint64, prev string, prx, ptx uint64) *pb.Report {
+// Period boundaries: the first of August, September and October 2026.
+var aug, sep, oct = monthStart(8), monthStart(9), monthStart(10)
+
+func monthStart(m time.Month) int64 { return time.Date(2026, m, 1, 0, 0, 0, 0, sh).Unix() }
+
+// traffic is a report in the September period.
+func traffic(ts int64, rx, tx, prx, ptx uint64) *pb.Report {
 	return &pb.Report{Ts: ts, Traffic: []*pb.IfaceTraffic{{
 		Iface: "eth0",
-		Cur:   &pb.Period{Start: cur, Rx: rx, Tx: tx},
-		Prev:  &pb.Period{Start: prev, Rx: prx, Tx: ptx},
+		Cur:   &pb.Period{Start: sep, End: oct, Rx: rx, Tx: tx},
+		Prev:  &pb.Period{Start: aug, End: sep, Rx: prx, Tx: ptx},
 	}}}
 }
 
@@ -92,19 +98,19 @@ func TestTrafficLatestTSWins(t *testing.T) {
 		return p[0]
 	}
 
-	write(t, s, "a", traffic(base, "2026-09-01", 1000, 100, "2026-08-01", 5000, 500), now)
+	write(t, s, "a", traffic(base, 1000, 100, 5000, 500), now)
 	// Older report (backlog or replay) arrives later: ignored.
-	write(t, s, "a", traffic(base-10, "2026-09-01", 900, 90, "2026-08-01", 5000, 500), now)
+	write(t, s, "a", traffic(base-10, 900, 90, 5000, 500), now)
 	if p := cur(); p.RX != 1000 || p.TX != 100 {
 		t.Fatalf("after older report: %+v", p)
 	}
 	// Agent state rebuilt: totals legitimately drop, and prev is empty.
-	write(t, s, "a", traffic(base+10, "2026-09-01", 20, 2, "2026-08-01", 0, 0), now)
+	write(t, s, "a", traffic(base+10, 20, 2, 0, 0), now)
 	if p := cur(); p.RX != 20 || p.TX != 2 {
 		t.Fatalf("after reset: %+v", p)
 	}
 	all, _ := s.Periods(ctx, "a", 24)
-	if len(all) != 2 || all[1].Start != "2026-08-01" || all[1].RX != 5000 {
+	if len(all) != 2 || all[1].Start != aug || all[1].End != sep || all[0].End != oct || all[1].RX != 5000 {
 		t.Fatalf("previous period lost: %+v", all)
 	}
 }
@@ -123,13 +129,13 @@ func TestDaily(t *testing.T) {
 		{day(3, 20), 40, 4}, // state rebuilt on day 3: counts its own total
 		{day(4, 0), 90, 9},  // day 4: +50
 	} {
-		write(t, s, "a", traffic(r.ts, "2026-09-01", r.rx, r.tx, "2026-08-01", 0, 0), time.Unix(r.ts, 0))
+		write(t, s, "a", traffic(r.ts, r.rx, r.tx, 0, 0), time.Unix(r.ts, 0))
 	}
 	// A second interface adds to the same days.
 	write(t, s, "a", &pb.Report{Ts: day(2, 5), Traffic: []*pb.IfaceTraffic{{
-		Iface: "eth1", Cur: &pb.Period{Start: "2026-09-01", Rx: 7, Tx: 7}}}}, time.Now())
+		Iface: "eth1", Cur: &pb.Period{Start: sep, End: oct, Rx: 7, Tx: 7}}}}, time.Now())
 
-	days, err := s.Daily(ctx, "a", "2026-09-01")
+	days, err := s.Daily(ctx, "a", sep)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +257,7 @@ func TestRollupAndTiers(t *testing.T) {
 
 	// Retention: raw older than the window is deleted, rollups stay.
 	s.now = func() time.Time { return now.Add(49 * time.Hour) }
-	if err := s.Cleanup(ret); err != nil {
+	if err := s.Cleanup(); err != nil {
 		t.Fatal(err)
 	}
 	var raw, r5 int
@@ -298,7 +304,7 @@ func TestBackupAndSingleFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "probe.db")
 	s := open(t, path)
-	write(t, s, "a", traffic(time.Now().Unix(), "2026-09-01", 123, 45, "2026-08-01", 0, 0), time.Now())
+	write(t, s, "a", traffic(time.Now().Unix(), 123, 45, 0, 0), time.Now())
 
 	// Live backup while the store is open.
 	out := filepath.Join(dir, "copy.db")
@@ -429,8 +435,8 @@ func TestAvailability(t *testing.T) {
 	}
 }
 
-// Sockets and threads (agent >= 0.1.9) merge into the metrics row, roll up,
-// and are null for older agents.
+// Sockets and threads merge into the metrics row and roll up; a source the
+// agent could not read stays null.
 func TestSocketsAndThreads(t *testing.T) {
 	s := newStore(t)
 	now := time.Now().Truncate(time.Hour).Add(-2 * time.Hour)
@@ -439,14 +445,14 @@ func TestSocketsAndThreads(t *testing.T) {
 		write(t, s, "a", &pb.Report{Ts: ts, Cpu: &pb.CPU{Usage: 1}}, time.Unix(ts, 0))
 		write(t, s, "a", &pb.Report{Ts: ts, Load: &pb.Load{L1: 1, Threads: uint32(300 + i)},
 			Sockets: &pb.Sockets{Tcp: uint32(40 + i%2*20), Udp: 7, TcpTw: 3}}, time.Unix(ts, 0))
-		write(t, s, "b", &pb.Report{Ts: ts, Cpu: &pb.CPU{Usage: 1}, Load: &pb.Load{L1: 1}}, time.Unix(ts, 0)) // old agent
+		write(t, s, "b", &pb.Report{Ts: ts, Cpu: &pb.CPU{Usage: 1}}, time.Unix(ts, 0)) // no loadavg, no sockstat
 	}
 	st, err := s.Status(ctx, "a")
 	if err != nil || st.TCP == nil || *st.TCP != 60 || *st.UDP != 7 || *st.TCPTW != 3 || *st.Threads != 329 || st.CPU == nil {
 		t.Fatalf("status a: %+v %v", st, err)
 	}
 	if st, _ := s.Status(ctx, "b"); st.TCP != nil || st.Threads != nil {
-		t.Fatalf("old agent: tcp %v threads %v", st.TCP, st.Threads)
+		t.Fatalf("unread sources: tcp %v threads %v", st.TCP, st.Threads)
 	}
 	if err := s.Rollup(now); err != nil {
 		t.Fatal(err)
@@ -518,28 +524,23 @@ func TestSparks(t *testing.T) {
 func TestPacketRatesAndSoftIRQ(t *testing.T) {
 	s := newStore(t)
 	now := time.Now().Truncate(time.Hour).Add(-2 * time.Hour)
-	u := func(v uint64) *uint64 { return &v }
-	f := func(v float32) *float32 { return &v }
 	for i, ts := 0, now.Unix(); ts < now.Add(5*time.Minute).Unix(); i, ts = i+1, ts+10 {
-		write(t, s, "a", &pb.Report{Ts: ts, Cpu: &pb.CPU{Usage: 20, Softirq: f(float32(2 + i%2*4))},
-			Net: []*pb.NetRate{{Iface: "eth0", RxRate: 1000, TxRate: 500, RxPps: u(uint64(100 + i%2*200)), TxPps: u(50)},
-				{Iface: "eth1", RxRate: 10, TxRate: 10, RxPps: u(1), TxPps: u(0)}}}, time.Unix(ts, 0))
-		write(t, s, "b", &pb.Report{Ts: ts, Cpu: &pb.CPU{Usage: 1},
-			Net: []*pb.NetRate{{Iface: "eth0", RxRate: 1, TxRate: 1}}}, time.Unix(ts, 0)) // old agent
+		write(t, s, "a", &pb.Report{Ts: ts, Cpu: &pb.CPU{Usage: 20, Softirq: float32(2 + i%2*4)},
+			Net: []*pb.NetRate{{Iface: "eth0", RxRate: 1000, TxRate: 500, RxPps: uint64(100 + i%2*200), TxPps: 50},
+				{Iface: "eth1", RxRate: 10, TxRate: 10, RxPps: 1, TxPps: 0}}}, time.Unix(ts, 0))
+		// b cannot read /proc/stat: its reports carry no CPU.
+		write(t, s, "b", &pb.Report{Ts: ts, Mem: &pb.Mem{Total: 10, Used: 1}}, time.Unix(ts, 0))
 	}
 	st, err := s.Status(ctx, "a")
 	if err != nil || st.SoftIRQ == nil || *st.SoftIRQ != 6 {
 		t.Fatalf("status a: softirq %v %v", st.SoftIRQ, err)
 	}
-	if st, _ := s.Status(ctx, "b"); st.SoftIRQ != nil {
-		t.Fatalf("old agent softirq %v", *st.SoftIRQ)
+	if st, _ := s.Status(ctx, "b"); st.SoftIRQ != nil || st.CPU != nil || st.MemUsed == nil {
+		t.Fatalf("status b: %+v", st)
 	}
 	sums, err := s.NetSums(ctx, "a", now.Unix()+10, now.Unix()+10)
-	if err != nil || len(sums) != 1 || !sums[0].RXPkts.Valid || sums[0].RXPkts.Float64 != 301 || sums[0].TXPkts.Float64 != 50 {
+	if err != nil || len(sums) != 1 || sums[0].RXPkts != 301 || sums[0].TXPkts != 50 {
 		t.Fatalf("sums a: %+v %v", sums, err)
-	}
-	if sums, _ := s.NetSums(ctx, "b", now.Unix(), now.Unix()); len(sums) != 1 || sums[0].RXPkts.Valid {
-		t.Fatalf("sums b: %+v", sums)
 	}
 	if err := s.Rollup(now); err != nil {
 		t.Fatal(err)
@@ -551,8 +552,5 @@ func TestPacketRatesAndSoftIRQ(t *testing.T) {
 	n, err := s.Net(ctx, "a", now.Unix(), now.Add(7*24*time.Hour).Unix())
 	if err != nil || *n["eth0"].Cols["rx_pps"][0] != 200 || *n["eth0"].Cols["rx_pps_max"][0] != 300 {
 		t.Fatalf("net 5m: %v", err)
-	}
-	if n, _ := s.Net(ctx, "b", now.Unix(), now.Add(7*24*time.Hour).Unix()); n["eth0"].Cols["rx_pps"][0] != nil {
-		t.Fatal("old agent rolled up a packet rate")
 	}
 }

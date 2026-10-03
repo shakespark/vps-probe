@@ -21,10 +21,11 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/shakespark/vps-probe/internal/atomicfile"
 )
 
 const (
@@ -54,13 +55,16 @@ type Totals struct {
 	TX uint64 `json:"tx"`
 }
 
+// Period is a billing period [Start, End) and what was counted in it.
+type Period struct {
+	Start, End time.Time
+	Totals
+}
+
 // IfaceTotals is what gets reported for one interface.
 type IfaceTotals struct {
 	Iface     string
-	CurStart  string
-	Cur       Totals
-	PrevStart string
-	Prev      Totals
+	Cur, Prev Period
 }
 
 type ifaceState struct {
@@ -106,12 +110,6 @@ func OpenReadOnly(path string, loc *time.Location, reset Reset, log *slog.Logger
 }
 
 func load(path string, loc *time.Location, reset Reset, log *slog.Logger, readOnly bool) (*Accountant, error) {
-	if reset.Day < 1 || reset.Day > 31 {
-		return nil, fmt.Errorf("traffic: reset_day %d out of range 1-31", reset.Day)
-	}
-	if reset.Hour < 0 || reset.Hour > 23 || reset.Minute < 0 || reset.Minute > 59 {
-		return nil, fmt.Errorf("traffic: reset time %02d:%02d out of range", reset.Hour, reset.Minute)
-	}
 	a := &Accountant{
 		path:     path,
 		loc:      loc,
@@ -164,10 +162,7 @@ func load(path string, loc *time.Location, reset Reset, log *slog.Logger, readOn
 }
 
 // Update folds a sample into the running totals.
-func (a *Accountant) Update(s Sample) error {
-	if s.BootID == "" {
-		return errors.New("traffic: empty boot id")
-	}
+func (a *Accountant) Update(s Sample) {
 	periodStart := PeriodStart(s.Time, a.loc, a.reset)
 	key := PeriodKey(periodStart)
 
@@ -204,7 +199,6 @@ func (a *Accountant) Update(s Sample) error {
 		t.TX += d.TX
 	}
 	a.dirty = true
-	return nil
 }
 
 func delta(last, cur uint64) uint64 {
@@ -234,8 +228,8 @@ func prune(p map[string]*Totals) {
 // interface disappears or is renamed mid-period.
 func (a *Accountant) Snapshot(now time.Time, monitored []string) []IfaceTotals {
 	curStart := PeriodStart(now, a.loc, a.reset)
-	curKey := PeriodKey(curStart)
-	prevKey := PeriodKey(PrevPeriodStart(curStart, a.loc, a.reset))
+	prevStart := PrevPeriodStart(curStart, a.loc, a.reset)
+	curKey, prevKey := PeriodKey(curStart), PeriodKey(prevStart)
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -250,13 +244,15 @@ func (a *Accountant) Snapshot(now time.Time, monitored []string) []IfaceTotals {
 
 	out := make([]IfaceTotals, 0, len(names))
 	for _, name := range names {
-		it := IfaceTotals{Iface: name, CurStart: curKey, PrevStart: prevKey}
+		it := IfaceTotals{Iface: name,
+			Cur:  Period{Start: curStart, End: NextPeriodStart(curStart, a.loc, a.reset)},
+			Prev: Period{Start: prevStart, End: curStart}}
 		if is := a.st.Interfaces[name]; is != nil {
 			if t := is.Periods[curKey]; t != nil {
-				it.Cur = *t
+				it.Cur.Totals = *t
 			}
 			if t := is.Periods[prevKey]; t != nil {
-				it.Prev = *t
+				it.Prev.Totals = *t
 			}
 		}
 		out = append(out, it)
@@ -275,7 +271,7 @@ func (a *Accountant) MaybeSave(now time.Time) error {
 	return a.Save()
 }
 
-// Save persists the state atomically: temp file, fsync, rename, fsync dir.
+// Save persists the state atomically.
 func (a *Accountant) Save() error {
 	if a.readOnly {
 		return nil
@@ -295,46 +291,11 @@ func (a *Accountant) Save() error {
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(a.path, data); err != nil {
+	if err := atomicfile.Write(a.path, data, 0o600); err != nil {
 		a.mu.Lock()
 		a.dirty = true
 		a.mu.Unlock()
 		return fmt.Errorf("traffic: save state: %w", err)
 	}
 	return nil
-}
-
-func writeFileAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	defer os.Remove(tmp) // no-op after a successful rename
-
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
 }

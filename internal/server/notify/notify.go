@@ -1,20 +1,19 @@
-// Package notify delivers alert messages. The Telegram client only ever
-// calls sendMessage: it never reads updates, so the bot cannot be used to
-// send anything to the server. Webhooks likewise only send.
+// Package notify delivers alert messages. Channels only send: the Telegram
+// client only ever calls sendMessage and never reads updates, and a
+// webhook's reply is never used, so no channel can be used to send anything
+// to the server.
 package notify
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
-	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/shakespark/vps-probe/internal/server/config"
 )
 
 // Notifier accepts a message for delivery without blocking.
@@ -26,79 +25,107 @@ type Notifier interface {
 type Log struct{ Log *slog.Logger }
 
 func (l Log) Notify(text string) {
-	l.Log.Info("alert (no telegram or webhook configured, not sent)", "message", text)
+	l.Log.Info("alert (no notify channel configured, not sent)", "message", text)
 }
 
-const (
-	// Telegram's limit is 4096 characters; stay under it.
-	maxMessage = 4000
-	queueCap   = 100
-	minBackoff = 2 * time.Second
-	maxBackoff = 5 * time.Minute
-	httpTimout = 20 * time.Second
-)
+// Multi sends every message to several channels.
+type Multi []Notifier
 
-type Telegram struct {
-	token, chatID string
-	base          string // https://api.telegram.org; tests point it elsewhere
-	client        *http.Client
-	log           *slog.Logger
-	queue         chan string
-}
-
-func NewTelegram(token, chatID string, log *slog.Logger) *Telegram {
-	return &Telegram{
-		token:  token,
-		chatID: chatID,
-		base:   "https://api.telegram.org",
-		client: &http.Client{Timeout: httpTimout},
-		log:    log,
-		queue:  make(chan string, queueCap),
+func (m Multi) Notify(text string) {
+	for _, n := range m {
+		n.Notify(text)
 	}
 }
 
-// Notify splits text into Telegram-sized messages and queues them. When the
-// queue is full (Telegram unreachable for a long time) new messages are
-// dropped, since they will be stale by the time it recovers anyway.
-func (t *Telegram) Notify(text string) {
-	for _, part := range Split(text, maxMessage) {
+const (
+	queueCap    = 100
+	minBackoff  = 2 * time.Second
+	maxBackoff  = 5 * time.Minute
+	httpTimeout = 20 * time.Second
+)
+
+// sender makes one attempt to deliver a message. A *permanentError means
+// retrying is pointless, a *rateLimited says when to retry. Errors must not
+// contain the channel's secrets: they are logged.
+type sender interface {
+	send(ctx context.Context, text string) error
+}
+
+// Channel is one destination: a queue in front of a sender, delivered in
+// order by Run with retries.
+type Channel struct {
+	Name   string
+	sender sender
+	maxLen int // messages longer than this many characters are split; 0 = never
+	log    *slog.Logger
+	queue  chan string
+}
+
+// New returns the channel a config entry describes.
+func New(c config.Channel, log *slog.Logger) *Channel {
+	if c.Type == config.Telegram {
+		return NewTelegram(c.Name, c.BotToken, c.ChatID, log)
+	}
+	return NewWebhook(c.Name, c.Method, c.URL, c.Headers, c.Body, log)
+}
+
+func newChannel(name string, s sender, maxLen int, log *slog.Logger) *Channel {
+	return &Channel{Name: name, sender: s, maxLen: maxLen, log: log, queue: make(chan string, queueCap)}
+}
+
+// Notify queues text. When the queue is full (the channel has been
+// unreachable for a long time) new messages are dropped, since they would be
+// stale by the time it recovers anyway.
+func (c *Channel) Notify(text string) {
+	for _, part := range c.split(text) {
 		select {
-		case t.queue <- part:
+		case c.queue <- part:
 		default:
-			t.log.Error("telegram: queue full, dropping message", "message", part)
+			c.log.Error(c.Name+": queue full, dropping message", "message", part)
 		}
 	}
 }
 
-// Run delivers queued messages in order, retrying each with exponential
-// backoff until it is sent or rejected outright.
-func (t *Telegram) Run(ctx context.Context) {
+func (c *Channel) split(text string) []string {
+	if c.maxLen == 0 {
+		return []string{text}
+	}
+	return Split(text, c.maxLen)
+}
+
+// Send makes one attempt to deliver text now, bypassing the queue.
+func (c *Channel) Send(ctx context.Context, text string) error {
+	for _, part := range c.split(text) {
+		if err := c.sender.send(ctx, part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Run delivers queued messages in order until ctx is done, retrying each
+// with exponential backoff until it is sent or rejected outright.
+func (c *Channel) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case msg := <-t.queue:
-			t.deliver(ctx, msg)
+		case msg := <-c.queue:
+			c.deliver(ctx, msg)
 		}
 	}
 }
 
-func (t *Telegram) deliver(ctx context.Context, msg string) {
-	deliver(ctx, t.log, "telegram", t.Send, msg)
-}
-
-// deliver sends one message over a channel, retrying with exponential
-// backoff until it is sent or rejected outright.
-func deliver(ctx context.Context, log *slog.Logger, channel string, send func(context.Context, string) error, msg string) {
+func (c *Channel) deliver(ctx context.Context, msg string) {
 	backoff := minBackoff
 	for {
-		err := send(ctx, msg)
+		err := c.sender.send(ctx, msg)
 		if err == nil {
 			return
 		}
 		var perm *permanentError
 		if errors.As(err, &perm) {
-			log.Error(channel+": message rejected, not retrying (check its settings in the config)", "err", err)
+			c.log.Error(c.Name+": message rejected, not retrying (check the channel's settings in the config)", "err", err)
 			return
 		}
 		wait := backoff
@@ -106,7 +133,7 @@ func deliver(ctx context.Context, log *slog.Logger, channel string, send func(co
 		if errors.As(err, &rl) {
 			wait = rl.after
 		}
-		log.Warn(channel+": send failed, retrying", "err", err, "in", wait)
+		c.log.Warn(c.Name+": send failed, retrying", "err", err, "in", wait)
 		select {
 		case <-ctx.Done():
 			return
@@ -123,52 +150,6 @@ func (e *permanentError) Error() string { return e.msg }
 type rateLimited struct{ after time.Duration }
 
 func (e *rateLimited) Error() string { return fmt.Sprintf("rate limited, retry after %v", e.after) }
-
-// Send makes one attempt. Errors never contain the bot token.
-func (t *Telegram) Send(ctx context.Context, text string) error {
-	form := url.Values{
-		"chat_id":                  {t.chatID},
-		"text":                     {text},
-		"disable_web_page_preview": {"true"},
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.base+"/bot"+t.token+"/sendMessage",
-		strings.NewReader(form.Encode()))
-	if err != nil {
-		return t.redact(err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := t.client.Do(req)
-	if err != nil {
-		return t.redact(err) // *url.Error includes the URL, and with it the token
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	var r struct {
-		OK          bool   `json:"ok"`
-		Description string `json:"description"`
-		Parameters  struct {
-			RetryAfter int `json:"retry_after"`
-		} `json:"parameters"`
-	}
-	json.Unmarshal(body, &r)
-	switch {
-	case resp.StatusCode == http.StatusOK && r.OK:
-		return nil
-	case resp.StatusCode == http.StatusTooManyRequests:
-		return &rateLimited{after: time.Duration(max(r.Parameters.RetryAfter, 1)) * time.Second}
-	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		return &permanentError{msg: t.redact(fmt.Errorf("HTTP %d: %s", resp.StatusCode, r.Description)).Error()}
-	default:
-		return t.redact(fmt.Errorf("HTTP %d: %s", resp.StatusCode, r.Description))
-	}
-}
-
-func (t *Telegram) redact(err error) error {
-	if t.token == "" {
-		return err
-	}
-	return errors.New(strings.ReplaceAll(err.Error(), t.token, "<bot_token>"))
-}
 
 // Split breaks text into parts of at most limit characters, preferring line
 // boundaries.

@@ -239,9 +239,9 @@ func TestSanitize(t *testing.T) {
 		},
 		Net: []*pb.NetRate{{Iface: "", RxRate: 1}, {Iface: "eth0", RxRate: 1}},
 		Traffic: []*pb.IfaceTraffic{
-			{Iface: "eth0", Cur: &pb.Period{Start: "2026-09-01", Rx: 1}},
-			{Iface: "eth1", Cur: &pb.Period{Start: "2026-13-01"}},
-			{Iface: "eth2", Cur: &pb.Period{Start: "2026-09-01", Rx: math.MaxUint64}},
+			{Iface: "eth0", Cur: &pb.Period{Start: 1788192000, End: 1790784000, Rx: 1}},
+			{Iface: "eth1", Cur: &pb.Period{Start: 1788192000, End: 1788192000 + 3600}}, // an hour is no billing period
+			{Iface: "eth2", Cur: &pb.Period{Start: 1788192000, End: 1790784000, Rx: math.MaxUint64}},
 		},
 		Pings: []*pb.Ping{
 			{Target: "b", Sent: 10, Lost: 10, Avg: float32(math.Inf(1))}, // RTT ignored when all lost
@@ -257,15 +257,13 @@ func TestSanitize(t *testing.T) {
 		t.Fatalf("scalars: %+v", rep)
 	}
 	big := &pb.Report{Load: &pb.Load{L1: 1, Threads: 2e7}, Sockets: &pb.Sockets{Tcp: 5, Udp: 2e7}}
-	if n := Sanitize(big); n != 2 || big.Load == nil || big.Load.Threads != 0 || big.Sockets != nil {
+	if n := Sanitize(big); n != 2 || big.Load != nil || big.Sockets != nil {
 		t.Fatalf("counts: dropped %d, %+v", n, big)
 	}
-	soft, huge, ok := float32(150), uint64(2e9), uint64(5000)
-	opt := &pb.Report{Cpu: &pb.CPU{Usage: 50, Softirq: &soft},
-		Net: []*pb.NetRate{{Iface: "eth0", RxRate: 1, RxPps: &huge, TxPps: &ok}}}
-	if n := Sanitize(opt); n != 2 || opt.Cpu == nil || opt.Cpu.Softirq != nil || opt.Cpu.Usage != 50 ||
-		len(opt.Net) != 1 || opt.Net[0].RxPps != nil || *opt.Net[0].TxPps != 5000 {
-		t.Fatalf("optional fields: dropped %d, %+v", n, opt)
+	wild := &pb.Report{Cpu: &pb.CPU{Usage: 50, Softirq: 150},
+		Net: []*pb.NetRate{{Iface: "eth0", RxRate: 1, RxPps: 2e9}, {Iface: "eth1", RxRate: 1, TxPps: 5000}}}
+	if n := Sanitize(wild); n != 2 || wild.Cpu != nil || len(wild.Net) != 1 || wild.Net[0].Iface != "eth1" {
+		t.Fatalf("rates: dropped %d, %+v", n, wild)
 	}
 	if len(rep.Disks) != 1 || len(rep.Net) != 1 || len(rep.Traffic) != 1 || len(rep.Pings) != 2 {
 		t.Fatalf("lists: disks=%d net=%d traffic=%d pings=%d", len(rep.Disks), len(rep.Net), len(rep.Traffic), len(rep.Pings))
@@ -307,7 +305,7 @@ func TestAgentSenderToStore(t *testing.T) {
 		Net:   []*pb.NetRate{{Iface: "eth0", RxRate: 100, TxRate: 200}},
 		Disks: []*pb.Disk{{Mount: "/", Total: 100, Used: 50, Avail: 50}},
 		Traffic: []*pb.IfaceTraffic{{Iface: "eth0",
-			Cur: &pb.Period{Start: "2026-09-01", Rx: 5 << 30, Tx: 1 << 30}}},
+			Cur: &pb.Period{Start: 1788192000, End: 1790784000, Rx: 5 << 30, Tx: 1 << 30}}},
 	}
 	for i := range 40 {
 		rep.Pings = append(rep.Pings, &pb.Ping{Target: fmt.Sprintf("peer-with-a-long-name-%02d", i),

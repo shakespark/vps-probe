@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -18,7 +17,9 @@ import (
 	_ "modernc.org/sqlite" // pure Go, keeps CGO_ENABLED=0 builds
 )
 
-const schemaVersion = 5
+// schemaVersion 10 is the 0.2 schema. Versions below it are 0.1.x files,
+// which are not carried over.
+const schemaVersion = 10
 
 // Rollup buckets, in seconds.
 const (
@@ -45,6 +46,11 @@ type Options struct {
 	Location  *time.Location // day boundaries for daily traffic
 	Retention Retention
 	Log       *slog.Logger
+}
+
+// Retention is how long each resolution is kept.
+type Retention struct {
+	Raw, M5, H1 time.Duration
 }
 
 // Open creates or opens the database at path.
@@ -98,213 +104,167 @@ func (s *Store) Close() error {
 	return errors.Join(errs...)
 }
 
-// migrate brings the file to schemaVersion, one step at a time, each step
-// in its own transaction. Steps only add tables, so older data is kept.
+// migrate creates the schema in a new file and checks the version of an
+// existing one. Later schema changes become further steps here.
 func (s *Store) migrate() error {
 	var v int
 	err := s.w.QueryRow("SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'schema_version'").Scan(&v)
 	if err != nil {
-		v = 0 // fresh database (or no meta table yet)
+		v = 0 // a new file
 	}
-	if v > schemaVersion {
+	switch {
+	case v == schemaVersion:
+		return nil
+	case v > schemaVersion:
 		return fmt.Errorf("schema version %d is newer than this build (%d); use a newer vps-probe-server", v, schemaVersion)
+	case v != 0:
+		return errors.New("this database was written by vps-probe 0.1.x, which 0.2 cannot read; move the file away and start a new one")
 	}
-	for ; v < schemaVersion; v++ {
-		if err := s.step(v+1, migrations[v]); err != nil {
-			return fmt.Errorf("migrating to schema %d: %w", v+1, err)
-		}
-		if v > 0 && s.log != nil {
-			s.log.Info("database schema upgraded", "version", v+1)
-		}
-	}
-	return nil
-}
-
-func (s *Store) step(version int, stmts []string) error {
 	tx, err := s.w.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	for _, stmt := range stmts {
+	for _, stmt := range schema {
 		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("%w in %.60q", err, stmt)
 		}
 	}
-	if version == 1 {
-		if _, err := tx.Exec(`INSERT OR REPLACE INTO meta(key, value) VALUES ('created_at', ?)`,
-			time.Now().UTC().Format(time.RFC3339)); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)`,
-		strconv.Itoa(version)); err != nil {
+	if _, err := tx.Exec(`INSERT INTO meta(key, value) VALUES ('created_at', ?), ('schema_version', ?)`,
+		time.Now().UTC().Format(time.RFC3339), strconv.Itoa(schemaVersion)); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// migrations[i] takes the schema from version i to i+1.
-var migrations = [][]string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5}
-
-// Packet rates and softirq time (agent >= 0.1.14), nullable like v4's
-// columns: older agents' rows have none.
-var schemaV5 = slices.Concat([]string{
-	`ALTER TABLE net_raw ADD COLUMN rx_pps REAL`,
-	`ALTER TABLE net_raw ADD COLUMN tx_pps REAL`,
-	`ALTER TABLE metrics_raw ADD COLUMN softirq REAL`,
-}, addColumns("net_5m", "rx_pps REAL", "rx_pps_max REAL", "tx_pps REAL", "tx_pps_max REAL"),
-	addColumns("net_1h", "rx_pps REAL", "rx_pps_max REAL", "tx_pps REAL", "tx_pps_max REAL"),
-	addColumns("metrics_5m", "softirq REAL", "softirq_max REAL"),
-	addColumns("metrics_1h", "softirq REAL", "softirq_max REAL"))
-
-func addColumns(table string, cols ...string) []string {
-	out := make([]string, len(cols))
-	for i, c := range cols {
-		out[i] = `ALTER TABLE ` + table + ` ADD COLUMN ` + c
-	}
-	return out
-}
-
-// Sockets and threads (agent >= 0.1.9) join the metrics rows as nullable
-// columns, so older agents' rows simply have none.
-var schemaV4 = slices.Concat([]string{
-	`ALTER TABLE metrics_raw ADD COLUMN tcp INTEGER`,
-	`ALTER TABLE metrics_raw ADD COLUMN udp INTEGER`,
-	`ALTER TABLE metrics_raw ADD COLUMN tcp_tw INTEGER`,
-	`ALTER TABLE metrics_raw ADD COLUMN threads INTEGER`,
-}, rollupCounts("metrics_5m"), rollupCounts("metrics_1h"))
-
-func rollupCounts(table string) []string {
-	var out []string
-	for _, c := range []string{"tcp REAL", "tcp_max INTEGER", "udp REAL", "udp_max INTEGER", "tcp_tw REAL",
-		"threads REAL", "threads_max INTEGER"} {
-		out = append(out, `ALTER TABLE `+table+` ADD COLUMN `+c)
-	}
-	return out
-}
-
-var schemaV3 = []string{
-	// The source IP of the node's newest report, and when it first
-	// reported from it. Only reports that raise max_ts update it, so a
-	// replayed packet from elsewhere can't.
-	`CREATE TABLE IF NOT EXISTS node_addr (
-		node INTEGER PRIMARY KEY, ip TEXT NOT NULL, since INTEGER NOT NULL
-	)`,
-}
-
-var schemaV2 = []string{
-	// Firing alerts and notified traffic levels, so a restart neither
-	// repeats nor forgets them. target: mount, peer name or period start.
-	`CREATE TABLE IF NOT EXISTS alert_state (
-		rule TEXT NOT NULL, node TEXT NOT NULL, target TEXT NOT NULL,
-		state TEXT NOT NULL, since INTEGER NOT NULL, notified INTEGER NOT NULL, value REAL,
-		PRIMARY KEY (rule, node, target)
-	) WITHOUT ROWID`,
-	`CREATE TABLE IF NOT EXISTS alert_history (
-		id INTEGER PRIMARY KEY, ts INTEGER NOT NULL,
-		rule TEXT NOT NULL, node TEXT NOT NULL, target TEXT NOT NULL,
-		event TEXT NOT NULL, value REAL, message TEXT NOT NULL
-	)`,
-	`CREATE INDEX IF NOT EXISTS alert_history_ts ON alert_history (ts)`,
-}
-
-var schemaV1 = []string{
-	`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
-	`CREATE TABLE IF NOT EXISTS nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)`,
+// Metrics come in three resolutions: raw (one row per report), 5m and 1h
+// rollups. A column is NULL when the agent could not read that source.
+var schema = []string{
+	`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+	`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)`,
 
 	// max_ts: newest report ts seen. fresh_at: server time when a report
 	// raised max_ts; replays of old packets never do, so they can't make a
-	// dead node look alive.
-	`CREATE TABLE IF NOT EXISTS node_status (
+	// dead node look alive. ip: the source of that newest report, and since
+	// when; a replay from elsewhere can't change it either. The sys_ columns
+	// are the newest system description (sent on start and hourly).
+	`CREATE TABLE node_status (
 		node     INTEGER PRIMARY KEY,
 		max_ts   INTEGER NOT NULL,
 		fresh_at INTEGER NOT NULL,
 		skew     INTEGER NOT NULL,
-		sys      TEXT,
-		sys_ts   INTEGER
+		ip       TEXT,
+		ip_since INTEGER,
+		sys_ts   INTEGER,
+		hostname TEXT, os TEXT, kernel TEXT, arch TEXT, cores INTEGER, boot_time INTEGER, agent_version TEXT
 	)`,
 
-	`CREATE TABLE IF NOT EXISTS metrics_raw (
+	`CREATE TABLE metrics_raw (
 		node INTEGER NOT NULL, ts INTEGER NOT NULL,
-		cpu REAL, steal REAL, load1 REAL, load5 REAL, load15 REAL,
+		cpu REAL, steal REAL, softirq REAL, load1 REAL, load5 REAL, load15 REAL,
 		mem_total INTEGER, mem_used INTEGER, swap_total INTEGER, swap_used INTEGER,
+		tcp INTEGER, udp INTEGER, tcp_tw INTEGER, threads INTEGER,
 		PRIMARY KEY (node, ts)
 	) WITHOUT ROWID`,
 	rollupMetrics("metrics_5m"),
 	rollupMetrics("metrics_1h"),
 
-	`CREATE TABLE IF NOT EXISTS net_raw (
+	`CREATE TABLE net_raw (
 		node INTEGER NOT NULL, iface TEXT NOT NULL, ts INTEGER NOT NULL,
-		rx REAL NOT NULL, tx REAL NOT NULL,
+		rx REAL NOT NULL, tx REAL NOT NULL, rx_pps REAL NOT NULL, tx_pps REAL NOT NULL,
 		PRIMARY KEY (node, iface, ts)
 	) WITHOUT ROWID`,
 	rollupNet("net_5m"),
 	rollupNet("net_1h"),
 
-	`CREATE TABLE IF NOT EXISTS disk_raw (
+	`CREATE TABLE disk_raw (
 		node INTEGER NOT NULL, mount TEXT NOT NULL, ts INTEGER NOT NULL,
 		total INTEGER NOT NULL, used INTEGER NOT NULL, avail INTEGER NOT NULL, inode_pct REAL NOT NULL,
 		PRIMARY KEY (node, mount, ts)
 	) WITHOUT ROWID`,
-	`CREATE TABLE IF NOT EXISTS disk_1h (
+	`CREATE TABLE disk_1h (
 		node INTEGER NOT NULL, mount TEXT NOT NULL, ts INTEGER NOT NULL,
 		total INTEGER NOT NULL, used REAL NOT NULL, used_max INTEGER NOT NULL, avail REAL NOT NULL, inode_pct REAL NOT NULL,
 		PRIMARY KEY (node, mount, ts)
 	) WITHOUT ROWID`,
 
 	// min/avg/max/jitter are NULL when no reply came back.
-	`CREATE TABLE IF NOT EXISTS ping_raw (
-		src INTEGER NOT NULL, dst TEXT NOT NULL, ts INTEGER NOT NULL,
-		sent INTEGER NOT NULL, lost INTEGER NOT NULL,
-		min REAL, avg REAL, max REAL, jitter REAL,
-		PRIMARY KEY (src, dst, ts)
-	) WITHOUT ROWID`,
-	rollupPing("ping_5m"),
-	rollupPing("ping_1h"),
+	pingTable("ping_raw"),
+	pingTable("ping_5m"),
+	pingTable("ping_1h"),
 
-	// Totals per billing period. ts is the report that wrote them: only a
-	// newer report may overwrite (see DESIGN.md §4.4).
-	`CREATE TABLE IF NOT EXISTS traffic_period (
-		node INTEGER NOT NULL, iface TEXT NOT NULL, start TEXT NOT NULL,
+	// Totals per billing period [start, end). ts is the report that wrote
+	// them: only a newer report may overwrite.
+	`CREATE TABLE traffic_period (
+		node INTEGER NOT NULL, iface TEXT NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL,
 		rx INTEGER NOT NULL, tx INTEGER NOT NULL, ts INTEGER NOT NULL,
 		PRIMARY KEY (node, iface, start)
 	) WITHOUT ROWID`,
 	// The current period's total as last seen on each day.
-	`CREATE TABLE IF NOT EXISTS traffic_daily (
-		node INTEGER NOT NULL, iface TEXT NOT NULL, day TEXT NOT NULL, start TEXT NOT NULL,
+	`CREATE TABLE traffic_daily (
+		node INTEGER NOT NULL, iface TEXT NOT NULL, day TEXT NOT NULL, start INTEGER NOT NULL,
 		rx INTEGER NOT NULL, tx INTEGER NOT NULL, ts INTEGER NOT NULL,
 		PRIMARY KEY (node, iface, day)
 	) WITHOUT ROWID`,
+
+	// Alerts that are pending or firing, so a restart neither repeats nor
+	// forgets them. target: a mount point or peer name, or "".
+	`CREATE TABLE alert_state (
+		rule TEXT NOT NULL, node TEXT NOT NULL, target TEXT NOT NULL,
+		firing INTEGER NOT NULL, since INTEGER NOT NULL, notified INTEGER NOT NULL, value REAL NOT NULL,
+		PRIMARY KEY (rule, node, target)
+	) WITHOUT ROWID`,
+	// What each report last sent for a node ("" = all nodes), so that it is
+	// sent once: see ReportMark.
+	`CREATE TABLE report_state (
+		report TEXT NOT NULL, node TEXT NOT NULL,
+		mark TEXT NOT NULL, level REAL NOT NULL, at INTEGER NOT NULL,
+		PRIMARY KEY (report, node)
+	) WITHOUT ROWID`,
+	// Everything that was sent or would have been. rule is an alert rule's
+	// name or a report's type.
+	`CREATE TABLE alert_history (
+		id INTEGER PRIMARY KEY, ts INTEGER NOT NULL,
+		rule TEXT NOT NULL, node TEXT NOT NULL, target TEXT NOT NULL,
+		event TEXT NOT NULL, value TEXT NOT NULL, message TEXT NOT NULL
+	)`,
+	`CREATE INDEX alert_history_ts ON alert_history (ts)`,
 }
 
 func rollupMetrics(name string) string {
-	return `CREATE TABLE IF NOT EXISTS ` + name + ` (
+	return `CREATE TABLE ` + name + ` (
 		node INTEGER NOT NULL, ts INTEGER NOT NULL,
-		cpu REAL, cpu_max REAL, steal REAL, steal_max REAL,
+		cpu REAL, cpu_max REAL, steal REAL, steal_max REAL, softirq REAL, softirq_max REAL,
 		load1 REAL, load1_max REAL, load5 REAL, load15 REAL,
 		mem_total INTEGER, mem_used REAL, mem_used_max INTEGER,
 		swap_total INTEGER, swap_used REAL, swap_used_max INTEGER,
+		tcp REAL, tcp_max INTEGER, udp REAL, udp_max INTEGER, tcp_tw REAL,
+		threads REAL, threads_max INTEGER,
 		PRIMARY KEY (node, ts)
 	) WITHOUT ROWID`
 }
 
 func rollupNet(name string) string {
-	return `CREATE TABLE IF NOT EXISTS ` + name + ` (
+	return `CREATE TABLE ` + name + ` (
 		node INTEGER NOT NULL, iface TEXT NOT NULL, ts INTEGER NOT NULL,
 		rx REAL NOT NULL, rx_max REAL NOT NULL, tx REAL NOT NULL, tx_max REAL NOT NULL,
+		rx_pps REAL NOT NULL, rx_pps_max REAL NOT NULL, tx_pps REAL NOT NULL, tx_pps_max REAL NOT NULL,
 		PRIMARY KEY (node, iface, ts)
 	) WITHOUT ROWID`
 }
 
-func rollupPing(name string) string {
-	return `CREATE TABLE IF NOT EXISTS ` + name + ` (
+func pingTable(name string) string {
+	return `CREATE TABLE ` + name + ` (
 		src INTEGER NOT NULL, dst TEXT NOT NULL, ts INTEGER NOT NULL,
 		sent INTEGER NOT NULL, lost INTEGER NOT NULL,
 		min REAL, avg REAL, max REAL, jitter REAL,
 		PRIMARY KEY (src, dst, ts)
 	) WITHOUT ROWID`
 }
+
+// pingAvg averages the avg column over rows, weighted by replies received.
+// It works on raw rows and on rollups alike, since rollups keep the counts.
+const pingAvg = `sum(avg * (sent - lost)) / NULLIF(sum(CASE WHEN avg IS NULL THEN 0 ELSE sent - lost END), 0)`
 
 // SyncNodes makes sure every configured node has a row id. Data of nodes
 // removed from the config stays in the file but is no longer shown.

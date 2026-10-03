@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/shakespark/vps-probe/internal/server/config"
 )
 
 const token = "123456:SECRET-token-value"
@@ -66,11 +68,11 @@ func (f *fakeTG) count() int {
 	return len(f.got)
 }
 
-func client(t *testing.T, f *fakeTG, logs *logBuf) *Telegram {
+func client(t *testing.T, f *fakeTG, logs *logBuf) *Channel {
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
-	tg := NewTelegram(token, "-1001234567890", slog.New(slog.NewTextHandler(logs, nil)))
-	tg.base = srv.URL
+	tg := NewTelegram("telegram", token, "-1001234567890", slog.New(slog.NewTextHandler(logs, nil)))
+	tg.sender.(*telegram).base = srv.URL
 	return tg
 }
 
@@ -107,8 +109,8 @@ func TestRetriesAndRedaction(t *testing.T) {
 	}
 
 	// Network error: *url.Error carries the URL; the token must not leak.
-	bad := NewTelegram(token, "1", slog.New(slog.NewTextHandler(&logs, nil)))
-	bad.base = "http://127.0.0.1:1"
+	bad := NewTelegram("telegram", token, "1", slog.New(slog.NewTextHandler(&logs, nil)))
+	bad.sender.(*telegram).base = "http://127.0.0.1:1"
 	err := bad.Send(context.Background(), "x")
 	if err == nil || strings.Contains(err.Error(), token) || !strings.Contains(err.Error(), "<bot_token>") {
 		t.Fatalf("err = %v", err)
@@ -157,5 +159,23 @@ func TestSplit(t *testing.T) {
 	}
 	if got := Split("short", 4000); len(got) != 1 || got[0] != "short" {
 		t.Fatalf("short: %v", got)
+	}
+}
+
+// A message over Telegram's limit goes out as several; a webhook gets it
+// whole. New builds either from its config entry.
+func TestLongMessageAndNew(t *testing.T) {
+	f := &fakeTG{status: []int{200}}
+	tg := client(t, f, &logBuf{})
+	long := strings.Repeat(strings.Repeat("字", 99)+"\n", 90) // 9000 characters
+	if err := tg.Send(context.Background(), long); err != nil || f.count() != 3 {
+		t.Fatalf("telegram: %d requests, %v", f.count(), err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if c := New(config.Channel{Type: config.Webhook, Name: "hook", URL: "https://example.com/x"}, log); c.Name != "hook" || len(c.split(long)) != 1 {
+		t.Fatalf("webhook channel: %+v", c)
+	}
+	if c := New(config.Channel{Type: config.Telegram, Name: "telegram", BotToken: token, ChatID: "1"}, log); c.sender.(*telegram).chatID != "1" {
+		t.Fatalf("telegram channel: %+v", c)
 	}
 }

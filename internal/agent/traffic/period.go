@@ -42,8 +42,8 @@ func anchor(y int, m time.Month, r Reset, loc *time.Location) time.Time {
 	return time.Date(first.Year(), first.Month(), d, r.Hour, r.Minute, 0, 0, loc)
 }
 
-// PeriodKey formats a period start for use as a map key and on the wire.
-// There is one period per month, so the start date alone is unique.
+// PeriodKey formats a period start as its key in the state file. There is
+// one period per month, so the start date alone is unique.
 func PeriodKey(start time.Time) string {
 	return start.Format(dateLayout)
 }
