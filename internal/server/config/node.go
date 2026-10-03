@@ -95,11 +95,9 @@ func (t Traffic) Billable(rx, tx int64) int64 {
 }
 
 // validateNodes checks the nodes, fills in their defaults and returns the
-// set of node ids.
+// set of node ids. A config without nodes is valid: that is a server just
+// installed, before its first add-node.
 func (c *Config) validateNodes(p *problems) map[string]bool {
-	if len(c.Nodes) == 0 {
-		p.add("nodes: at least one node is required")
-	}
 	ids := map[string]bool{}
 	tokens := map[string]string{}
 	for i := range c.Nodes {

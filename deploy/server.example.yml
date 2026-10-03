@@ -17,34 +17,30 @@ db: /var/lib/vps-probe-server/probe.db
 timezone: Asia/Shanghai
 
 # 节点。页面上的顺序就是这里的顺序。
-# 加节点最省事的办法是 `vps-probe-server add-node -id ...`：它生成 token、把节点
-# 追加到这个列表末尾，并打印在那台 VPS 上安装 agent 的一行命令。
-nodes:
-  - id: hk-1                    # 字母、数字和 . _ -；agent 配置里的 node 要和它一样
-    name: 香港 1                # 可选：页面上显示的名字
-    token: "REPLACE-WITH-gen-token-OUTPUT-000000000"   # 每台一个，`vps-probe-server gen-token` 生成
-    region: HK                  # 可选：地区代码，卡片上的角标
-    group: 亚洲                 # 可选：总览页按分组切换
-    traffic:                    # 可选：流量配额和计费周期
-      quota_gb: 1000            # GB 按 1024³ 字节计；不写或 0 表示不限
-      quota_mode: sum           # 配额算哪部分：sum 收+发（默认）| max 取大 | tx 只算发 | rx 只算收
-      reset_day: 1              # 周期在每月几号开始，默认 1；当月没有这一天时用月末
-      reset_time: "00:00"       # 周期在当天几点开始，默认 00:00，按 timezone
-    plan:                       # 可选：套餐，显示在卡片上，到期前提醒
-      expire_at: 2027-03-15     # 到期日
-      renew_months: 12          # 自动续费周期（月）：过了到期日自动顺延；不写则显示「已过期」
-      price: "$10/年"           # 只用于显示
-    ping:                       # 可选：时延互测
-      addr: 203.0.113.5         # 其他节点 ping 它用的地址；不写就没有节点 ping 它
-  - id: jp-1
-    token: "REPLACE-WITH-ANOTHER-gen-token-OUTPUT-01"
-    ping:
-      addr: jp1.example.com
-      # exclude: [hk-1]         # 和这些节点互不 ping（双向，写在任意一方即可）
-      # extra:                  # 这个节点额外 ping 的目标（不是节点），常用来测隧道，见 docs/tunnels.md
-      #   - { name: cf-vpn, addr: 1.1.1.1 }                          # VPN 型隧道：路由要走隧道
-      #   - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }   # 本地端口转发到 1.1.1.1:53
-      #   - { name: hk1-via-sgp, addr: "127.0.0.1:39527", type: echo, key: "<hk-1 上 echo.yml 的 key>" }
+# 加节点用 `vps-probe-server add-node -id ...`：它生成 token、把节点追加到这个列表
+# 末尾，并打印在那台 VPS 上安装 agent 的一行命令。下面注释里是一个节点能写的全部设置。
+nodes: []
+  # - id: hk-1                    # 字母、数字和 . _ -；agent 配置里的 node 要和它一样
+  #   name: 香港 1                # 可选：页面上显示的名字
+  #   token: "<每台一个，gen-token 生成>"
+  #   region: HK                  # 可选：地区代码，卡片上的角标
+  #   group: 亚洲                 # 可选：总览页按分组切换
+  #   traffic:                    # 可选：流量配额和计费周期
+  #     quota_gb: 1000            # GB 按 1024³ 字节计；不写或 0 表示不限
+  #     quota_mode: sum           # 配额算哪部分：sum 收+发（默认）| max 取大 | tx 只算发 | rx 只算收
+  #     reset_day: 1              # 周期在每月几号开始，默认 1；当月没有这一天时用月末
+  #     reset_time: "00:00"       # 周期在当天几点开始，默认 00:00，按 timezone
+  #   plan:                       # 可选：套餐，显示在卡片上，到期前提醒
+  #     expire_at: 2027-03-15     # 到期日
+  #     renew_months: 12          # 自动续费周期（月）：过了到期日自动顺延；不写则显示「已过期」
+  #     price: "$10/年"           # 只用于显示
+  #   ping:                       # 可选：时延互测
+  #     addr: 203.0.113.5         # 其他节点 ping 它用的地址；不写就没有节点 ping 它
+  #     exclude: [jp-1]           # 和这些节点互不 ping（双向，写在任意一方即可）
+  #     extra:                    # 这个节点额外 ping 的目标（不是节点），常用来测隧道，见 docs/tunnels.md
+  #       - { name: cf-vpn, addr: 1.1.1.1 }                          # VPN 型隧道：路由要走隧道
+  #       - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }   # 本地端口转发到 1.1.1.1:53
+  #       - { name: hk1-via-sgp, addr: "127.0.0.1:39527", type: echo, key: "<对端 echo.yml 的 key>" }
 # traffic 里的周期设置和 ping 这一段只用来生成各节点的 agent 配置：改了以后要在那台
 # 节点上重新安装配置（`vps-probe-server install-cmd -node ID`）才生效。
 

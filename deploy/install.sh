@@ -86,7 +86,9 @@ install_binary() {
 	mv -f "$BIN/$NAME.new" "$BIN/$NAME"
 }
 
-# Returns 1 when there is no usable config yet (an example was installed).
+# Returns 1 when there is no usable config yet: the example was installed
+# and needs to be filled in. (The server's example is usable as it is: a
+# server without nodes.)
 install_config() {
 	src=$1
 	if [ -n "$src" ]; then
@@ -112,8 +114,11 @@ install_config() {
 		say "keeping existing config $CONF"
 		return 0
 	fi
-	example="$HERE/examples/$ROLE.example.yml"
-	install -m 0640 -o root -g "$NAME" "$example" "$CONF"
+	install -m 0640 -o root -g "$NAME" "$HERE/examples/$ROLE.example.yml" "$CONF"
+	if validate "$CONF" >/dev/null 2>&1; then
+		say "no config given: installed the example as $CONF"
+		return 0
+	fi
 	warn "no config given: installed the example as $CONF"
 	return 1
 }
@@ -234,8 +239,9 @@ cmd_install() {
 
 			Next steps (see README):
 			  - allow UDP 9527 to this machine (cloud security group / firewall)
-			  - per node: vps-probe-server add-node -id ID -server THIS_HOST:9527, restart
-			    this service, then paste the command it prints on that VPS
+			  - set public_addr in $CONF: how agents reach this machine, HOST:9527
+			  - per node: vps-probe-server add-node -id ID, restart this service, then
+			    paste the command it prints on that VPS
 			  - web UI: publish http://localhost:8080 through cloudflared + Access,
 			    or an HTTPS reverse proxy with basic_auth
 		EOF

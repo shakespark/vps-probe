@@ -1,5 +1,5 @@
 // Package release holds the release signing keys and builds the one-line
-// command that installs a signed release on a VPS (docs/DESIGN.md §6.1.1).
+// command that installs a signed release on a VPS (docs/DESIGN.md §7.2).
 package release
 
 import (

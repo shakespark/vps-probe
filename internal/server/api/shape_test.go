@@ -22,7 +22,7 @@ import (
 	"github.com/shakespark/vps-probe/internal/server/store"
 )
 
-// The demo site (docs/DESIGN.md §14) answers the API from a script, which
+// The demo site (docs/DESIGN.md §11) answers the API from a script, which
 // goes stale silently when a response gains a field. This test pins the
 // structure of every response - names and types, no values - in
 // web/demo/api-shape.json; web/demo/check.js holds the demo to the same file.

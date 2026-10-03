@@ -33,6 +33,15 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
+// A server just installed has no nodes yet.
+func TestNoNodes(t *testing.T) {
+	for _, yml := range []string{"", "nodes: []\n", "nodes:\n"} {
+		if c, err := Parse([]byte(yml)); err != nil || len(c.Nodes) != 0 || len(c.Alerts) == 0 {
+			t.Errorf("%q: %+v, %v", yml, c, err)
+		}
+	}
+}
+
 func TestDurations(t *testing.T) {
 	c, err := Parse([]byte("retention: {raw: 3d, m5: 60d, h1: 9600h}\nnodes:\n  - {id: a, token: " + tokA + "}\n"))
 	if err != nil {
@@ -45,7 +54,6 @@ func TestDurations(t *testing.T) {
 
 func TestRejects(t *testing.T) {
 	for name, yml := range map[string]string{
-		"no nodes":        "db: /x.db\n",
 		"unknown key":     "nodes:\n  - {id: a, token: " + tokA + "}\ntypo: 1\n",
 		"short token":     "nodes:\n  - {id: a, token: short}\n",
 		"shared token":    "nodes:\n  - {id: a, token: " + tokA + "}\n  - {id: b, token: " + tokA + "}\n",
@@ -392,13 +400,37 @@ func TestExampleConfig(t *testing.T) {
 	if c.Retention != def.Retention || c.Backup != def.Backup || c.Listen != def.Listen || c.DB != def.DB || c.Timezone != def.Timezone {
 		t.Errorf("the example's settings differ from the defaults")
 	}
-	// Every commented-out block is valid too: uncommenting must not break
-	// the file. The node-level ones are checked through hk-1 and jp-1.
-	if n := c.Nodes[0]; n.Traffic.Quota() != 1000<<30 || n.Plan.ExpireAt != "2027-03-15" || n.Ping.Addr != "203.0.113.5" {
-		t.Errorf("first node: %+v", n)
+	if len(c.Nodes) != 0 {
+		t.Errorf("the example comes with %d nodes: a new server must start with none", len(c.Nodes))
 	}
-	// The generated agent config for a node of the example loads in the agent.
-	if _, err := c.AgentConfig("hk-1", "probe.example.com:9527"); err != nil {
-		t.Error(err)
+	// The commented-out node is valid once uncommented and given a token and
+	// the node it refers to; add-node works on the file as it is.
+	text := strings.Replace(string(data), "nodes: []\n", "nodes:\n  - {id: jp-1, token: "+tokB+"}\n", 1)
+	text = strings.Replace(text, `"<每台一个，gen-token 生成>"`, tokA, 1)
+	text = strings.Replace(text, `"<对端 echo.yml 的 key>"`, tokA, 1)
+	var lines []string
+	inNode := false
+	for _, l := range strings.Split(text, "\n") {
+		if rest, ok := strings.CutPrefix(l, "  # "); ok && (inNode || strings.HasPrefix(rest, "- id: hk-1")) {
+			inNode, l = true, "  "+rest
+		} else {
+			inNode = false
+		}
+		lines = append(lines, l)
+	}
+	full, err := Parse([]byte(strings.Join(lines, "\n")))
+	if err != nil {
+		t.Fatalf("with the example node uncommented: %v", err)
+	}
+	n, _ := full.Node("hk-1")
+	if n == nil || n.Traffic.Quota() != 1000<<30 || n.Plan.ExpireAt != "2027-03-15" || n.Ping.Addr != "203.0.113.5" || len(n.Ping.Extra) != 3 {
+		t.Errorf("example node: %+v", n)
+	}
+	out, err := AddNode(data, NewNode{ID: "first", Token: tokA})
+	if err != nil {
+		t.Fatalf("add-node on the example: %v", err)
+	}
+	if c, err := Parse(out); err != nil || len(c.Nodes) != 1 {
+		t.Fatalf("after add-node: %v", err)
 	}
 }

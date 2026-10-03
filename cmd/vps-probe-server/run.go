@@ -62,6 +62,9 @@ func run(args []string) error {
 			log.Info("database closed")
 		}
 	}()
+	if len(cfg.Nodes) == 0 {
+		log.Warn("no nodes in the config: add the first with `vps-probe-server add-node -id ID`, then restart")
+	}
 	ids := make([]string, len(cfg.Nodes))
 	for i, n := range cfg.Nodes {
 		ids[i] = n.ID

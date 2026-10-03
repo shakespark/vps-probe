@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,7 +124,7 @@ func Parse(data []byte) (*Config, error) {
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
-	if err := dec.Decode(c); err != nil {
+	if err := dec.Decode(c); err != nil && !errors.Is(err, io.EOF) { // EOF: an empty file, all defaults
 		return nil, fmt.Errorf("config: %w", err)
 	}
 	if c.Alerts == nil {

@@ -2,7 +2,7 @@ VERSION ?= $(shell cat VERSION)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 ARCHES := amd64 arm64
 
-# Reproducible releases (docs/DESIGN.md §13.2): the exact Go release from
+# Reproducible releases (docs/DESIGN.md §10): the exact Go release from
 # go.mod's toolchain line (downloaded if the local one differs), no VCS
 # stamping, and tarballs with fixed order, owners, modes and mtime (the
 # commit's time), so a rebuild of a tag matches the CI artifacts byte for byte.
@@ -23,20 +23,21 @@ build:
 	done; done
 
 # Release tarballs: dist/vps-probe-$(VERSION)-linux-<arch>.tar.gz, each with
-# the three binaries, install.sh, systemd units, example configs and the license
-# files.
+# the three binaries, install.sh, systemd units, example configs, the
+# documentation and the license files.
 dist: build licenses
 	@for arch in $(ARCHES); do \
 		d=dist/vps-probe-$(VERSION)-linux-$$arch; rm -rf $$d; \
-		mkdir -p $$d/bin $$d/systemd $$d/examples; \
+		mkdir -p $$d/bin $$d/systemd $$d/examples $$d/docs; \
 		cp dist/vps-probe-agent-linux-$$arch $$d/bin/vps-probe-agent; \
 		cp dist/vps-probe-server-linux-$$arch $$d/bin/vps-probe-server; \
 		cp dist/vps-probe-echo-linux-$$arch $$d/bin/vps-probe-echo; \
 		cp deploy/install.sh $$d/; chmod 0755 $$d/install.sh; \
 		cp deploy/*.service $$d/systemd/; \
 		cp deploy/agent.example.yml deploy/server.example.yml deploy/echo.example.yml deploy/cloudflared.example.yml $$d/examples/; \
-		cp README.md LICENSE NOTICE THIRD_PARTY_LICENSES $$d/; \
-		(cd $$d && LC_ALL=C sha256sum bin/* install.sh systemd/* examples/* README.md LICENSE NOTICE THIRD_PARTY_LICENSES > SHA256SUMS); \
+		cp docs/*.md $$d/docs/; \
+		cp README.md SECURITY.md LICENSE NOTICE THIRD_PARTY_LICENSES $$d/; \
+		(cd $$d && LC_ALL=C sha256sum bin/* install.sh systemd/* examples/* docs/* README.md SECURITY.md LICENSE NOTICE THIRD_PARTY_LICENSES > SHA256SUMS); \
 		LC_ALL=C $(TAR) -C dist -cf $$d.tar vps-probe-$(VERSION)-linux-$$arch && gzip -9nf $$d.tar || exit 1; \
 		rm -rf $$d; \
 		echo "dist: $$d.tar.gz"; \
@@ -50,14 +51,14 @@ licenses:
 
 # Check the draft GitHub release CI built for v$(VERSION) against a local
 # rebuild of the tag; release-sign then signs it with the offline key and
-# publishes it (docs/DESIGN.md §13.1).
+# publishes it (docs/DESIGN.md §10).
 release-verify:
 	VERSION=$(VERSION) ./scripts/release.sh verify
 
 release-sign:
 	VERSION=$(VERSION) ./scripts/release.sh sign
 
-# The static demo site (docs/DESIGN.md §14): the real UI plus web/demo/demo.js,
+# The static demo site (docs/DESIGN.md §11): the real UI plus web/demo/demo.js,
 # which answers /api/* in the browser. Upload dist/demo/ to a static host,
 # at the root of the site.
 demo:

@@ -92,6 +92,36 @@ func TestAddNodeLayouts(t *testing.T) {
 	}
 }
 
+// A server just installed has no nodes: the first one turns the empty list
+// into a block list, wherever the key is and whatever follows it.
+func TestAddFirstNode(t *testing.T) {
+	item := NewNode{ID: "new", Token: tokC}
+	block := "  - id: new\n    token: " + tokC + "\n"
+	for name, c := range map[string]struct{ in, want string }{
+		"empty list":     {"timezone: UTC\nnodes: []\n\n# notify\nalerts: []\n", "timezone: UTC\nnodes:\n" + block + "\n# notify\nalerts: []\n"},
+		"with a comment": {"nodes: []   # none yet\n", "nodes:   # none yet\n" + block},
+		"no value":       {"nodes:\ntimezone: UTC\n", "nodes:\n" + block + "timezone: UTC\n"},
+		"last line":      {"timezone: UTC\nnodes: []", "timezone: UTC\nnodes:\n" + block},
+		"comments below": {"nodes: []\n  # - id: example\n  #   token: x\nalerts: []\n", "nodes:\n" + block + "  # - id: example\n  #   token: x\nalerts: []\n"},
+	} {
+		out, err := AddNode([]byte(c.in), item)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		} else if string(out) != c.want {
+			t.Errorf("%s: got\n%s\nwant\n%s", name, out, c.want)
+		}
+	}
+	if _, err := AddNode([]byte("timezone: UTC\n"), item); err == nil {
+		t.Error("added a node to a config without a nodes key")
+	}
+	// And the second goes below the first.
+	out, _ := AddNode([]byte("nodes: []\nalerts: []\n"), item)
+	out, err := AddNode(out, NewNode{ID: "two", Token: tokA})
+	if want := "nodes:\n" + block + "  - id: two\n    token: " + tokA + "\nalerts: []\n"; err != nil || string(out) != want {
+		t.Errorf("second node: %v\n%s", err, out)
+	}
+}
+
 func TestAddNodeRejects(t *testing.T) {
 	for name, c := range map[string]struct {
 		in string
