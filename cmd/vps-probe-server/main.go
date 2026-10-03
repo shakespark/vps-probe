@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -14,12 +15,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
 	"vpsprobe/internal/server/alert"
 	"vpsprobe/internal/server/api"
+	"vpsprobe/internal/server/basicauth"
 	"vpsprobe/internal/server/cfaccess"
 	"vpsprobe/internal/server/config"
 	"vpsprobe/internal/server/ingest"
@@ -47,6 +52,7 @@ func usage() {
   vps-probe-server agent-config [-config FILE] -node ID -server HOST:PORT -o FILE
                                                      write agent.yml for a node (mode 0600)
   vps-probe-server gen-token                         print a new random node token
+  vps-probe-server hash-password                     read a password, print its hash for basic_auth
   vps-probe-server version
 `)
 }
@@ -70,6 +76,8 @@ func main() {
 		err = agentConfig(args)
 	case "gen-token":
 		err = genToken()
+	case "hash-password":
+		err = hashPassword()
 	case "version":
 		fmt.Println(version)
 	case "help", "-h", "--help":
@@ -92,6 +100,47 @@ func genToken() error {
 	b := make([]byte, 32)
 	rand.Read(b)
 	fmt.Println(base64.RawURLEncoding.EncodeToString(b))
+	return nil
+}
+
+// hashPassword prints the bcrypt hash for basic_auth.password_hash. On a
+// terminal it asks twice without echo; otherwise it reads one line from
+// stdin, so the password never has to appear in the shell history.
+func hashPassword() error {
+	var pw string
+	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+		fmt.Fprint(os.Stderr, "Password: ")
+		a, err := term.ReadPassword(fd)
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return err
+		}
+		fmt.Fprint(os.Stderr, "Again: ")
+		b, err := term.ReadPassword(fd)
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return err
+		}
+		if string(a) != string(b) {
+			return errors.New("the two passwords differ")
+		}
+		pw = string(a)
+	} else {
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && line == "" {
+			return fmt.Errorf("read the password from stdin: %w", err)
+		}
+		pw = strings.TrimRight(line, "\r\n")
+	}
+	// bcrypt ignores everything after 72 bytes; refuse rather than truncate.
+	if len(pw) < 10 || len(pw) > 72 {
+		return errors.New("want a password of 10 to 72 bytes")
+	}
+	h, err := basicauth.Hash(pw)
+	if err != nil {
+		return err
+	}
+	fmt.Println(h)
 	return nil
 }
 
@@ -258,9 +307,15 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("web: %w", err)
 	}
-	if host, _, _ := net.SplitHostPort(cfg.Listen.Web); !isLoopback(host) && !cfg.CFAccess.Enabled() {
-		log.Warn("web UI is not bound to loopback and cf_access is off: anyone who can reach it sees everything",
-			"listen", cfg.Listen.Web)
+	if host, _, _ := net.SplitHostPort(cfg.Listen.Web); !isLoopback(host) {
+		switch {
+		case cfg.BasicAuth.Enabled():
+			log.Warn("web UI is not bound to loopback: basic_auth sends the password with every request, serve it only through an HTTPS reverse proxy",
+				"listen", cfg.Listen.Web)
+		case !cfg.CFAccess.Enabled():
+			log.Warn("web UI is not bound to loopback and neither cf_access nor basic_auth is set: anyone who can reach it sees everything",
+				"listen", cfg.Listen.Web)
+		}
 	}
 	ui, err := web.New()
 	if err != nil {
@@ -271,6 +326,9 @@ func serve(args []string) error {
 	if cfg.CFAccess.Enabled() {
 		access = cfaccess.New(cfg.CFAccess.TeamDomain, cfg.CFAccess.AUD, log)
 		handler = access.Middleware(handler)
+	}
+	if cfg.BasicAuth.Enabled() {
+		handler = basicauth.New(cfg.BasicAuth.User, cfg.BasicAuth.PasswordHash, log).Middleware(handler)
 	}
 	srv := &http.Server{
 		Handler:           handler,
@@ -303,7 +361,7 @@ func serve(args []string) error {
 		}
 	}()
 	log.Info("server started", "version", version, "ingest", in.Addr(), "web", ln.Addr(),
-		"nodes", len(cfg.Nodes), "db", cfg.DB, "alert_rules", len(cfg.Alerts), "telegram", cfg.Telegram.Enabled(), "cf_access", cfg.CFAccess.Enabled())
+		"nodes", len(cfg.Nodes), "db", cfg.DB, "alert_rules", len(cfg.Alerts), "telegram", cfg.Telegram.Enabled(), "cf_access", cfg.CFAccess.Enabled(), "basic_auth", cfg.BasicAuth.Enabled())
 
 	<-ctx.Done()
 	log.Info("shutting down")

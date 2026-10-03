@@ -5,7 +5,7 @@
 设计与安全原则见 [docs/DESIGN.md](docs/DESIGN.md)。核心一条：**agent 只推不收，不接受服务端的任何指令**，服务端被攻破也无法控制 VPS。
 
 - agent：每台 VPS 一个，普通用户运行，不监听任何端口，通过加密 UDP 上报。
-- 服务端：一台公网 VPS，UDP 9527 收上报；网页只监听本机 8080，经 Cloudflare Tunnel + Access 登录后访问。
+- 服务端：一台公网 VPS，UDP 9527 收上报；网页只监听本机 8080，登录后才能访问：Cloudflare Tunnel + Access，或者 HTTPS 反向代理 + 内置的 Basic 认证。
 - 全部数据在一个 SQLite 文件里；迁移只需 `server.yml` + `probe.db` 两个文件。
 
 下文命令都以 root 执行。
@@ -73,9 +73,18 @@ rm server.yml                          # 已安装到 /etc/vps-probe/server.yml
 
 **放行 UDP 9527**（云厂商安全组 / 防火墙），同时监听 IPv4 和 IPv6。非法包一律静默丢弃，端口对扫描器看起来是关着的。
 
-## 3. 通过 Cloudflare Tunnel + Access 访问网页
+## 3. 访问网页
 
-网页没有自己的登录，靠 Cloudflare Access 挡在前面；配置 `cf_access` 后服务端还会自己校验 Access 签发的令牌，隧道之外的请求一律 403。
+网页只监听 `127.0.0.1:8080`，必须先登录才能看。两种方式选一种：
+
+- **A. Cloudflare Tunnel + Access**（推荐）：不用开任何入站端口，登录由 Cloudflare 负责。
+- **B. HTTPS 反向代理 + Basic 认证**：不用 Cloudflare，需要一个域名和 80/443 端口。
+
+已经有自带登录的反向代理（Authelia、oauth2-proxy、Tailscale 等）的，把它指向 `127.0.0.1:8080` 即可，两种都不用配。
+
+### A. Cloudflare Tunnel + Access
+
+靠 Cloudflare Access 挡在前面；配置 `cf_access` 后服务端还会自己校验 Access 签发的令牌，隧道之外的请求一律 403。
 
 按这个顺序做，不会把自己锁在外面：
 
@@ -97,6 +106,46 @@ rm server.yml                          # 已安装到 /etc/vps-probe/server.yml
    ```
 
    然后 `systemctl restart vps-probe-server`，再用浏览器确认能正常访问。之后直接访问 `http://服务端IP:8080` 或在服务器上 `curl 127.0.0.1:8080` 都会得到 403，这是预期行为。
+
+### B. HTTPS 反向代理 + Basic 认证
+
+需要服务端 ≥ 0.1.16。浏览器会弹出用户名密码框；密码随每个请求发送，所以**必须走 HTTPS**，`listen.web` 保持 `127.0.0.1:8080` 不要改。
+
+1. **生成密码哈希**（配置里只存哈希，至少 10 个字符）：
+
+   ```sh
+   vps-probe-server hash-password        # 输入两次密码，不回显；打印 $2a$12$... 一行
+   ```
+
+2. **写进 `/etc/vps-probe/server.yml`** 并重启：
+
+   ```yaml
+   basic_auth:
+     user: admin
+     password_hash: "$2a$12$..."          # 上一步打印的那一行，要加引号
+   ```
+
+   ```sh
+   vps-probe-server check -config /etc/vps-probe/server.yml && systemctl restart vps-probe-server
+   ```
+
+3. **反向代理**。用 [Caddy](https://caddyserver.com/) 最省事，证书自动申请，`/etc/caddy/Caddyfile`：
+
+   ```
+   probe.example.com {
+       reverse_proxy 127.0.0.1:8080
+   }
+   ```
+
+   nginx 等其他反向代理也可以，要求：和服务端装在同一台机器上，转发到 `127.0.0.1:8080`；带上 `X-Forwarded-For`（nginx：`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`）。服务端按这个头对输错密码的来源限速，只信任来自本机的连接带的这个头；反向代理在别的机器上时，所有访客会被算成同一个来源。
+
+4. **验证**：`curl -sI https://probe.example.com/` 返回 `401`；浏览器打开，输入用户名密码后看到探针页面。
+
+说明：
+
+- 同一来源连续输错 5 次后，要等一会儿才能再试（之后每 12 秒 1 次），期间返回 429；已经登录的浏览器不受影响。
+- 没有"退出登录"按钮，关闭浏览器即可。改密码：重新 `hash-password`，替换配置并重启。
+- `basic_auth` 和 `cf_access` 不能同时配置。
 
 ## 4. 添加节点（每台 VPS）
 
@@ -211,8 +260,9 @@ agent 停止前会把流量最后读一次并保存，升级不会丢月流量�
 | 现象 | 看哪里 |
 |---|---|
 | agent 日志一直 `no acknowledgement from server` | 服务端 `journalctl -u vps-probe-server`：`authentication failed` = token 不一致；`packet for a node not in the config` = node id 没登记；`timestamp too far` = 时钟偏差（检查 NTP）。都没有 = 包没到服务端，查安全组 / 防火墙的 UDP 9527 |
-| 丢弃计数 | 网页底部；或未开 `cf_access` 时在服务端 `curl -s 127.0.0.1:8080/api/stats` |
+| 丢弃计数 | 网页底部；或未开 `cf_access` / `basic_auth` 时在服务端 `curl -s 127.0.0.1:8080/api/stats` |
 | 网页 403 | 开了 `cf_access`：只能经 Cloudflare Access 访问；服务端日志 `cf_access: request rejected` 会写明原因 |
+| 网页 401 / 429 | 开了 `basic_auth`：401 是用户名或密码不对，429 是同一来源输错太多次，等一分钟；服务端日志 `basic_auth: wrong user name or password` 带来源地址 |
 | 时延矩阵里对不上 | agent 的 `ping.peers[].name` 要写对端的节点 id；用 `agent-config` 生成的配置自动满足 |
 | agent 起不来：`no physical network interface detected` | 在 agent.yml 写 `interfaces: [网卡名]` |
 | ping 全部丢包、日志 `ping disabled` | `install.sh` 会自动处理 ICMP 权限；手动安装时见第 4 步说明 |
@@ -231,8 +281,9 @@ agent 停止前会把流量最后读一次并保存，升级不会丢月流量�
   `-dry-run` 把每份报告以 JSON 打印出来并显示加密后的包大小，不写正式的流量状态文件，可以和已安装的 agent 同时运行。
 - 修改 `proto/` 后需要 `protoc` 和 `protoc-gen-go`，执行 `make proto`；生成的代码已提交。
 - 目录结构和各模块说明见 `docs/DESIGN.md` §9。
+- 演示站（`docs/DESIGN.md` §14）：`make demo` 生成 `dist/demo/`，是同一份界面加上在浏览器里生成假数据的 `web/demo/demo.js`，没有后端，整个目录放到静态托管的站点根路径即可（如 Cloudflare Pages：`npx wrangler pages deploy dist/demo`）。改了接口的返回字段后，`go test ./internal/server/api -update-shape` 更新 `web/demo/api-shape.json`，再改 `demo.js` 直到 `make demo-check`（需要 node）通过。
 - 发布新版本（`docs/DESIGN.md` §13）：
-  1. 改 `VERSION` 并提交，`git tag v<版本> && git push origin main v<版本>`；
+  1. 改 `VERSION` 并提交，`git push origin main`，再 `git tag v<版本> && git push origin v<版本>`（tag 单独推送，和提交一起推可能不触发 CI）；
   2. GitHub Actions 测试、构建，建一个草稿 Release（Actions 页面看进度）；
   3. 在自己的终端执行 `make release-sign`：核对草稿里的包与本地重建逐字节一致，签名，上传签名并正式发布。只核对不签名用 `make release-verify`。签名密钥默认 `~/.ssh/vps-probe-release`，可用 `SIGNING_KEY=` 指定。
 - 升级或增减 Go 依赖、更换 `web/static/vendor/` 里的前端库后执行 `make licenses`，提交更新后的 `THIRD_PARTY_LICENSES`（`make dist` 也会重新生成）。

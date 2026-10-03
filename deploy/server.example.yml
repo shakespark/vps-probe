@@ -60,6 +60,13 @@ offline_after: 30s
 #   team_domain: myteam.cloudflareaccess.com
 #   aud: "0123...（64 位十六进制 AUD tag）"
 
+# 可选，不用 Cloudflare Access 时用：网页要求用户名和密码（HTTP Basic）。和 cf_access 二选一。
+# 密码随每个请求发送，必须放在 HTTPS 反向代理后面，listen.web 保持 127.0.0.1（见 README 第 3 步 B）。
+# password_hash 用 `vps-probe-server hash-password` 生成。
+# basic_auth:
+#   user: admin
+#   password_hash: "$2a$12$..."
+
 # 告警规则，见 docs/DESIGN.md §7。整段不写 = 使用下面这组默认规则；写 `alerts: []` = 不告警。
 # metric: cpu | steal | load1 | mem | swap | disk | offline | ping_loss | ping_avg | net_in | net_out | pps_in | pps_out | softirq | traffic | expiry | ip_change | period_report | weekly_report
 alerts:

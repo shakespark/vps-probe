@@ -11,7 +11,7 @@ SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct)
 TAR := tar --sort=name --format=gnu --owner=0 --group=0 --numeric-owner \
 	--mode=u=rwX,go=rX --mtime=@$(SOURCE_DATE_EPOCH)
 
-.PHONY: all build test proto dist licenses release-verify release-sign clean
+.PHONY: all build test proto dist licenses release-verify release-sign demo demo-check clean
 
 all: test build
 
@@ -56,6 +56,24 @@ release-verify:
 
 release-sign:
 	VERSION=$(VERSION) ./scripts/release.sh sign
+
+# The static demo site (docs/DESIGN.md §14): the real UI plus web/demo/demo.js,
+# which answers /api/* in the browser. Upload dist/demo/ to a static host,
+# at the root of the site.
+demo:
+	rm -rf dist/demo
+	mkdir -p dist/demo/static
+	cp -r web/static/. dist/demo/static/
+	mv dist/demo/static/index.html dist/demo/index.html
+	cp web/demo/demo.js dist/demo/static/demo.js
+	cp web/demo/_headers dist/demo/_headers
+	sed -i 's|<script type="module" src="/static/app.js"></script>|<script src="/static/demo.js"></script>\n&|' dist/demo/index.html
+	grep -q '/static/demo.js' dist/demo/index.html
+	@echo "demo: dist/demo"
+
+# demo.js must answer with the same fields as the real API. Needs node.
+demo-check:
+	node web/demo/check.js
 
 test:
 	go vet ./...

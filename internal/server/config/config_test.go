@@ -183,6 +183,32 @@ func TestCFAccess(t *testing.T) {
 	}
 }
 
+func TestBasicAuth(t *testing.T) {
+	base := "nodes:\n  - {id: a, token: " + tokA + "}\n"
+	// Only the format and cost are checked here.
+	hash := "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+	c, err := Parse([]byte(base + "basic_auth: {user: admin, password_hash: \"" + hash + "\"}\n"))
+	if err != nil || !c.BasicAuth.Enabled() {
+		t.Fatal(err)
+	}
+	if c, err := Parse([]byte(base)); err != nil || c.BasicAuth.Enabled() {
+		t.Fatalf("basic_auth on without being configured: %v", err)
+	}
+	aud := "4714c1358e65fe4b408ad6d432a5f878f08194bdb4752441fd56faefa9b2b6f2"
+	for _, bad := range []string{
+		"basic_auth: {user: admin}",
+		"basic_auth: {password_hash: \"" + hash + "\"}",
+		"basic_auth: {user: admin, password_hash: secret}", // a plaintext password
+		"basic_auth: {user: admin, password_hash: \"$2a$04$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy\"}", // cost too low
+		"basic_auth: {user: \"a:b\", password_hash: \"" + hash + "\"}",
+		"basic_auth: {user: admin, password_hash: \"" + hash + "\"}\ncf_access: {team_domain: myteam.cloudflareaccess.com, aud: " + aud + "}",
+	} {
+		if _, err := Parse([]byte(base + bad + "\n")); err == nil {
+			t.Errorf("accepted: %s", bad)
+		}
+	}
+}
+
 func TestExpiry(t *testing.T) {
 	sh, _ := time.LoadLocation("Asia/Shanghai")
 	at := func(s string) time.Time { // a UTC instant

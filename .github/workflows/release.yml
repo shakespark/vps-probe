@@ -35,6 +35,9 @@ jobs:
 
       - run: make test
 
+      # The demo site's data must still match the API (node is preinstalled).
+      - run: make demo-check
+
       - run: make dist
 
       - name: THIRD_PARTY_LICENSES is up to date

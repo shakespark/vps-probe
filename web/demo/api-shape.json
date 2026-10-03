@@ -1,0 +1,511 @@
+[
+ {
+  "name": "nodes",
+  "path": "/api/nodes",
+  "shape": {
+   "[]": {
+    "{}": {
+     "expire_at": "string",
+     "expire_days": "number",
+     "group": "string",
+     "id": "string",
+     "name": "string",
+     "online": "bool",
+     "price": "string",
+     "region": "string",
+     "renew_months": "number",
+     "status": {
+      "{}": {
+       "clock_skew": "number",
+       "cpu": "number",
+       "disks": {
+        "[]": {
+         "{}": {
+          "avail": "number",
+          "inode_pct": "number",
+          "mount": "string",
+          "total": "number",
+          "used": "number"
+         }
+        }
+       },
+       "fresh_at": "number",
+       "ip": "string",
+       "ip_since": "number",
+       "load1": "number",
+       "load15": "number",
+       "load5": "number",
+       "max_ts": "number",
+       "mem_total": "number",
+       "mem_used": "number",
+       "metrics_ts": "number",
+       "net": {
+        "[]": {
+         "{}": {
+          "iface": "string",
+          "rx": "number",
+          "tx": "number"
+         }
+        }
+       },
+       "softirq": "number",
+       "steal": "number",
+       "swap_total": "number",
+       "swap_used": "number",
+       "sys": {
+        "{}": {
+         "agent_version": "string",
+         "arch": "string",
+         "boot_time": "number",
+         "cores": "number",
+         "hostname": "string",
+         "kernel": "string",
+         "os": "string",
+         "uptime": "number"
+        }
+       },
+       "tcp": "number",
+       "tcp_tw": "number",
+       "threads": "number",
+       "traffic": {
+        "{}": {
+         "ifaces": {
+          "[]": {
+           "{}": {
+            "iface": "string",
+            "rx": "number",
+            "tx": "number"
+           }
+          }
+         },
+         "rx": "number",
+         "start": "string",
+         "tx": "number"
+        }
+       },
+       "udp": "number"
+      }
+     },
+     "traffic_quota_gb": "number",
+     "traffic_quota_mode": "string"
+    }
+   }
+  }
+ },
+ {
+  "name": "metrics",
+  "path": "/api/nodes/hk-1/metrics",
+  "shape": {
+   "{}": {
+    "cols": {
+     "{}": {
+      "cpu": {
+       "[]": "number"
+      },
+      "cpu_max": {
+       "[]": "number"
+      },
+      "load1": {
+       "[]": "number"
+      },
+      "load15": {
+       "[]": "number"
+      },
+      "load1_max": {
+       "[]": "number"
+      },
+      "load5": {
+       "[]": "number"
+      },
+      "mem_total": {
+       "[]": "number"
+      },
+      "mem_used": {
+       "[]": "number"
+      },
+      "mem_used_max": {
+       "[]": "number"
+      },
+      "softirq": {
+       "[]": "number"
+      },
+      "softirq_max": {
+       "[]": "number"
+      },
+      "steal": {
+       "[]": "number"
+      },
+      "steal_max": {
+       "[]": "number"
+      },
+      "swap_total": {
+       "[]": "number"
+      },
+      "swap_used": {
+       "[]": "number"
+      },
+      "swap_used_max": {
+       "[]": "number"
+      },
+      "tcp": {
+       "[]": "number"
+      },
+      "tcp_max": {
+       "[]": "number"
+      },
+      "tcp_tw": {
+       "[]": "number"
+      },
+      "threads": {
+       "[]": "number"
+      },
+      "threads_max": {
+       "[]": "number"
+      },
+      "udp": {
+       "[]": "number"
+      },
+      "udp_max": {
+       "[]": "number"
+      }
+     }
+    },
+    "step": "number",
+    "tier": "string",
+    "ts": {
+     "[]": "number"
+    }
+   }
+  }
+ },
+ {
+  "name": "net",
+  "path": "/api/nodes/hk-1/net",
+  "dynamic": [
+   ""
+  ],
+  "shape": {
+   "{*}": {
+    "{}": {
+     "cols": {
+      "{}": {
+       "rx": {
+        "[]": "number"
+       },
+       "rx_max": {
+        "[]": "number"
+       },
+       "rx_pps": {
+        "[]": "number"
+       },
+       "rx_pps_max": {
+        "[]": "number"
+       },
+       "tx": {
+        "[]": "number"
+       },
+       "tx_max": {
+        "[]": "number"
+       },
+       "tx_pps": {
+        "[]": "number"
+       },
+       "tx_pps_max": {
+        "[]": "number"
+       }
+      }
+     },
+     "step": "number",
+     "tier": "string",
+     "ts": {
+      "[]": "number"
+     }
+    }
+   }
+  }
+ },
+ {
+  "name": "disks",
+  "path": "/api/nodes/hk-1/disks",
+  "dynamic": [
+   ""
+  ],
+  "shape": {
+   "{*}": {
+    "{}": {
+     "cols": {
+      "{}": {
+       "avail": {
+        "[]": "number"
+       },
+       "inode_pct": {
+        "[]": "number"
+       },
+       "total": {
+        "[]": "number"
+       },
+       "used": {
+        "[]": "number"
+       },
+       "used_max": {
+        "[]": "number"
+       }
+      }
+     },
+     "step": "number",
+     "tier": "string",
+     "ts": {
+      "[]": "number"
+     }
+    }
+   }
+  }
+ },
+ {
+  "name": "ping",
+  "path": "/api/ping/hk-1/tyo-1",
+  "shape": {
+   "{}": {
+    "cols": {
+     "{}": {
+      "avg": {
+       "[]": "number"
+      },
+      "jitter": {
+       "[]": "number"
+      },
+      "loss_pct": {
+       "[]": "number"
+      },
+      "lost": {
+       "[]": "number"
+      },
+      "max": {
+       "[]": "number"
+      },
+      "min": {
+       "[]": "number"
+      },
+      "sent": {
+       "[]": "number"
+      }
+     }
+    },
+    "step": "number",
+    "tier": "string",
+    "ts": {
+     "[]": "number"
+    }
+   }
+  }
+ },
+ {
+  "name": "matrix",
+  "path": "/api/ping/matrix?window=1h",
+  "shape": {
+   "{}": {
+    "links": {
+     "[]": {
+      "{}": {
+       "avg": "number",
+       "dst": "string",
+       "jitter": "number",
+       "loss_pct": "number",
+       "lost": "number",
+       "max": "number",
+       "min": "number",
+       "sent": "number",
+       "src": "string"
+      }
+     }
+    },
+    "nodes": {
+     "[]": "string"
+    },
+    "window": "string"
+   }
+  }
+ },
+ {
+  "name": "availability",
+  "path": "/api/ping/availability?range=24h",
+  "shape": {
+   "{}": {
+    "cell": "number",
+    "down_loss_pct": "number",
+    "from": "number",
+    "links": {
+     "[]": {
+      "{}": {
+       "avail_pct": "number",
+       "avg": "number",
+       "cells": {
+        "{}": {
+         "avg": {
+          "[]": "number"
+         },
+         "down": {
+          "[]": "number"
+         },
+         "lost": {
+          "[]": "number"
+         },
+         "periods": {
+          "[]": "number"
+         },
+         "sent": {
+          "[]": "number"
+         }
+        }
+       },
+       "down": "number",
+       "dst": "string",
+       "lost": "number",
+       "periods": "number",
+       "sent": "number",
+       "src": "string"
+      }
+     }
+    },
+    "n": "number",
+    "range": "string"
+   }
+  }
+ },
+ {
+  "name": "traffic",
+  "path": "/api/traffic",
+  "shape": {
+   "[]": {
+    "{}": {
+     "id": "string",
+     "name": "string",
+     "periods": {
+      "[]": {
+       "{}": {
+        "ifaces": {
+         "[]": {
+          "{}": {
+           "iface": "string",
+           "rx": "number",
+           "tx": "number"
+          }
+         }
+        },
+        "rx": "number",
+        "start": "string",
+        "tx": "number"
+       }
+      }
+     },
+     "traffic_quota_gb": "number",
+     "traffic_quota_mode": "string"
+    }
+   }
+  }
+ },
+ {
+  "name": "daily",
+  "path": "/api/traffic/hk-1/daily",
+  "shape": {
+   "{}": {
+    "days": {
+     "[]": {
+      "{}": {
+       "day": "string",
+       "rx": "number",
+       "tx": "number"
+      }
+     }
+    },
+    "period": "string"
+   }
+  }
+ },
+ {
+  "name": "stats",
+  "path": "/api/stats",
+  "dynamic": [
+   "ingest"
+  ],
+  "shape": {
+   "{}": {
+    "db_bytes": "number",
+    "ingest": {
+     "{*}": "number"
+    },
+    "server_time": "number",
+    "timezone": "string",
+    "version": "string"
+   }
+  }
+ },
+ {
+  "name": "alerts",
+  "path": "/api/alerts",
+  "shape": {
+   "{}": {
+    "active": {
+     "[]": {
+      "{}": {
+       "metric": "string",
+       "node": "string",
+       "rule": "string",
+       "since": "number",
+       "state": "string",
+       "target": "string",
+       "value": "number"
+      }
+     }
+    },
+    "facets": {
+     "{}": {
+      "nodes": {
+       "[]": "string"
+      },
+      "rules": {
+       "[]": "string"
+      }
+     }
+    },
+    "history": {
+     "[]": {
+      "{}": {
+       "event": "string",
+       "message": "string",
+       "node": "string",
+       "rule": "string",
+       "target": "string",
+       "ts": "number",
+       "value": "number"
+      }
+     }
+    },
+    "rules": {
+     "[]": {
+      "{}": {
+       "at": "string",
+       "exclude": {
+        "[]": "string"
+       },
+       "for": "string",
+       "levels": {
+        "[]": "number"
+       },
+       "metric": "string",
+       "name": "string",
+       "nodes": "any",
+       "notify_recovery": "null",
+       "op": "string",
+       "ratio": "number",
+       "repeat": "string",
+       "threshold": "number"
+      }
+     }
+    },
+    "telegram": "bool",
+    "truncated": "bool"
+   }
+  }
+ }
+]

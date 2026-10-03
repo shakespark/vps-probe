@@ -20,6 +20,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"vpsprobe/internal/echo"
+	"vpsprobe/internal/server/basicauth"
 	"vpsprobe/internal/wire"
 )
 
@@ -32,9 +33,10 @@ type Config struct {
 	Backup    Backup    `yaml:"backup"`
 	// A node is shown offline when no fresh report arrived for this long.
 	// Keep it at about 3x the agents' interval.
-	OfflineAfter Duration `yaml:"offline_after"`
-	Telegram     Telegram `yaml:"telegram"`
-	CFAccess     CFAccess `yaml:"cf_access"`
+	OfflineAfter Duration  `yaml:"offline_after"`
+	Telegram     Telegram  `yaml:"telegram"`
+	CFAccess     CFAccess  `yaml:"cf_access"`
+	BasicAuth    BasicAuth `yaml:"basic_auth"`
 	// nil (key absent) means DefaultRules; an empty list disables alerts.
 	Alerts []Rule `yaml:"alerts"`
 
@@ -108,6 +110,16 @@ type CFAccess struct {
 }
 
 func (c CFAccess) Enabled() bool { return c.TeamDomain != "" }
+
+// BasicAuth, when set, makes the web UI require this user name and password
+// on every request (HTTP Basic). For deployments without Cloudflare Access;
+// the password travels with each request, so serve it over HTTPS only.
+type BasicAuth struct {
+	User         string `yaml:"user"`
+	PasswordHash string `yaml:"password_hash"` // bcrypt, from `vps-probe-server hash-password`
+}
+
+func (b BasicAuth) Enabled() bool { return b.User != "" }
 
 // Telegram is optional; without it alerts are only logged and recorded.
 type Telegram struct {
@@ -505,6 +517,18 @@ func (c *Config) validate() error {
 		}
 		if len(a.AUD) != 64 || strings.Trim(strings.ToLower(a.AUD), "0123456789abcdef") != "" {
 			bad("cf_access.aud: want the 64-hex-character Application Audience (AUD) tag of the Access application")
+		}
+	}
+	if b := c.BasicAuth; b.User != "" || b.PasswordHash != "" {
+		// RFC 7617: the user name cannot contain a colon.
+		if b.User == "" || len(b.User) > 64 || strings.ContainsAny(b.User, ":\x00\r\n") {
+			bad("basic_auth.user: want 1-64 characters without ':'")
+		}
+		if err := basicauth.CheckHash(b.PasswordHash); err != nil {
+			bad("basic_auth.password_hash: want a bcrypt hash with cost >= %d, as printed by `vps-probe-server hash-password` (%v)", basicauth.MinCost, err)
+		}
+		if c.CFAccess.Enabled() {
+			bad("basic_auth and cf_access are both set: use one")
 		}
 	}
 	if c.Alerts == nil {

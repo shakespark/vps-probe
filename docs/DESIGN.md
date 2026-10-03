@@ -21,7 +21,7 @@
 2. **agent 不接受任何指令**：不执行命令、不下载脚本、不远程更新、不从服务端拉取配置。agent 只从服务端接收 ACK，ACK 仅用于把已送达的报文移出重传队列，不含任何其他语义。
 3. **agent 非 root 运行**：专用系统用户 `vps-probe`，systemd 加固；采集数据只读 `/proc`、`/sys`、`statfs`，都不需要 root。
 4. **互测目标由 agent 本地配置**：不由服务端下发，防止服务端被利用去探测任意地址。
-5. **Web 不暴露公网**：Web 只监听 `127.0.0.1`，只能经 Cloudflare Tunnel + Access 登录后访问。服务端唯一的公网端口是 UDP ingest（agent 上报），**校验不通过的包一律静默丢弃、不做任何回应**，端口扫描器无法把它与被防火墙过滤的端口区分开（见 §6.2）。
+5. **Web 必须先鉴权才能访问**：Web 默认只监听 `127.0.0.1`，前面必须有一层登录，三选一：Cloudflare Tunnel + Access（推荐，服务端再校验 Access 令牌，§6.1 cf_access）；内置 HTTP Basic 认证（§6.1 basic_auth，放在 HTTPS 反向代理之后）；或者由自带鉴权的反向代理负责。没有匿名可见的页面。服务端唯一直接面向公网的端口是 UDP ingest（agent 上报），**校验不通过的包一律静默丢弃、不做任何回应**，端口扫描器无法把它与被防火墙过滤的端口区分开（见 §6.2）。
 6. **Web 只读**：Web 没有任何写接口，所有配置通过服务端配置文件修改。
 7. **Telegram Bot 只发不收**：不设置 webhook、不调用 getUpdates，不存在通过 TG 下达指令的通道。
 8. **每台 agent 独立 token**：token 派生出该节点的加密密钥（§5.3），一台的 token 泄露只影响该节点的数据。服务端需要用 token 解密，因此服务端配置文件中保存 token 明文，文件权限 0600。
@@ -55,6 +55,7 @@
 
 - **ingest 与 Web 完全独立**：ingest 是 UDP，只接受加密上报包，不提供任何查询；Web 只绑定 `127.0.0.1`，公网无法直接访问。
 - Web：cloudflared 把 `probe.example.com` 映射到 `127.0.0.1:8080`，Cloudflare Access 配置登录策略（邮箱 OTP / GitHub 等）。服务端可选校验 `Cf-Access-Jwt-Assertion` JWT（纵深防御，推荐开启）。
+- 不用 Cloudflare 时：任意 HTTPS 反向代理（Caddy、nginx）转发到 `127.0.0.1:8080`，服务端开 `basic_auth`；或者由反向代理自己做鉴权。
 - 服务端宕机或网络中断时：监控曲线会出现缺口（agent 内存缓冲 1 小时，恢复后补传），**月流量不受影响**（在 agent 本地累计，见 §4）。
 
 ## 3. 技术选型
@@ -294,6 +295,9 @@ timezone: Asia/Shanghai    # 按日流量的日期划分，须与 agent 的 traf
 cf_access:                 # 可选：校验 Web 请求的 Access JWT（见下）
   team_domain: myteam.cloudflareaccess.com
   aud: "<application AUD tag>"
+basic_auth:                # 可选，与 cf_access 二选一：HTTP Basic 认证（见下）
+  user: admin
+  password_hash: "$2a$12$..."   # vps-probe-server hash-password 生成
 nodes:
   - id: hk-1
     name: 香港 1
@@ -325,6 +329,15 @@ backup:
 - 公钥从 `https://<team_domain>/cdn-cgi/access/certs` 获取，每小时刷新；遇到未知 `kid`（密钥轮换）立即重新获取，但每分钟最多一次，防止伪造 kid 刷请求。
 - 启动时不等待公钥：取到之前所有请求都 403，后台每 30s 重试（fail closed）。
 - 拒绝原因按类别限频写日志。开启后在服务器上直接 `curl 127.0.0.1:8080` 也会 403，属预期。
+
+**basic_auth**：给不用 Cloudflare Access 的部署。配置后每个网页请求都必须带正确的用户名和密码，否则 401（浏览器弹出登录框）。与 `cf_access` 不能同时配置。
+
+- 选 Basic 而不是登录页：不需要登录接口、会话和 cookie，Web 仍然只有 GET，没有任何由请求改变的服务端状态可供攻击（除下面的限速计数）。代价是没有"退出登录"（关闭浏览器即可）。
+- 配置里只存 bcrypt 哈希（cost ≥ 10），`vps-probe-server hash-password` 生成（密码从终端读取、不回显，或从标准输入读一行）；`htpasswd -B`、`caddy hash-password` 生成的哈希也能用。
+- 校验：用户名常数时间比较；密码用 bcrypt。bcrypt 每次约几十毫秒，页面一次刷新有十几个请求，所以验证通过的凭据在内存里记一个 HMAC 摘要（密钥每次启动随机生成），后续请求只比对摘要。
+- 防暴力破解：验证失败按来源地址限速（每个地址 5 次突发，之后每 12 秒 1 次；IPv6 按 /64），超限直接 429、不再计算 bcrypt；同时最多 2 个 bcrypt 在算，防止被用来耗尽 CPU。来源地址：连接来自本机（反向代理）时取 `X-Forwarded-For` 最右边一项（反向代理自己添加的，客户端伪造不了），否则取连接地址。已登录的浏览器不受限速影响。
+- 失败按来源地址限频写日志。
+- **密码随每个请求发送，必须走 HTTPS**：`listen.web` 保持 `127.0.0.1`，由反向代理终结 TLS。服务端自己不做 TLS。`listen.web` 不是本机地址又开了 `basic_auth` 时启动告警。
 
 **到期日**：剩余天数按服务端 `timezone` 的日历日计算（当天为 0，过期为负）。写了 `renew_months` 时，到期日过去后按 `expire_at + k × renew_months` 个月顺延到第一个不早于今天的日期；每次都从 `expire_at` 起算，月底按当月最后一天截断（1-31 起每月续费：2-28、3-31……），不会越算越早。API 和告警共用同一个计算函数，显示的天数与提醒一致。
 
@@ -526,7 +539,7 @@ Telegram：
 ```
 cmd/
   vps-probe-agent/      main.go（含 -dry-run）
-  vps-probe-server/     main.go（serve / check / backup / test-telegram / agent-config / gen-token）
+  vps-probe-server/     main.go（serve / check / backup / test-telegram / agent-config / gen-token / hash-password）
   vps-probe-echo/       main.go：隧道探测应答端（可选，只装在隧道终点）
 proto/probe/v1/         probe.proto
 internal/
@@ -548,7 +561,9 @@ internal/
     alert/              告警规则评估、状态机
     notify/             Telegram 发送（只发不收）
     cfaccess/           Cloudflare Access JWT 校验
+    basicauth/          HTTP Basic 认证、失败限速
 web/                    web.go（go:embed）+ static/（index.html、app.js、style.css、vendor/echarts 及其 LICENSE、NOTICE）
+  demo/                 演示站：demo.js（假数据）、api-shape.json（接口结构）、check.js、_headers（§14）；不进服务端程序
 deploy/
   vps-probe-agent.service
   agent.example.yml
@@ -593,7 +608,8 @@ docs/
 
 - TCP 时延（后续可做 TCP connect 到对端已有端口）；经端口转发隧道的时延已由 DNS 探测和隧道回显覆盖
 - 容器型 VPS（OpenVZ/LXC 的 venet 网卡识别）
-- 多用户 / 权限体系（依赖 CF Access）
+- 多用户 / 权限体系（依赖 CF Access；`basic_auth` 只有一个账号）
+- 匿名可见的公开状态页（需要单独的监听端口和字段白名单；有需求再做）。演示用途由静态演示站承担（§14）
 - agent 自动更新（安全原则 2）
 
 ## 13. 发布与签名
@@ -602,7 +618,7 @@ docs/
 
 ### 13.1 流程
 
-1. 维护者改 `VERSION`、提交，打 tag `v<VERSION>` 并推送。
+1. 维护者改 `VERSION`、提交并推送 `main`，再打 tag `v<VERSION>` 单独推送（tag 和提交在同一次 push 里可能不触发 CI）。
 2. GitHub Actions（`.github/workflows/release.yml`）：检查 tag 与 `VERSION` 一致 → `make test` → `make dist` → 检查提交的 `THIRD_PARTY_LICENSES` 是最新的 → 建一个**草稿** Release，上传两个 tar.gz 和 `vps-probe-<版本>.sha256`。草稿对外不可见。CI 不持有任何签名密钥。
 3. 维护者在自己电脑上 `make release-sign`：
    - 下载草稿里的文件，用 `.sha256` 核对；
@@ -634,3 +650,29 @@ docs/
 - 维护者电脑被攻破：攻击者可以签任何东西。
 - 用户拿到的公钥本身是假的：公钥要从 GitHub 仓库或 README 获取，以后升级沿用同一个。
 - CI 的 workflow 固定 action 的 commit SHA、不用缓存、checkout 不保存凭据，降低被供应链污染的机会；即使 CI 产物被篡改，也会在第 3 步的比对里暴露。
+
+## 14. 演示站
+
+目的：让人不装就能看到界面和功能，又不暴露任何真实部署。演示站是纯静态文件，没有后端，托管在静态托管服务上（Cloudflare Pages，站点根路径；页面里的 `/static/...` 是绝对路径，放在子目录下不能用）。
+
+### 14.1 原理
+
+- 界面就是 `web/static/` 里的同一份文件，一行不改。
+- 多加载一个 `web/demo/demo.js`（普通脚本，排在 `app.js` 这个 module 之前执行）：它替换 `window.fetch`，同源的 `/api/*` 请求不发出去，直接返回在浏览器里生成的数据；并在页面顶部加一条"演示数据"提示。
+- `web/demo/` 不在 `go:embed` 的范围内，不会进服务端程序。
+- `make demo` 生成 `dist/demo/`：拷贝 `web/static/`，在 `index.html` 的 `app.js` 之前插入 `demo.js` 的 script 标签（构建时插入，不另存一份 index.html），再放一个 `_headers`（与服务端相同的 CSP 等安全响应头）。
+
+### 14.2 数据
+
+- 十台虚构节点（名称、主机名、IP 都是编的，IP 用文档保留网段），不含任何真实部署的数据。
+- **数值是时间戳的确定函数**：`值 = 基线 + 日周期 + 按 (节点, 指标, 时间桶) 哈希出的噪声`。同一时刻在总览、节点图表的不同时间范围、时延矩阵和链路图里一致；定时刷新只是多出新的点，曲线不会跳。
+- 与服务端相同的分层规则（§6.4）：raw / 5m / 1h、每条曲线最多约 1000 点、`*_max` 列；所有查询参数（`from`/`to`、`window`、`range`、`periods`、`period`、告警筛选）都按真实接口的语义处理。
+- 流量：按 (节点, 日) 确定地生成每日用量，周期合计 = 各日之和。
+- 编排的"剧情"，以打开页面的时刻为锚点：一台节点正在被 DDoS（入站远大于出站、软中断升高、其他节点到它丢包，`ddos` 告警中）；一台节点离线（`offline` 告警中）；一条长期丢包的链路；一台节点流量接近配额；一台节点即将到期；告警历史里有对应的记录，以及每周流量汇总、周期结算、IP 变化等。
+
+### 14.3 防止过时
+
+接口加了字段而演示数据没跟上，界面会悄悄缺东西。两道检查：
+
+- `internal/server/api` 的测试把每个接口响应的**结构**（字段名和类型，不含数值）与 `web/demo/api-shape.json` 比较；接口变了测试就失败，`go test ./internal/server/api -update-shape` 更新这个文件。
+- `make demo-check`（需要 node）用同样的规则算出 `demo.js` 各接口输出的结构，与 `api-shape.json` 比较。发布流水线里会跑；本机没有 node 可以不跑。
