@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,4 +55,51 @@ func TestRefreshIfacesWaitsForDefaultRoute(t *testing.T) {
 	step(2*time.Minute, "eth0") // the route goes away: keep the choice
 	up(true)
 	step(2*time.Minute, "eth0")
+}
+
+// In a container whose lxcfs has died /proc/stat cannot be read. The agent
+// starts anyway, with an unknown boot time, and says so once per collector
+// rather than at every sample.
+func TestStartsWithoutBootTime(t *testing.T) {
+	fs := collect.FS{Proc: t.TempDir()}
+	os.MkdirAll(filepath.Join(fs.Proc, "sys", "kernel", "random"), 0o755)
+	os.WriteFile(filepath.Join(fs.Proc, "sys", "kernel", "random", "boot_id"), []byte("b1\n"), 0o644)
+	var logs bytes.Buffer
+	a := &Agent{fs: fs, log: slog.New(slog.NewTextHandler(&logs, nil))}
+	if err := a.readBoot(); err != nil {
+		t.Fatal(err)
+	}
+	if a.bootID != "b1" || !a.bootTime.IsZero() {
+		t.Fatalf("bootID %q, bootTime %v; want b1 and the zero time", a.bootID, a.bootTime)
+	}
+
+	stat := filepath.Join(fs.Proc, "stat")
+	read := func() bool {
+		_, err := a.fs.ReadCPU()
+		return a.collected("cpu", err)
+	}
+	logs.Reset()
+	if read() || read() || read() {
+		t.Fatal("reading a missing /proc/stat succeeded")
+	}
+	if n := strings.Count(logs.String(), "read cpu"); n != 1 {
+		t.Fatalf("%d log lines for three failures, want 1:\n%s", n, &logs)
+	}
+	os.WriteFile(stat, []byte("cpu  1 2 3 4 5 6 7 8 9 10\nbtime 1700000000\n"), 0o644)
+	if !read() || !read() {
+		t.Fatal("reading /proc/stat failed")
+	}
+	if n := strings.Count(logs.String(), "readable again"); n != 1 {
+		t.Fatalf("%d recovery lines, want 1:\n%s", n, &logs)
+	}
+	os.Remove(stat)
+	read()
+	if n := strings.Count(logs.String(), "not reported until"); n != 2 {
+		t.Fatalf("a second outage logged %d failure lines in total, want 2:\n%s", n, &logs)
+	}
+
+	// Without the boot id traffic accounting cannot work: that is fatal.
+	if err := (&Agent{fs: collect.FS{Proc: t.TempDir()}, log: a.log}).readBoot(); err == nil {
+		t.Fatal("readBoot without a boot id succeeded")
+	}
 }

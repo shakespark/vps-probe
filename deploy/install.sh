@@ -140,6 +140,31 @@ agent_icmp() {
 	fi
 }
 
+# In an LXC container lxcfs puts the container's own figures over
+# /proc/meminfo, /proc/stat, /proc/uptime and others. ProtectProc,
+# ProtectKernelTunables and ProtectControlGroups each give the service a new
+# /proc without them, and the agent would report the host's memory and CPU.
+# Binding the files back in (BindReadOnlyPaths) keeps the unit from starting
+# at all once lxcfs has died, so these three are turned off instead. The agent
+# stays an unprivileged user with no capabilities to write there.
+agent_lxcfs() {
+	dropin=$UNITS/$NAME.service.d/lxcfs.conf
+	if ! grep -q ' fuse\.lxcfs ' /proc/mounts 2>/dev/null; then
+		rm -f "$dropin"
+		return
+	fi
+	[ -f "$dropin" ] || say "LXC container (lxcfs): keeping the container's /proc for $NAME via $dropin"
+	install -d -m 0755 "$UNITS/$NAME.service.d"
+	cat >"$dropin" <<-'EOF'
+		[Service]
+		# A new /proc would show the host's memory and CPU instead of this
+		# container's (lxcfs).
+		ProtectProc=default
+		ProtectKernelTunables=no
+		ProtectControlGroups=no
+	EOF
+}
+
 start() {
 	systemctl daemon-reload
 	systemctl enable "$NAME" >/dev/null 2>&1
@@ -188,6 +213,7 @@ cmd_install() {
 	install_binary
 	install_unit
 	[ "$NAME" != vps-probe-agent ] || agent_icmp
+	[ "$NAME" != vps-probe-agent ] || agent_lxcfs
 	if ! install_config "$cfg"; then
 		systemctl daemon-reload
 		say "edit $CONF, then run: $0 $ROLE"

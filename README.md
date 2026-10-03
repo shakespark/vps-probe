@@ -19,7 +19,7 @@
 - **时延**：节点两两互 ping 的矩阵、每条链路的历史曲线（按丢包着色）和 24 小时 / 7 天 / 30 天可用率；还能测经隧道（端口转发、VPN）的时延。
 - **告警**：离线、CPU / 内存 / 磁盘、链路丢包、流量配额档位、到期提醒、上报 IP 变化；**DDoS 识别**（入站远大于出站，附包速率和其他节点到它的丢包作为证据）和被利用对外攻击的识别。Telegram 和任意 webhook（Bark、ntfy、Discord、Server 酱……）。
 - **部署**：服务端一个程序加一个 SQLite 文件，迁移只要两个文件；agent 一个 5 MB 的静态程序，普通用户运行。一条命令加节点，一条命令在 VPS 上装好 agent。
-- 深色 / 浅色自适应，手机可用。只支持 Linux + systemd（amd64 / arm64）。在 KVM 的 VPS 上长期运行过；OpenVZ / LXC 容器有网卡识别的兜底，但还没有在真机上验证。
+- 深色 / 浅色自适应，手机可用。只支持 Linux + systemd（amd64 / arm64）。在 KVM 的 VPS 上长期运行过；LXC 容器从 0.1.21 起支持（在 Proxmox 的 LXC 上实测过）；OpenVZ 只有网卡识别的兜底，还没有在真机上验证。
 
 ## 安全模型
 
@@ -85,7 +85,7 @@
 从 [GitHub Releases](https://github.com/shakespark/vps-probe/releases) 下载，连同同一版本的 `.sha256` 和 `.sha256.sig`：
 
 ```sh
-V=0.1.20
+V=0.1.21
 B=https://github.com/shakespark/vps-probe/releases/download/v$V
 curl -fLO $B/vps-probe-$V-linux-amd64.tar.gz -fLO $B/vps-probe-$V.sha256 -fLO $B/vps-probe-$V.sha256.sig
 ```
@@ -284,6 +284,7 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
 无论哪种方式，生成的都只是一个本地配置文件：**agent 不会从服务端拉取任何东西**。
 
 - 如果系统的 `net.ipv4.ping_group_range` 不允许普通用户 ping，`install.sh` 会只给 agent 服务加 `CAP_NET_RAW`（`/etc/systemd/system/vps-probe-agent.service.d/icmp.conf`），不改系统设置。
+- LXC 容器（agent ≥ 0.1.21）：`install.sh` 会给 agent 服务加一个 drop-in（`vps-probe-agent.service.d/lxcfs.conf`），关掉三项会换掉 `/proc` 的沙箱设置，否则上报的是宿主机的内存和 CPU。负载和 CPU 使用率以容器里 `uptime`、`vmstat` 看到的为准，很多商家的容器里它们反映的是整台宿主机或整个 CPU 核。宿主机的 lxcfs 出故障时（容器里 `free` 报 `Transport endpoint is not connected`），agent 照常上报流量、磁盘和时延，CPU、内存、负载显示「—」，重启容器即可恢复。从 0.1.18–0.1.20 升级的 LXC 节点，升级那一次会把容器启动以来的流量多计一遍，介意就先重启容器再升级。
 - 默认自动识别物理网卡（有 `/sys/class/net/<网卡>/device` 的）；OpenVZ、LXC 这类没有物理网卡的容器，改为统计默认路由所在的网卡（agent ≥ 0.1.18）。有两块以上物理网卡时只统计带默认路由的那几块，内网网卡不计入（agent ≥ 0.1.20）；默认路由走隧道（WireGuard、WARP 等）的机器仍然统计全部物理网卡。想自己指定就在 agent.yml 里写 `interfaces: [eth0]`：比如第二块网卡也走公网计费流量、但上面没有默认路由。
 - 某些节点之间不想互 ping：在其中一方写 `no_ping: [对方 id, ...]`（双向生效），然后给涉及的节点重新生成 agent.yml 并安装。
 - 测经隧道的时延：在发起探测的节点下写 `extra_peers`，再重新生成它的 agent.yml。

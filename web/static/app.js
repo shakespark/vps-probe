@@ -491,7 +491,7 @@ function nodeTable(nodes, newest) {
         text: t ? `↓ ${fmtBytes(t.rx)} ↑ ${fmtBytes(t.tx)}` + (quota != null ? ` · ${fmtPct(quota, 0)}` : '') : '—' }),
       h('td', { class: 'num', text: s.load1 != null ? s.load1.toFixed(2) : '—' }),
       h('td', { class: 'num', text: s.tcp != null ? `${s.tcp} / ${s.udp}` : '—', title: connText(s) || null }),
-      h('td', { class: 'num', text: s.sys ? fmtDur(nowSec() - s.sys.boot_time) : '—' }),
+      h('td', { class: 'num', text: s.sys && s.sys.boot_time ? fmtDur(nowSec() - s.sys.boot_time) : '—' }),
       h('td', { class: 'num' + (expiryClass(n.expire_days) ? ' ' + expiryClass(n.expire_days) : ''),
         text: n.expire_at ? fmtExpiry(n.expire_days) : '—', title: n.expire_at ? [n.expire_at, n.price].filter(Boolean).join(' · ') : null }));
     return tr;
@@ -572,7 +572,7 @@ function nodeCard(n, newest, sp) {
 
   const sys = s.sys;
   card.append(h('div', { class: 'card-sub muted', text: sys
-    ? [sys.os, sys.arch, sys.cores ? sys.cores + ' 核' : null, '运行 ' + fmtDur(nowSec() - sys.boot_time)]
+    ? [sys.os, sys.arch, sys.cores ? sys.cores + ' 核' : null, sys.boot_time ? '运行 ' + fmtDur(nowSec() - sys.boot_time) : null]
       .filter(Boolean).join(' · ')
     : '—' }));
   if (sp) card.append(cardSparks(sp));

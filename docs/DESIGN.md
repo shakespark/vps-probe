@@ -13,7 +13,7 @@
 | F3 | 告警 | 资源阈值、离线、时延/丢包、流量配额，通过 Telegram 推送 |
 | F4 | 月流量统计 | 物理网口收/发总量，按周期（默认自然月，可配置账单日）累计，**重启不丢数据** |
 
-规模：≤10 台 Linux VPS（KVM 等完整虚拟化，无容器型）。
+规模：≤10 台 Linux VPS，以 KVM 等完整虚拟化为主。LXC 容器从 0.1.21 起支持（§5.7，在 Proxmox 的 LXC 上实测过）；OpenVZ 只有网卡识别的兜底（§4.1），没有在真机上验证。
 
 ## 1. 安全原则（硬性约束）
 
@@ -116,7 +116,7 @@
    - `boot_id` 相同且 `cur >= last` → `delta = cur - last`
    - `boot_id` 相同但 `cur < last`（驱动重载/网卡重建导致计数器归零）→ `delta = cur`
 3. 把 `delta` 累加到**当前时间所属周期**，更新 `last = cur`、`boot_id`。
-4. 首次见到某块网卡（首次安装，或新加入统计的网卡）时没有历史读数：若本次开机时间晚于当前周期起点，开机以来的流量全部属于本周期，`delta = cur`；否则无法判断其中有多少属于本周期，只记录基线、不计入。
+4. 首次见到某块网卡（首次安装，或新加入统计的网卡）时没有历史读数：若本次开机时间晚于当前周期起点，开机以来的流量全部属于本周期，`delta = cur`；否则无法判断其中有多少属于本周期，只记录基线、不计入。开机时间取「当前时间 − `/proc/uptime`」，读不到 uptime 时取 `/proc/stat` 的 `btime`；两个都读不到（§5.7 的 lxcfs 失效）按「无法判断」处理，只记录基线（agent ≥ 0.1.21，之前只用 `btime`，读不到就拒绝启动）。普通机器上两种取法相等；LXC 容器里 `btime` 是宿主机的开机时间，而网卡计数器是从容器启动时开始的，所以要用 uptime。
 5. 落盘：每 30s 一次 + 收到 SIGTERM 时一次。写法为写临时文件 → fsync → rename → fsync 目录，保证不会写出半个文件。
 6. 周期记录保留最近 24 个。
 7. 状态文件损坏（无法解析）时，将其改名为 `traffic.json.corrupt-<时间>` 保留现场，按首次运行处理并记录错误日志。
@@ -164,6 +164,8 @@
 | 时延 | 每个 peer 的 sent/lost/min/avg/max/jitter | ICMP，或 UDP DNS 查询 / 隧道回显 | 每秒 1 包，10s 汇总 |
 
 CPU steal 单独记录，便于发现超售的机器。
+
+**读不到就不报，不退出**：CPU、负载、内存、连接数任何一项读取失败，这一项在本次上报里留空，其余照常上报；页面上对应位置显示「—」。同一项连续失败只在第一次记一条错误日志，恢复时再记一条，不会每 10 秒刷一条（agent ≥ 0.1.21）。启动时唯一不能缺的是 `boot_id`（流量统计靠它识别重启）；开机时间读不到时带着「未知」启动（§4.2 第 4 条），上报的 `boot_time` 为 0，页面的运行时间显示「—」。
 
 软中断（softirq）主要是内核处理网络收发包的时间，是 CPU 使用率的一部分、不是额外的；包速率来自 `/proc/net/dev` 的 rx/tx packets。两者用来识别「包多流量小」的攻击（SYN flood、小包 UDP flood）：字节速率不高，但包速率和软中断很高，入站平均包长很小（SYN 约 60 字节）。从 agent 0.1.14 起上报，protobuf 里是 `optional` 字段——0 包/秒、0% 软中断都是正常值，不能像线程数那样用 0 表示「旧 agent」；旧 agent 的这些列为 NULL，页面上不显示包速率图。
 
@@ -279,11 +281,29 @@ ping:
 
 - `User=vps-probe`，`StateDirectory=vps-probe`（mode 0700），`UMask=0077`。
 - `CapabilityBoundingSet=` 为空；ICMP 走非特权 datagram socket。主机不允许时改为 `CAP_NET_RAW`。
-- `ProtectSystem=strict`、`ProtectHome=read-only`（不能用 `yes`，否则对 /home 下挂载点做 statfs 时，得到的是遮盖用的空 tmpfs 的数据）、`PrivateTmp`、`PrivateDevices`、`ProtectProc=invisible`、`ProtectKernel*`、`ProtectClock`、`ProtectHostname`。
+- `ProtectSystem=strict`、`ProtectHome=read-only`（不能用 `yes`，否则对 /home 下挂载点做 statfs 时，得到的是遮盖用的空 tmpfs 的数据）、`PrivateTmp`、`PrivateDevices`、`ProtectProc=invisible`、`ProtectKernel*`、`ProtectClock`、`ProtectHostname`。其中 `ProtectProc`、`ProtectKernelTunables`、`ProtectControlGroups` 在 LXC 容器里由 `install.sh` 关掉，原因见 §5.7。
 - `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`、`RestrictNamespaces`、`MemoryDenyWriteExecute`、`SystemCallFilter=@system-service`、`MemoryMax=64M`。
 - **不能加 `PrivateNetwork`**：`/proc/net/dev` 按网络命名空间隔离，加了之后只能看到 `lo`。
 - 不能加 `ProcSubset=pid`：它会隐藏 `/proc/stat`、`/proc/meminfo`。
 - `TimeoutStopSec=15`：留出退出前最后一次读数和落盘的时间。
+
+### 5.7 LXC 容器（agent ≥ 0.1.21）
+
+LXC 容器和宿主机共用内核，`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/loadavg`、`/proc/cpuinfo` 默认是宿主机的数据；宿主机上的 lxcfs（一个 FUSE 文件系统）把容器自己的数据逐个文件盖在这些路径上，容器里的 `free`、`top` 才显示得对。
+
+**问题一：沙箱把 lxcfs 盖的那一层丢了。** `ProtectProc`、`ProtectKernelTunables`、`ProtectControlGroups` 三项中任何一项都会让 systemd 给服务挂一个全新的 `/proc`，上面没有 lxcfs 的文件。0.1.20 及之前的 agent 在 LXC 里上报的是宿主机的内存、CPU 和开机时间（实测：1 GiB 的容器报成 504 GiB）。
+
+做法：`install.sh` 发现 `/proc/mounts` 里有 `fuse.lxcfs` 时，写一个 drop-in `vps-probe-agent.service.d/lxcfs.conf`，把这三项关掉（`ProtectProc=default`、`ProtectKernelTunables=no`、`ProtectControlGroups=no`），服务用容器原本的 `/proc`。不是 LXC 的机器没有这个文件，单元不变；`--upgrade` 也会走这一步，所以旧节点升级后就修好了。
+
+- 代价：只在 LXC 里，agent 能看到别的进程在 `/proc` 下的条目（和任何普通用户一样），`/proc/sys`、cgroup 不再被额外挂成只读。agent 仍是没有任何 capability 的普通用户，本来就写不了这些地方，实测写入都是 Permission denied；其余加固项不变。
+- 没有采用的做法：保留三项，用 `BindReadOnlyPaths=-/proc/meminfo …` 把 lxcfs 的文件绑回沙箱。lxcfs 正常时可行，但 lxcfs 失效后这些文件连 stat 都报错，systemd 建沙箱失败（`226/NAMESPACE`），服务完全起不来（在 systemd 252 上用失效的 FUSE 文件实测）；前缀 `-` 只忽略「不存在」，不忽略这种错误。
+- 手工安装（不用 `install.sh`）的 LXC 节点要自己加这个 drop-in。
+
+**问题二：lxcfs 失效。** 宿主机的 lxcfs 进程崩溃或被重启后，容器里这几个文件一读就报 `Transport endpoint is not connected`，直到容器重启；容器自带的 `free`、`uptime` 同样报错。这时 agent 照常启动和运行，只是 CPU、负载、内存留空（§5.1），流量、磁盘、连接数、时延不受影响。
+
+**修不了的**：lxcfs 给什么 agent 就报什么。Proxmox 默认不虚拟化负载，容器里看到的 load 是宿主机的；`/proc/stat` 给的是容器所在 CPU 核的数据，同一个核上别的租户的占用也算在里面。这和容器里 `uptime`、`vmstat` 看到的一致。
+
+**升级时的一次性多计**：0.1.18–0.1.20 的 agent 在 LXC 里读到的是宿主机的 `boot_id`，升级后读到的是容器自己的，流量统计会当成一次重启，把容器启动以来的流量再计一遍。只发生在升级的那一次；介意的话先重启容器再升级（计数器归零，多计的量接近 0）。
 
 ## 6. 服务端设计
 
@@ -642,6 +662,7 @@ docs/
 - ingest：未知节点、解密失败、畸形 protobuf、`ts` 越界，均需静默丢弃；重复报文的幂等性。
 - agent 发送器：ACK 移出队列、超时重发、服务端离线时只发探测包、队列上限。
 - 告警状态机：pending/firing/恢复/重复提醒、服务端启动静默期。
+- agent 降级：没有 `/proc/stat` 和 `/proc/uptime` 时能启动、开机时间为未知；采集项连续失败只记一条日志、恢复记一条；开机时间优先取 uptime、其次 `btime`。
 - 端到端：本地启动 server + 2 个 agent（peer 互指 127.0.0.1），跑通整条链路。
 
 ## 11. 里程碑

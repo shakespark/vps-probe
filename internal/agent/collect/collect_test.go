@@ -330,3 +330,21 @@ func TestHostReads(t *testing.T) {
 		t.Fatalf("load = %+v, %v", l, err)
 	}
 }
+
+// In an LXC container btime is the host's boot and the uptime the
+// container's: the uptime wins, btime is the fallback.
+func TestSystemStart(t *testing.T) {
+	fs := FS{Proc: t.TempDir()}
+	now := time.Unix(1800000000, 500)
+	if _, err := fs.SystemStart(now); err == nil {
+		t.Fatal("start time without /proc/uptime and /proc/stat")
+	}
+	os.WriteFile(filepath.Join(fs.Proc, "stat"), []byte("cpu  1 2 3 4 5 6 7 8 9 10\nbtime 1700000000\n"), 0o644)
+	if st, err := fs.SystemStart(now); err != nil || !st.Equal(time.Unix(1700000000, 0)) {
+		t.Fatalf("from btime = %v, %v", st, err)
+	}
+	os.WriteFile(filepath.Join(fs.Proc, "uptime"), []byte("728.25 728.25\n"), 0o644)
+	if st, err := fs.SystemStart(now); err != nil || !st.Equal(time.Unix(1800000000-728, 0)) {
+		t.Fatalf("from uptime = %v, %v", st, err)
+	}
+}

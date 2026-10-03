@@ -120,6 +120,18 @@ func (f FS) BootTime() (time.Time, error) {
 	return time.Time{}, errors.New("collect: btime not found in /proc/stat")
 }
 
+// SystemStart is when this system started: now minus /proc/uptime, or btime
+// when the uptime cannot be read. On a real or fully virtualized machine the
+// two agree. In an LXC container lxcfs reports the container's uptime and
+// leaves btime as the host's boot, and the interface counters start with the
+// container, so the uptime is the one that says since when they count.
+func (f FS) SystemStart(now time.Time) (time.Time, error) {
+	if up, err := f.Uptime(); err == nil {
+		return now.Truncate(time.Second).Add(-time.Duration(up) * time.Second), nil
+	}
+	return f.BootTime()
+}
+
 // BootID identifies the current boot; it changes on every reboot.
 func (f FS) BootID() (string, error) {
 	data, err := f.read(f.Proc, "sys", "kernel", "random", "boot_id")
@@ -468,7 +480,7 @@ func (f FS) ReadSysInfo() SysInfo {
 		s.Kernel = strings.TrimSpace(string(data))
 	}
 	s.OS = f.osPrettyName()
-	s.BootTime, _ = f.BootTime()
+	s.BootTime, _ = f.SystemStart(time.Now())
 	s.Uptime, _ = f.Uptime()
 	return s
 }

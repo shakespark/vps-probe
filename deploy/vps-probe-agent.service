@@ -30,6 +30,9 @@ ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
 PrivateDevices=yes
+# These three mount a new /proc. In an LXC container that loses the lxcfs
+# overlay and the agent would see the host's memory and CPU, so install.sh
+# turns them off there (service.d/lxcfs.conf).
 ProtectProc=invisible
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

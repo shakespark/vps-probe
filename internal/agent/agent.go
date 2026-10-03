@@ -55,6 +55,8 @@ type Agent struct {
 	ifacesAt time.Time
 	lastDisk time.Time
 	lastSys  time.Time
+
+	failing map[string]bool // collectors whose last read failed
 }
 
 // New prepares an agent. In dryRun mode the traffic state is loaded
@@ -62,13 +64,10 @@ type Agent struct {
 func New(cfg *config.Config, sink Sink, version string, dryRun bool, log *slog.Logger) (*Agent, error) {
 	a := &Agent{cfg: cfg, log: log, fs: collect.Host, sink: sink, version: version}
 
+	if err := a.readBoot(); err != nil {
+		return nil, err
+	}
 	var err error
-	if a.bootID, err = a.fs.BootID(); err != nil {
-		return nil, err
-	}
-	if a.bootTime, err = a.fs.BootTime(); err != nil {
-		return nil, err
-	}
 	statePath := filepath.Join(cfg.StateDir, stateFile)
 	reset := traffic.Reset{Day: cfg.Traffic.ResetDay, Hour: cfg.Traffic.ResetHour, Minute: cfg.Traffic.ResetMinute}
 	if dryRun {
@@ -102,6 +101,45 @@ func New(cfg *config.Config, sink Sink, version string, dryRun bool, log *slog.L
 		return nil, err
 	}
 	return a, nil
+}
+
+// readBoot identifies the current boot. The boot id is required: traffic
+// accounting cannot tell a reboot without it. The boot time is not. In a
+// container whose lxcfs has died neither /proc/uptime nor /proc/stat can be
+// read; the time stays
+// zero, which traffic accounting takes as "unknown" (a new interface is then
+// not counted since boot), and everything that can still be read is reported.
+func (a *Agent) readBoot() error {
+	var err error
+	if a.bootID, err = a.fs.BootID(); err != nil {
+		return err
+	}
+	if a.bootTime, err = a.fs.SystemStart(time.Now()); err != nil {
+		a.bootTime = time.Time{}
+		a.log.Warn("boot time unknown: starting without it", "err", err)
+	}
+	return nil
+}
+
+// collected logs a collector's failure once, and its recovery: a source that
+// stays unreadable (the files lxcfs provides, once lxcfs has died) would
+// otherwise log at every sample. It reports whether the read succeeded.
+func (a *Agent) collected(what string, err error) bool {
+	if err != nil {
+		if !a.failing[what] {
+			if a.failing == nil {
+				a.failing = map[string]bool{}
+			}
+			a.failing[what] = true
+			a.log.Error("read "+what+": not reported until it can be read again", "err", err)
+		}
+		return false
+	}
+	if a.failing[what] {
+		delete(a.failing, what)
+		a.log.Info("read " + what + ": readable again")
+	}
+	return true
 }
 
 // Run samples on interval boundaries until ctx is done, then records final
@@ -273,9 +311,7 @@ func (a *Agent) tick(ts time.Time) {
 		})
 	}
 
-	if c, err := a.fs.ReadCPU(); err != nil {
-		a.log.Error("read cpu", "err", err)
-	} else {
+	if c, err := a.fs.ReadCPU(); a.collected("cpu", err) {
 		if a.havePrevC {
 			if p, ok := collect.CPUUsage(a.prevCPU, c); ok {
 				softirq := float32(p.SoftIRQ)
@@ -284,19 +320,13 @@ func (a *Agent) tick(ts time.Time) {
 		}
 		a.prevCPU, a.havePrevC = c, true
 	}
-	if l, err := a.fs.ReadLoad(); err != nil {
-		a.log.Error("read load", "err", err)
-	} else {
+	if l, err := a.fs.ReadLoad(); a.collected("load", err) {
 		rep.Load = &pb.Load{L1: float32(l.L1), L5: float32(l.L5), L15: float32(l.L15), Threads: l.Threads}
 	}
-	if m, err := a.fs.ReadMem(); err != nil {
-		a.log.Error("read memory", "err", err)
-	} else {
+	if m, err := a.fs.ReadMem(); a.collected("memory", err) {
 		rep.Mem = &pb.Mem{Total: m.Total, Used: m.Used, SwapTotal: m.SwapTotal, SwapUsed: m.SwapUsed}
 	}
-	if k, err := a.fs.ReadSockets(); err != nil {
-		a.log.Error("read sockets", "err", err)
-	} else {
+	if k, err := a.fs.ReadSockets(); a.collected("sockets", err) {
 		rep.Sockets = &pb.Sockets{Tcp: k.TCP, Udp: k.UDP, TcpTw: k.TCPTimeWait}
 	}
 
@@ -316,8 +346,12 @@ func (a *Agent) tick(ts time.Time) {
 	if a.lastSys.IsZero() || now.Sub(a.lastSys) >= sysEvery {
 		a.lastSys = now
 		s := a.fs.ReadSysInfo()
+		var boot int64 // 0 = unknown; the zero time's Unix() is not 0
+		if !s.BootTime.IsZero() {
+			boot = s.BootTime.Unix()
+		}
 		rep.Sys = &pb.SysInfo{Hostname: s.Hostname, Os: s.OS, Kernel: s.Kernel, Arch: s.Arch,
-			Cores: uint32(s.Cores), BootTime: s.BootTime.Unix(), Uptime: s.Uptime, AgentVersion: a.version}
+			Cores: uint32(s.Cores), BootTime: boot, Uptime: s.Uptime, AgentVersion: a.version}
 	}
 
 	if a.pinger != nil {
