@@ -558,8 +558,11 @@ deploy/
   echo.example.yml
   cloudflared.example.yml   本地配置方式的隧道示例
   install.sh              安装 / 升级 / 卸载（agent、server、echo）
+  release-signers         发布签名公钥（§13）
 VERSION                   版本号；`make dist` 生成发布包
 scripts/third_party_licenses.sh   生成 THIRD_PARTY_LICENSES（`make licenses`，`make dist` 时自动执行）
+scripts/release.sh        核对 CI 构建的草稿 Release，签名并发布（`make release-verify` / `make release-sign`，§13）
+.github/workflows/release.yml   推送 tag 后测试、构建、建草稿 Release（§13）
 LICENSE                   Apache-2.0
 NOTICE                    版权声明及所含 Apache-2.0 组件的 NOTICE
 docs/
@@ -592,3 +595,42 @@ docs/
 - 容器型 VPS（OpenVZ/LXC 的 venet 网卡识别）
 - 多用户 / 权限体系（依赖 CF Access）
 - agent 自动更新（安全原则 2）
+
+## 13. 发布与签名
+
+目标：用户能确认下载的发布包是这个仓库某个 tag 的源码构建出来的，并且经维护者确认；GitHub 账号或 CI 被攻破，也发不出能通过验证的包。
+
+### 13.1 流程
+
+1. 维护者改 `VERSION`、提交，打 tag `v<VERSION>` 并推送。
+2. GitHub Actions（`.github/workflows/release.yml`）：检查 tag 与 `VERSION` 一致 → `make test` → `make dist` → 检查提交的 `THIRD_PARTY_LICENSES` 是最新的 → 建一个**草稿** Release，上传两个 tar.gz 和 `vps-probe-<版本>.sha256`。草稿对外不可见。CI 不持有任何签名密钥。
+3. 维护者在自己电脑上 `make release-sign`：
+   - 下载草稿里的文件，用 `.sha256` 核对；
+   - 在临时 worktree 里检出同一个 tag（先确认本地 tag 和 GitHub 上的指向同一个 commit），重新 `make dist`，逐个比较 tar 包：文件列表、权限、属主、mtime 和每个文件的字节都要一致；
+   - 用离线签名密钥 `ssh-keygen -Y sign -n vps-probe-release` 签 `.sha256`，得到 `.sha256.sig`，再用仓库里的 `deploy/release-signers` 验一遍；
+   - 上传 `.sig`，把草稿改为正式发布。
+
+   只核对、不签名：`make release-verify`。
+4. 用户：用 README 给出的公钥 `ssh-keygen -Y verify` 验 `.sha256`，再 `sha256sum -c` 验 tar 包。OpenSSH ≥ 8.1 自带（Debian 11、Ubuntu 20.04 起），不需要装别的工具。
+
+签名对象是 `.sha256` 而不是各个 tar 包：一个签名覆盖整个版本，`.sha256` 里每个 tar 包的哈希又覆盖包内所有文件。
+
+### 13.2 可复现构建
+
+本地重建能和 CI 产物逐字节一致，靠这些约定（`Makefile`）：
+
+- 工具链：`GOTOOLCHAIN` 取 go.mod 的 `toolchain` 行，本机 Go 版本不同时自动下载那个版本（经 Go checksum 数据库校验）。Debian 打包的 Go 与官方同版本的构建结果一致（已验证）。
+- `CGO_ENABLED=0`、`-trimpath`、`-buildvcs=false`。VCS 信息取决于检出方式（worktree、浅克隆），会让同一份源码产出不同的二进制；版本号已经由 `-X main.version` 写入，对应的 commit 就是 tag 指向的 commit。
+- tar：`--sort=name`、属主 0/0、权限归一（目录和可执行文件 0755，其余 0644）、mtime 统一为该 commit 的提交时间（`SOURCE_DATE_EPOCH`）；`gzip -n` 不写文件名和时间戳；`LC_ALL=C` 固定排序。
+
+### 13.3 密钥
+
+- 专用 ed25519 SSH 密钥，只存在维护者电脑上（`~/.ssh/vps-probe-release`，0600，无口令，以便发布流程无人值守），备份在维护者的密码管理器里；不进 CI，不进 GitHub，和登录 GitHub 的密钥分开。电脑损坏时从备份恢复即可继续发布。
+- 公钥在 `deploy/release-signers`（OpenSSH allowed_signers 格式，限定 namespace `vps-probe-release`）和 README。namespace 让这把密钥的签名不能被挪作他用（比如冒充 git commit 签名）。
+- 换密钥：把新公钥加进 `release-signers`（旧的保留，旧版本的签名仍能用旧公钥验证），在 README 和发布说明里写明更换。没有自动化的轮换流程。
+
+### 13.4 不防什么
+
+- 维护者电脑被攻破：攻击者可以签任何东西。
+- 用户拿到的公钥本身是假的：公钥要从 GitHub 仓库或 README 获取，以后升级沿用同一个。
+- CI 的 workflow 固定 action 的 commit SHA、不用缓存、checkout 不保存凭据，降低被供应链污染的机会；即使 CI 产物被篡改，也会在第 3 步的比对里暴露。

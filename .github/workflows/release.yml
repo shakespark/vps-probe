@@ -1,0 +1,68 @@
+# Builds a pushed tag v<VERSION> into a draft GitHub release. CI holds no
+# signing key: the maintainer checks the draft against a local rebuild,
+# signs it and publishes it with `make release-sign` (docs/DESIGN.md §13).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  draft:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the draft release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Any recent Go will do: the Makefile pins the exact toolchain from
+      # go.mod's toolchain line.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Tag matches VERSION
+        run: |
+          if [ "$GITHUB_REF_NAME" != "v$(cat VERSION)" ]; then
+            echo "tag $GITHUB_REF_NAME does not match VERSION $(cat VERSION)" >&2
+            exit 1
+          fi
+
+      - run: make test
+
+      - run: make dist
+
+      - name: THIRD_PARTY_LICENSES is up to date
+        run: git diff --exit-code THIRD_PARTY_LICENSES
+
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          v=$(cat VERSION)
+          {
+            git log -1 --format='%s%n%n%b' | grep -v '^Co-Authored-By:'
+            cat <<EOF
+
+          ## 校验
+
+          用 README 里的发布公钥验证签名，再核对 tar 包：
+
+          \`\`\`sh
+          ssh-keygen -Y verify -f release-signers -I shakespark -n vps-probe-release \\
+              -s vps-probe-$v.sha256.sig < vps-probe-$v.sha256
+          sha256sum -c --ignore-missing vps-probe-$v.sha256
+          \`\`\`
+          EOF
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+            --title "vps-probe $v" --notes-file notes.md \
+            "dist/vps-probe-$v-linux-amd64.tar.gz" \
+            "dist/vps-probe-$v-linux-arm64.tar.gz" \
+            "dist/vps-probe-$v.sha256"

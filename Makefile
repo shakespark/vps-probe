@@ -2,19 +2,28 @@ VERSION ?= $(shell cat VERSION)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 ARCHES := amd64 arm64
 
-.PHONY: all build test proto dist licenses clean
+# Reproducible releases (docs/DESIGN.md §13.2): the exact Go release from
+# go.mod's toolchain line (downloaded if the local one differs), no VCS
+# stamping, and tarballs with fixed order, owners, modes and mtime (the
+# commit's time), so a rebuild of a tag matches the CI artifacts byte for byte.
+export GOTOOLCHAIN := $(shell sed -n 's/^toolchain //p' go.mod)
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct)
+TAR := tar --sort=name --format=gnu --owner=0 --group=0 --numeric-owner \
+	--mode=u=rwX,go=rX --mtime=@$(SOURCE_DATE_EPOCH)
+
+.PHONY: all build test proto dist licenses release-verify release-sign clean
 
 all: test build
 
 build:
 	@for arch in $(ARCHES); do for cmd in vps-probe-agent vps-probe-server vps-probe-echo; do \
 		echo "build $$cmd linux/$$arch"; \
-		CGO_ENABLED=0 GOOS=linux GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" \
+		CGO_ENABLED=0 GOOS=linux GOARCH=$$arch go build -trimpath -buildvcs=false -ldflags "$(LDFLAGS)" \
 			-o dist/$$cmd-linux-$$arch ./cmd/$$cmd || exit 1; \
 	done; done
 
 # Release tarballs: dist/vps-probe-$(VERSION)-linux-<arch>.tar.gz, each with
-# both binaries, install.sh, systemd units, example configs and the license
+# the three binaries, install.sh, systemd units, example configs and the license
 # files.
 dist: build licenses
 	@for arch in $(ARCHES); do \
@@ -27,8 +36,8 @@ dist: build licenses
 		cp deploy/*.service $$d/systemd/; \
 		cp deploy/agent.example.yml deploy/server.example.yml deploy/echo.example.yml deploy/cloudflared.example.yml $$d/examples/; \
 		cp README.md LICENSE NOTICE THIRD_PARTY_LICENSES $$d/; \
-		(cd $$d && sha256sum bin/* install.sh systemd/* examples/* README.md LICENSE NOTICE THIRD_PARTY_LICENSES > SHA256SUMS); \
-		tar -C dist -czf $$d.tar.gz --owner=0 --group=0 vps-probe-$(VERSION)-linux-$$arch; \
+		(cd $$d && LC_ALL=C sha256sum bin/* install.sh systemd/* examples/* README.md LICENSE NOTICE THIRD_PARTY_LICENSES > SHA256SUMS); \
+		LC_ALL=C $(TAR) -C dist -cf $$d.tar vps-probe-$(VERSION)-linux-$$arch && gzip -9nf $$d.tar || exit 1; \
 		rm -rf $$d; \
 		echo "dist: $$d.tar.gz"; \
 	done
@@ -38,6 +47,15 @@ dist: build licenses
 # vendored web libraries. Commit it after dependency changes.
 licenses:
 	ARCHES="$(ARCHES)" ./scripts/third_party_licenses.sh
+
+# Check the draft GitHub release CI built for v$(VERSION) against a local
+# rebuild of the tag; release-sign then signs it with the offline key and
+# publishes it (docs/DESIGN.md §13.1).
+release-verify:
+	VERSION=$(VERSION) ./scripts/release.sh verify
+
+release-sign:
+	VERSION=$(VERSION) ./scripts/release.sh sign
 
 test:
 	go vet ./...

@@ -1,0 +1,6 @@
+# Release signing keys for vps-probe (OpenSSH allowed_signers format).
+# Verify a release with:
+#   ssh-keygen -Y verify -f release-signers -I shakespark -n vps-probe-release \
+#       -s vps-probe-<version>.sha256.sig < vps-probe-<version>.sha256
+# Key fingerprint: SHA256:58Ji7UsUqJ+HoARS8RJsg88YH+M1bhivbOcJSXY/0Dg
+shakespark namespaces="vps-probe-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINDQDD9r2Mz+c1/6CsxfhDCaC36NKng8VLjgct61j567

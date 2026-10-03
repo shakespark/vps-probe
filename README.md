@@ -10,23 +10,48 @@
 
 下文命令都以 root 执行。
 
-## 1. 构建发布包
+## 1. 获取发布包
 
-需要 Go 1.24+，在自己的电脑上：
+每个发布包都包含三个程序、`install.sh`、systemd 服务文件、示例配置和许可证文件；同一个包既能装服务端也能装 agent。VPS 是 ARM 的就用 arm64 包（`uname -m` 显示 `aarch64`）。
+
+从 [GitHub Releases](https://github.com/shakespark/vps-probe/releases) 下载，连同同一版本的 `.sha256` 和 `.sha256.sig`：
+
+```sh
+V=0.1.15
+B=https://github.com/shakespark/vps-probe/releases/download/v$V
+curl -fLO $B/vps-probe-$V-linux-amd64.tar.gz -fLO $B/vps-probe-$V.sha256 -fLO $B/vps-probe-$V.sha256.sig
+```
+
+**验证签名。** 每个版本都由维护者用离线密钥签名（CI 不持有密钥，见 [docs/DESIGN.md](docs/DESIGN.md) §13）。发布公钥（指纹 `SHA256:58Ji7UsUqJ+HoARS8RJsg88YH+M1bhivbOcJSXY/0Dg`）：
+
+```
+shakespark namespaces="vps-probe-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINDQDD9r2Mz+c1/6CsxfhDCaC36NKng8VLjgct61j567
+```
+
+```sh
+echo 'shakespark namespaces="vps-probe-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINDQDD9r2Mz+c1/6CsxfhDCaC36NKng8VLjgct61j567' > release-signers
+ssh-keygen -Y verify -f release-signers -I shakespark -n vps-probe-release \
+    -s vps-probe-$V.sha256.sig < vps-probe-$V.sha256    # 应输出 Good "vps-probe-release" signature
+sha256sum -c --ignore-missing vps-probe-$V.sha256      # 应输出 OK
+```
+
+公钥以本仓库的 `deploy/release-signers` 为准，以后升级沿用同一个。需要 OpenSSH ≥ 8.1（Debian 11、Ubuntu 20.04 起自带）。
+
+**自己构建**也可以，需要 Go 1.24+：
 
 ```sh
 make test     # go vet + 单元测试
 make dist     # dist/vps-probe-<版本>-linux-{amd64,arm64}.tar.gz 及 .sha256
 ```
 
-版本号在 `VERSION` 文件里。每个发布包都包含三个程序、`install.sh`、systemd 服务文件、示例配置和许可证文件；同一个包既能装服务端也能装 agent。VPS 是 ARM 的就用 arm64 包（`uname -m` 显示 `aarch64`）。
+版本号在 `VERSION` 文件里。构建是可复现的：检出某个 tag 构建出的包与该版本 Release 里的逐字节一致（Makefile 自动使用 go.mod 指定的 Go 版本，本机版本不同时会下载）。
 
 ## 2. 安装服务端
 
-把发布包传到服务端 VPS 并解压：
+把发布包传到服务端 VPS（或在 VPS 上按第 1 步直接下载并验证）并解压：
 
 ```sh
-scp dist/vps-probe-0.1.0-linux-amd64.tar.gz root@服务端IP:
+scp vps-probe-0.1.0-linux-amd64.tar.gz root@服务端IP:
 ssh root@服务端IP
 tar xzf vps-probe-0.1.0-linux-amd64.tar.gz && cd vps-probe-0.1.0-linux-amd64
 sha256sum -c SHA256SUMS
@@ -206,6 +231,10 @@ agent 停止前会把流量最后读一次并保存，升级不会丢月流量�
   `-dry-run` 把每份报告以 JSON 打印出来并显示加密后的包大小，不写正式的流量状态文件，可以和已安装的 agent 同时运行。
 - 修改 `proto/` 后需要 `protoc` 和 `protoc-gen-go`，执行 `make proto`；生成的代码已提交。
 - 目录结构和各模块说明见 `docs/DESIGN.md` §9。
+- 发布新版本（`docs/DESIGN.md` §13）：
+  1. 改 `VERSION` 并提交，`git tag v<版本> && git push origin main v<版本>`；
+  2. GitHub Actions 测试、构建，建一个草稿 Release（Actions 页面看进度）；
+  3. 在自己的终端执行 `make release-sign`：核对草稿里的包与本地重建逐字节一致，签名，上传签名并正式发布。只核对不签名用 `make release-verify`。签名密钥默认 `~/.ssh/vps-probe-release`，可用 `SIGNING_KEY=` 指定。
 - 升级或增减 Go 依赖、更换 `web/static/vendor/` 里的前端库后执行 `make licenses`，提交更新后的 `THIRD_PARTY_LICENSES`（`make dist` 也会重新生成）。
 
 ## 许可证
