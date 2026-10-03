@@ -40,7 +40,7 @@ mkdir -p state && STATE_DIRECTORY=$PWD/state ./vps-probe-agent-linux-amd64 run -
 
 浏览器打开 <http://127.0.0.1:18080>（没有配登录保护，只监听本机）。
 
-只看 agent 采到了什么、不发送：`vps-probe-agent run -config agent.yml -dry-run`。它把每份报文以 JSON 打印出来，不写流量状态文件，可以和已安装的 agent 同时运行。
+只看 agent 采到了什么、不发送：`STATE_DIRECTORY=$PWD/state ./vps-probe-agent-linux-amd64 run -config agent.yml -dry-run`。它把每份报文以 JSON 打印出来，不写流量状态文件，可以和已安装的 agent 同时运行。
 
 ## 网页
 
