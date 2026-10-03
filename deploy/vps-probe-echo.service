@@ -5,7 +5,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/vps-probe-echo -config /etc/vps-probe/echo.yml
+ExecStart=/usr/local/bin/vps-probe-echo run -config /etc/vps-probe/echo.yml
 Restart=always
 RestartSec=5
 

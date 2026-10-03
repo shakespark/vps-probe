@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -364,5 +365,40 @@ func TestQuota(t *testing.T) {
 	}
 	if q := (Traffic{QuotaGB: 1.5}).Quota(); q != 3<<29 {
 		t.Errorf("quota = %d", q)
+	}
+}
+
+// The example config that ships in the release loads, and spells out the
+// same rules and reports a config without those keys gets.
+func TestExampleConfig(t *testing.T) {
+	data, err := os.ReadFile("../../../deploy/server.example.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c.Alerts, DefaultRules()) {
+		t.Errorf("alerts in the example differ from DefaultRules:\n%+v\n%+v", c.Alerts, DefaultRules())
+	}
+	def, err := Parse([]byte("nodes:\n  - {id: a, token: " + tokA + "}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c.Reports, def.Reports) {
+		t.Errorf("reports in the example differ from the defaults:\n%+v\n%+v", c.Reports, def.Reports)
+	}
+	if c.Retention != def.Retention || c.Backup != def.Backup || c.Listen != def.Listen || c.DB != def.DB || c.Timezone != def.Timezone {
+		t.Errorf("the example's settings differ from the defaults")
+	}
+	// Every commented-out block is valid too: uncommenting must not break
+	// the file. The node-level ones are checked through hk-1 and jp-1.
+	if n := c.Nodes[0]; n.Traffic.Quota() != 1000<<30 || n.Plan.ExpireAt != "2027-03-15" || n.Ping.Addr != "203.0.113.5" {
+		t.Errorf("first node: %+v", n)
+	}
+	// The generated agent config for a node of the example loads in the agent.
+	if _, err := c.AgentConfig("hk-1", "probe.example.com:9527"); err != nil {
+		t.Error(err)
 	}
 }

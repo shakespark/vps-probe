@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"os"
 	"strings"
 	"testing"
 
@@ -76,5 +78,42 @@ func TestErrors(t *testing.T) {
 		if _, err := Parse([]byte(cfg)); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// The example config that ships in the release loads, and its commented-out
+// lines do too once uncommented.
+func TestExampleConfig(t *testing.T) {
+	data, err := os.ReadFile("../../../deploy/agent.example.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse(data); err == nil {
+		t.Fatal("the placeholder token was accepted")
+	}
+	data = bytes.Replace(data, []byte("<这个节点的 token>"), []byte("abcdefghijklmnopqrstuvwxyz0123456789"), 1)
+	c, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Node != "hk-1" || len(c.Peers) != 2 || c.Traffic.Reset != (traffic.Reset{Day: 1}) {
+		t.Fatalf("example: %+v", c)
+	}
+	var all []string
+	for _, l := range strings.Split(string(data), "\n") {
+		// Settings are commented out with "# " at the line's indentation;
+		// prose comments are Chinese sentences, which no setting starts with.
+		trimmed := strings.TrimLeft(l, " ")
+		if rest, ok := strings.CutPrefix(trimmed, "# "); ok && (strings.HasPrefix(rest, "- {") || strings.HasPrefix(rest, "disks:") || strings.HasPrefix(rest, "interfaces:")) {
+			l = l[:len(l)-len(trimmed)] + rest
+		}
+		all = append(all, strings.Replace(l, "<那边的 key>", "abcdefghijklmnopqrstuvwxyz0123456789", 1))
+	}
+	c, err = Parse([]byte(strings.Join(all, "\n")))
+	if err != nil {
+		t.Fatalf("with the commented-out settings: %v", err)
+	}
+	if len(c.Peers) != 4 || len(c.Disks) != 2 || len(c.Interfaces) != 1 {
+		t.Fatalf("with the commented-out settings: %+v", c)
 	}
 }

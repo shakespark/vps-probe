@@ -67,10 +67,18 @@ func occasion(r *config.Report) string {
 	case config.ReportQuota:
 		return fmt.Sprintf("流量达到配额的 %s%%（每周期每档一次）", join(r.Levels))
 	case config.ReportExpiry:
-		days := slices.Clone(r.Days)
+		days := slices.DeleteFunc(slices.Clone(r.Days), func(d float64) bool { return d == 0 })
 		slices.Sort(days)
 		slices.Reverse(days)
-		return fmt.Sprintf("到期前 %s 天提醒（0 = 当天；每个到期日每档一次）", join(days))
+		s := "到期当天提醒"
+		if len(days) > 0 {
+			s = fmt.Sprintf("到期前 %s 天", join(days))
+			if len(days) < len(r.Days) {
+				s += "和当天"
+			}
+			s += "提醒"
+		}
+		return s + "（每个到期日每档一次）"
 	case config.ReportIPChange:
 		return "上报来源 IP 变化时通知"
 	case config.ReportPeriod:

@@ -5,15 +5,15 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/vps-probe-agent -config /etc/vps-probe/agent.yml
+ExecStart=/usr/local/bin/vps-probe-agent run -config /etc/vps-probe/agent.yml
 Restart=always
 RestartSec=5
 # Gives the final traffic read + save time to finish on shutdown.
 TimeoutStopSec=15
 
-User=vps-probe
-Group=vps-probe
-StateDirectory=vps-probe
+User=vps-probe-agent
+Group=vps-probe-agent
+StateDirectory=vps-probe-agent
 StateDirectoryMode=0700
 UMask=0077
 

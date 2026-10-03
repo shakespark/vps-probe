@@ -78,7 +78,9 @@ func run(args []string) error {
 		go s.Run(ctx)
 		sink = s
 	}
-	a, err := agent.New(cfg, sink, agent.Options{Version: version, DryRun: *dryRun}, log)
+	// systemd names the unit's StateDirectory in the environment; run by hand,
+	// the agent uses the same place.
+	a, err := agent.New(cfg, sink, agent.Options{Version: version, DryRun: *dryRun, StateDir: os.Getenv("STATE_DIRECTORY")}, log)
 	if err != nil {
 		return err
 	}

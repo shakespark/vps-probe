@@ -1,40 +1,33 @@
-# vps-probe agent config. Install as /etc/vps-probe/agent.yml,
-# owner root:vps-probe, mode 0640 (it contains the token).
+# vps-probe-agent 的配置，安装为 /etc/vps-probe/agent.yml。
+# 里面有本节点的 token：root:vps-probe-agent，权限 0640（install.sh 会设好）。
+#
+# 一般不用手写：服务端的 `vps-probe-server add-node` / `install-cmd` 会按 server.yml
+# 生成它并装好。agent 只读这个本地文件，不接受服务端下发的任何配置。
 
-# Node id: 1-32 chars of letters, digits, '.', '_', '-'. Must match the
-# server's node entry exactly.
-node: hk-1
+node: hk-1                    # 节点 id，和 server.yml 里的一致
+server: 203.0.113.1:9527      # 服务端的 UDP 地址，可以写域名
+token: "<这个节点的 token>"   # 和 server.yml 里这个节点的 token 一致
 
-server:
-  addr: 203.0.113.1:9527    # server UDP address; a hostname also works
-  token: "<node token>"     # from `vps-probe-server gen-token`, same value on the server
+# 报告这些挂载点的磁盘用量。默认只有根分区。
+# disks: ["/", "/data"]
 
-interval: 10s               # sampling / reporting interval
-state_dir: /var/lib/vps-probe
+# 流量统计算哪些网卡。默认自动识别：物理网卡；有多块时只算带默认路由的
+# （第二块通常是内网）；容器里没有物理网卡，算默认路由所在的那块。
+# 识别得不对时在这里写明。
+# interfaces: [eth0]
 
-# Mount points to report disk usage for.
-disks: ["/"]
-
-# Interfaces to count traffic on. Empty = auto-detect: the physical NICs; of
-# several, only those with a default route (a second NIC is usually private).
-interfaces: []
-
+# 计费周期从每月几号、几点开始。周期的起止由 agent 自己算好再上报。
 traffic:
-  timezone: Asia/Shanghai
-  reset_day: 1              # 1 = calendar month; e.g. 15 = resets on the 15th
-  # reset_time: "18:21"     # optional time of day the period starts (default 00:00)
+  timezone: Asia/Shanghai     # 和服务端的 timezone 保持一致
+  reset_day: 1                # 默认 1（自然月）；当月没有这一天时用月末
+  reset_time: "00:00"         # 默认 00:00
 
-ping:
-  interval: 1s
-  timeout: 2s
-  # Peers are only ever configured here, never pushed from the server.
-  # Use the peer's node id (as in server.yml) as name, so the latency matrix lines up.
-  peers:
-    - { name: jp-1, addr: 203.0.113.5 }
-    - { name: us-1, addr: 198.51.100.7 }
-    # type: dns sends a UDP DNS query to host:port instead of an ICMP echo, for
-    # tunnels that only forward TCP/UDP: forward a local port to 1.1.1.1:53.
-    # - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }
-    # type: echo sends a signed request to a vps-probe-echo responder at the
-    # tunnel's far end; key is that responder's key.
-    # - { name: hk2-via-sgp, addr: "127.0.0.1:39527", type: echo, key: "<responder key>" }
+# 时延互测的目标。name 写对方在 server.yml 里的节点 id，时延矩阵才能对上。
+peers:
+  - { name: jp-1, addr: 203.0.113.5 }
+  - { name: us-1, addr: us1.example.com }
+  # 只转发 TCP/UDP 的隧道（端口转发）没法 ping，用下面两种，addr 写 host:port：
+  # type: dns  向它发一个 DNS 查询。把本地端口转发到 1.1.1.1:53 就能测这条隧道。
+  # - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }
+  # type: echo 向隧道另一端的 vps-probe-echo 发带签名的请求；key 是那边 echo.yml 里的 key。
+  # - { name: hk2-via-sgp, addr: "127.0.0.1:39527", type: echo, key: "<那边的 key>" }
