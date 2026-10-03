@@ -1,0 +1,21 @@
+vps-probe
+Copyright 2026 shakespark
+
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+The binaries include third-party software; their license texts are in
+THIRD_PARTY_LICENSES. Notices of the Apache-2.0 licensed parts follow.
+
+--------------------------------------------------------------------------
+Apache ECharts (embedded in the vps-probe-server web UI)
+
+Apache ECharts
+Copyright 2017-2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (https://www.apache.org/).
+
+--------------------------------------------------------------------------
+gopkg.in/yaml.v3
+
+Copyright 2011-2016 Canonical Ltd.

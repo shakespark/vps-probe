@@ -19,7 +19,7 @@ make test     # go vet + 单元测试
 make dist     # dist/vps-probe-<版本>-linux-{amd64,arm64}.tar.gz 及 .sha256
 ```
 
-版本号在 `VERSION` 文件里。每个发布包都包含两个程序、`install.sh`、systemd 服务文件和示例配置；同一个包既能装服务端也能装 agent。VPS 是 ARM 的就用 arm64 包（`uname -m` 显示 `aarch64`）。
+版本号在 `VERSION` 文件里。每个发布包都包含三个程序、`install.sh`、systemd 服务文件、示例配置和许可证文件；同一个包既能装服务端也能装 agent。VPS 是 ARM 的就用 arm64 包（`uname -m` 显示 `aarch64`）。
 
 ## 2. 安装服务端
 
@@ -206,3 +206,8 @@ agent 停止前会把流量最后读一次并保存，升级不会丢月流量�
   `-dry-run` 把每份报告以 JSON 打印出来并显示加密后的包大小，不写正式的流量状态文件，可以和已安装的 agent 同时运行。
 - 修改 `proto/` 后需要 `protoc` 和 `protoc-gen-go`，执行 `make proto`；生成的代码已提交。
 - 目录结构和各模块说明见 `docs/DESIGN.md` §9。
+- 升级或增减 Go 依赖、更换 `web/static/vendor/` 里的前端库后执行 `make licenses`，提交更新后的 `THIRD_PARTY_LICENSES`（`make dist` 也会重新生成）。
+
+## 许可证
+
+[Apache License 2.0](LICENSE)。发布的程序里包含的第三方软件及其许可证见 [NOTICE](NOTICE) 和 [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)。

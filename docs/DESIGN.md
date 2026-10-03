@@ -548,7 +548,7 @@ internal/
     alert/              告警规则评估、状态机
     notify/             Telegram 发送（只发不收）
     cfaccess/           Cloudflare Access JWT 校验
-web/                    web.go（go:embed）+ static/（index.html、app.js、style.css、vendor/echarts）
+web/                    web.go（go:embed）+ static/（index.html、app.js、style.css、vendor/echarts 及其 LICENSE、NOTICE）
 deploy/
   vps-probe-agent.service
   agent.example.yml
@@ -559,6 +559,9 @@ deploy/
   cloudflared.example.yml   本地配置方式的隧道示例
   install.sh              安装 / 升级 / 卸载（agent、server、echo）
 VERSION                   版本号；`make dist` 生成发布包
+scripts/third_party_licenses.sh   生成 THIRD_PARTY_LICENSES（`make licenses`，`make dist` 时自动执行）
+LICENSE                   Apache-2.0
+NOTICE                    版权声明及所含 Apache-2.0 组件的 NOTICE
 docs/
   DESIGN.md
 ```
