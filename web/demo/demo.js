@@ -73,7 +73,7 @@
       price: '$49.9/年', expireIn: 213, upDays: 17, ddos: true },
     { id: 'sjc-1', name: '圣何塞', region: 'US', group: '美洲', at: [37.3, -121.9], host: 'sjc-dc2-112', ip: '192.0.2.118',
       os: DEB12, cores: 2, mem: 4, disk: 80, cpu: 7, net: 2e5, daily: 3.5, quota: 4000, mode: 'sum',
-      price: '$29/年', expireIn: 96, upDays: 412, agent: '0.1.9' },
+      price: '$29/年', expireIn: 96, upDays: 412, agent: '0.2.0' },
     { id: 'fra-1', name: '法兰克福', region: 'DE', group: '欧洲', at: [50.1, 8.7], host: 'fra-cx22', ip: '198.51.100.140',
       os: UBU, cores: 2, mem: 4, disk: 40, cpu: 26, net: 7e5, daily: 9, quota: 20000, mode: 'tx',
       price: '€4.5/月', renew: 1, expireIn: 14, upDays: 35 },
@@ -183,8 +183,7 @@
       const lag = (w) => mean([0.25, 0.5, 0.75, 1].map(f => inst(n, t - w * f).load1));
       return {
         cpu: avg(v => v.cpu), cpu_max: max(v => v.cpu), steal: avg(v => v.steal), steal_max: max(v => v.steal),
-        // An agent older than 0.1.14 reports neither softirq nor packet rates.
-        softirq: n.agent ? null : avg(v => v.softirq), softirq_max: n.agent ? null : max(v => v.softirq),
+        softirq: avg(v => v.softirq), softirq_max: max(v => v.softirq),
         load1: avg(v => v.load1), load1_max: max(v => v.load1), load5: lag(300), load15: lag(900),
         mem_total: s[0].memTotal, mem_used: avg(v => v.memUsed), mem_used_max: max(v => v.memUsed),
         swap_total: s[0].swapTotal, swap_used: avg(v => v.swapUsed), swap_used_max: max(v => v.swapUsed),
@@ -222,8 +221,8 @@
       const avg = f => Math.round(mean(s.map(f))), max = f => Math.round(Math.max(...s.map(f)));
       return {
         rx: avg(v => v.rx), rx_max: max(v => v.rx), tx: avg(v => v.tx), tx_max: max(v => v.tx),
-        rx_pps: n.agent ? null : avg(v => v.rxPps), rx_pps_max: n.agent ? null : max(v => v.rxPps),
-        tx_pps: n.agent ? null : avg(v => v.txPps), tx_pps_max: n.agent ? null : max(v => v.txPps),
+        rx_pps: avg(v => v.rxPps), rx_pps_max: max(v => v.rxPps),
+        tx_pps: avg(v => v.txPps), tx_pps_max: max(v => v.txPps),
       };
     }) };
   }
@@ -311,8 +310,17 @@
   }
 
   function ping(src, dstName, from, to) {
-    if (!peers(src).includes(dstName)) return { tier: pickTier(from, to, true).tier, step: pickTier(from, to, true).step, ts: [], cols: {} };
+    if (!peers(src).includes(dstName)) return { ...pickTier(from, to, true), ts: [], cols: {} };
     return series(from, to, true, 10, since(src), lastTick(src), (t, step) => pingAgg(src, dstName, t, t + step, 6));
+  }
+  // Every link of src that has data in the range, by peer name.
+  function pings(src, from, to) {
+    const out = {};
+    for (const dst of peers(src)) {
+      const s = ping(src, dst, from, to);
+      if (s.ts.length) out[dst] = s;
+    }
+    return out;
   }
 
   function matrix(window) {
@@ -387,10 +395,11 @@
     const idx = (yy, mm) => Math.floor(Date.UTC(yy, mm, rd) / 1000 / DAY);
     return [idx(y, m), idx(y, m + 1)];
   }
+  // A period [first, next) in day indexes, as the API returns it.
   function period(n, first, next) {
     let rx = 0, tx = 0;
     for (let i = first; i < next && i <= dayIndex(now()); i++) { const d = dayTraffic(n, i); rx += d.rx; tx += d.tx; }
-    return { start: ymd(dayStart(first)), rx, tx, ifaces: [{ iface: iface(n), rx, tx }] };
+    return { start: dayStart(first), end: dayStart(next), rx, tx, ifaces: [{ iface: iface(n), rx, tx }] };
   }
   function periods(n, limit) {
     const out = [];
@@ -401,15 +410,19 @@
     }
     return out;
   }
+  // start: a period's start in unix seconds; the current period without it.
   function daily(n, start) {
-    const first = start ? dayIndex(fromYMD(start)) : periodOf(n, dayIndex(now()))[0];
+    const first = start ? dayIndex(start) : periodOf(n, dayIndex(now()))[0];
     const [pFirst, next] = periodOf(n, first);
     if (pFirst !== first || dayStart(next) <= since(n)) return { period: start, days: [] };
     const days = [];
     for (let i = Math.max(first, dayIndex(since(n))); i < next && i <= dayIndex(now()); i++) days.push({ day: ymd(dayStart(i)), ...dayTraffic(n, i) });
-    return { period: ymd(dayStart(first)), days };
+    return { period: dayStart(first), days };
   }
+  const MODES = { sum: '收+发', max: '取大', tx: '仅上行', rx: '仅下行' };
+  // What counts against the quota, and the quota as the API shows it.
   const usedOf = (n, p) => ({ sum: p.rx + p.tx, max: Math.max(p.rx, p.tx), tx: p.tx, rx: p.rx })[n.mode || 'sum'];
+  const quotaOf = (n, cur) => n.quota ? { bytes: n.quota * GB, mode: MODES[n.mode || 'sum'], used: cur ? usedOf(n, cur) : 0 } : null;
 
   // ---- nodes --------------------------------------------------------------
 
@@ -417,46 +430,48 @@
 
   function nodeView(n) {
     const t = lastTick(n), v = inst(n, t), boot = T0 - n.upDays * DAY + seed(n.id) % 3600;
-    const view = { id: n.id, name: n.name, online: alive(n, now()), traffic_quota_mode: n.mode || 'sum', region: n.region, group: n.group };
-    if (n.quota) view.traffic_quota_gb = n.quota;
+    const cur = periods(n, 1)[0];
+    const view = { id: n.id, name: n.name, region: n.region, group: n.group, online: alive(n, now()), plan: null, quota: quotaOf(n, cur) };
     if (expiry(n)) {
-      Object.assign(view, { expire_at: expiry(n), expire_days: dayIndex(fromYMD(expiry(n))) - dayIndex(now()), price: n.price });
-      if (n.renew) view.renew_months = n.renew;
+      view.plan = { expire_at: expiry(n), days: dayIndex(fromYMD(expiry(n))) - dayIndex(now()), price: n.price };
+      if (n.renew) view.plan.renew_months = n.renew;
     }
     view.status = {
       max_ts: t, fresh_at: t, clock_skew: seed(n.id) % 3 - 1,
       sys: { hostname: n.host, os: n.os[0], kernel: n.os[1], arch: 'amd64', cores: n.cores, boot_time: boot,
-        uptime: t - t % 3600 - boot, agent_version: n.agent || '0.1.15' },
+        agent_version: n.agent || '0.2.1' },
       ip: n.ip, ip_since: n.id === 'tw-1' ? T0 - 3 * DAY - 4000 : since(n),
-      metrics_ts: t, cpu: r3(v.cpu), steal: r3(v.steal), softirq: n.agent ? null : r3(v.softirq),
+      metrics_ts: t, cpu: r3(v.cpu), steal: r3(v.steal), softirq: r3(v.softirq),
       load1: r3(v.load1), load5: r3(mean([75, 150, 225, 300].map(d => inst(n, t - d).load1))),
       load15: r3(mean([225, 450, 675, 900].map(d => inst(n, t - d).load1))),
       mem_total: v.memTotal, mem_used: Math.round(v.memUsed), swap_total: v.swapTotal, swap_used: Math.round(v.swapUsed),
       tcp: Math.round(v.tcp), udp: Math.round(v.udp), tcp_tw: Math.round(v.tw), threads: Math.round(v.threads),
       net: [{ iface: iface(n), rx: Math.round(v.rx), tx: Math.round(v.tx) }],
       disks: mounts(n).map(m => diskAt(n, m, t - t % 60)),
-      traffic: periods(n, 1)[0],
+      traffic: cur,
     };
     return view;
   }
 
   // ---- alerts -------------------------------------------------------------
 
+  // The rules and reports in effect, worded as the server words them.
+  const rule = (name, condition, nodes = '全部', repeat = '不重复', recovery = '是') => ({ name, condition, nodes, repeat, recovery });
+  const report = (name, condition) => rule(name, condition, '全部', '', '');
   const RULES = [
-    { name: 'offline', metric: 'offline', for: '1m', nodes: 'all', repeat: '0s', notify_recovery: null },
-    { name: 'cpu_high', metric: 'cpu', op: '>', threshold: 90, for: '5m', nodes: 'all', repeat: '0s', notify_recovery: null },
-    { name: 'mem_high', metric: 'mem', op: '>', threshold: 90, for: '5m', nodes: 'all', repeat: '0s', notify_recovery: null },
-    { name: 'disk_full', metric: 'disk', op: '>', threshold: 90, for: '10m', nodes: 'all', repeat: '6h', notify_recovery: null },
-    { name: 'link_loss', metric: 'ping_loss', op: '>', threshold: 20, for: '3m', nodes: ['hk-1', 'tyo-1'], repeat: '0s', notify_recovery: null },
-    { name: 'traffic_quota', metric: 'traffic', for: '0s', nodes: 'all', repeat: '0s', notify_recovery: null, levels: [80, 90, 100] },
-    { name: 'expiry', metric: 'expiry', for: '0s', nodes: 'all', repeat: '0s', notify_recovery: null, levels: [7, 1] },
-    { name: 'ddos', metric: 'net_in', op: '>=', threshold: 50, for: '2m', nodes: 'all', exclude: ['tw-1'], repeat: '0s', notify_recovery: null, ratio: 4 },
-    { name: 'abuse_out', metric: 'net_out', op: '>=', threshold: 50, for: '5m', nodes: 'all', exclude: ['tw-1'], repeat: '0s', notify_recovery: null, ratio: 4 },
-    { name: 'ip_change', metric: 'ip_change', for: '0s', nodes: 'all', repeat: '0s', notify_recovery: null },
-    { name: 'period_report', metric: 'period_report', for: '0s', nodes: 'all', repeat: '0s', notify_recovery: null },
-    { name: 'weekly_report', metric: 'weekly_report', for: '0s', nodes: 'all', repeat: '0s', notify_recovery: null, at: 'Mon 10:00' },
+    rule('offline', '超过 1m 没有上报'),
+    rule('cpu_high', 'CPU > 90.0%，持续 5m'),
+    rule('mem_high', '内存 > 90.0%，持续 5m'),
+    rule('disk_full', '磁盘 > 90.0%，持续 10m', '全部', '每 6h'),
+    rule('link_loss', '丢包 > 20.0%，持续 3m', '香港 1、东京 1'),
+    rule('ddos', '入站 >= 50.0 Mbps，且不低于出站的 4 倍，持续 2m', '全部，除 台北'),
+    rule('abuse_out', '出站 >= 50.0 Mbps，且不低于入站的 4 倍，持续 5m', '全部，除 台北'),
+    report('traffic_quota', '流量达到配额的 80 / 90 / 100%（每周期每档一次）'),
+    report('expiry', '到期前 7 / 1 天提醒（每个到期日每档一次）'),
+    report('ip_change', '上报来源 IP 变化时通知'),
+    report('period', '每个流量周期结束时发送结算'),
+    report('weekly', '每周一 10:00 发送流量汇总'),
   ];
-  const MODES = { sum: '收+发', max: '取大', tx: '仅上行', rx: '仅下行' };
   const label = n => `${n.name}（${n.id}）`;
   function fmtBytes(v) {
     if (v >= GB) return (v / GB).toFixed(2) + ' GB';
@@ -488,47 +503,49 @@
   // The alert log, newest first. Built once: its times hang off T0.
   const HISTORY = (() => {
     const h = [], n = id => byId.get(id);
+    // Alert messages name their rule; a report's title says what it is.
     const add = (ts, rule, node, target, event, value, title, ...lines) => h.push({ ts, rule, node, target, event, value,
-      message: [title + ' ' + rule + (node ? ' · ' + label(n(node)) : ''), ...lines, stamp(ts)].join('\n') });
+      message: [title + (event === 'notice' || event === 'report' ? '' : ' ' + rule) + (node ? ' · ' + label(n(node)) : ''),
+        ...lines, stamp(ts)].join('\n') });
     const at = (daysAgo, hh, mm) => dayStart(dayIndex(T0) - daysAgo) + hh * 3600 + mm * 60;
 
     // Now: the attack on la-1 and lon-1 going dark.
     const la = n('la-1'), f = inst(la, DDOS_AT + 120);
-    add(DDOS_AT + 120, 'ddos', 'la-1', '', 'firing', r3(f.rx * 8 / 1e6), '🔴 告警',
-      `入站 ${mbps(f.rx)}，出站 ${mbps(f.tx)}，疑似 DDoS（${(f.rx / f.tx).toFixed(1)} 倍）（阈值 >= 50.0 Mbps，且不低于出站的 4 倍），已持续 2 分 0 秒`,
-      `入站 ${(f.rxPps / 1e4).toFixed(1)} 万包/秒（平均 ${Math.round(f.rx / f.rxPps)} 字节/包），出站 ${Math.round(f.txPps)} 包/秒`,
-      '8 个节点中 7 个到它丢包 ≥ 20%');
-    add(OFFLINE_AT + 70, 'offline', 'lon-1', '', 'firing', 70, '🔴 告警', '已 1 分 10 秒 没有上报');
+    add(DDOS_AT + 120, 'ddos', 'la-1', '', 'firing', mbps(f.rx), '🔴 告警',
+      `疑似 DDoS：入站 ${mbps(f.rx)}，出站 ${mbps(f.tx)}（${(f.rx / f.tx).toFixed(1)} 倍）（阈值 >= 50.0 Mbps，且不低于出站的 4 倍），已持续 2 分 0 秒`,
+      '8 个节点中 7 个到它丢包 ≥ 20%',
+      `入站 ${(f.rxPps / 1e4).toFixed(1)} 万包/秒（平均 ${Math.round(f.rx / f.rxPps)} 字节/包），出站 ${Math.round(f.txPps)} 包/秒，软中断 ${f.softirq.toFixed(1)}%`);
+    add(OFFLINE_AT + 70, 'offline', 'lon-1', '', 'firing', fmtDur(70), '🔴 告警', '已 1 分 10 秒 没有上报');
 
     // hk-2 is eating its quota.
     const hk2 = n('hk-2'), q = hk2.quota * GB, start = ymd(dayStart(periodOf(hk2, dayIndex(T0))[0]));
     for (const [daysAgo, pct] of [[3, 80], [0.4, 90]]) {
-      add(Math.floor(T0 - daysAgo * DAY), 'traffic_quota', 'hk-2', start, 'level', pct, '📊 流量',
+      add(Math.floor(T0 - daysAgo * DAY), 'traffic_quota', 'hk-2', start, 'notice', pct + '%', '📊 流量',
         `本周期（${start} 起）已用 ${fmtBytes(q * pct / 100 + 3e8)}，达到配额 ${fmtBytes(q)} 的 ${pct}%（计费：${MODES[hk2.mode]}）`);
     }
     // The 7-day reminders: sg-1 expires in 5 days, hk-2 in 4.
     const sg = n('sg-1');
-    add(at(2, 9, 0), 'expiry', 'sg-1', expiry(sg), 'level', 7, '⏰ 到期', `将于 ${expiry(sg)} 到期，还剩 7 天，价格 ${sg.price}`);
-    add(at(3, 9, 0), 'expiry', 'hk-2', expiry(hk2), 'level', 7, '⏰ 到期',
+    add(at(2, 9, 0), 'expiry', 'sg-1', expiry(sg), 'notice', '剩 7 天', '⏰ 到期', `将于 ${expiry(sg)} 到期，还剩 7 天，价格 ${sg.price}`);
+    add(at(3, 9, 0), 'expiry', 'hk-2', expiry(hk2), 'notice', '剩 7 天', '⏰ 到期',
       `将于 ${expiry(hk2)} 到期，还剩 7 天，价格 ${hk2.price}（自动续费，每 1 个月）`);
 
-    add(T0 - 3 * DAY - 4000, 'ip_change', 'tw-1', '198.51.100.87', 'changed', 0, '🔁 IP 变化', '198.51.100.23 → 198.51.100.87');
+    add(T0 - 3 * DAY - 4000, 'ip_change', 'tw-1', '198.51.100.87', 'notice', '', '🔁 IP 变化', '198.51.100.23 → 198.51.100.87');
 
     // Incidents that came and went.
     const pair = (ts, dur, rule, node, target, fire, value, clear, back) => {
       add(ts, rule, node, target, 'firing', value, '🔴 告警', fire);
-      add(ts + dur, rule, node, target, 'recovered', back, rule === 'offline' ? '🟢 恢复在线' : '🟢 恢复', clear);
+      add(ts + dur, rule, node, target, 'recovered', back, '🟢 恢复', clear);
     };
-    pair(at(1, 3, 12), 1450, 'link_loss', 'hk-1', 'la-1', '香港 1（hk-1） → la-1 丢包 34.2%（阈值 > 20.0%），已持续 3 分 0 秒', 34.2,
-      '香港 1（hk-1） → la-1 丢包 0.4%，异常持续约 24 分 10 秒', 0.4);
-    pair(at(2, 21, 40), 520, 'cpu_high', 'fra-1', '', 'CPU 97.3%（阈值 > 90.0%），已持续 5 分 0 秒', 97.3, 'CPU 21.8%，告警持续 8 分 40 秒', 21.8);
-    pair(at(5, 14, 5), 2140, 'offline', 'syd-1', '', '已 1 分 2 秒 没有上报', 62, '已恢复上报，离线约 35 分 40 秒', 2140);
-    pair(at(8, 6, 30), 5400, 'disk_full', 'tw-1', '/data', '磁盘 /data 91.4%（阈值 > 90.0%），已持续 10 分 0 秒', 91.4,
-      '磁盘 /data 62.0%，异常持续约 1 小时 30 分', 62);
-    pair(at(11, 23, 18), 700, 'mem_high', 'hk-2', '', '内存 93.6%（阈值 > 90.0%），已持续 5 分 0 秒', 93.6, '内存 71.2%，告警持续 11 分 40 秒', 71.2);
-    pair(at(16, 2, 47), 960, 'ddos', 'tyo-1', '', '入站 212.4 Mbps，出站 6.0 Mbps，疑似 DDoS（35.4 倍）（阈值 >= 50.0 Mbps，且不低于出站的 4 倍），已持续 2 分 0 秒',
-      212.4, '入站 4.1 Mbps，出站 3.8 Mbps，告警持续 16 分 0 秒', 4.1);
-    pair(at(22, 17, 2), 380, 'offline', 'sg-1', '', '已 1 分 5 秒 没有上报', 65, '已恢复上报，离线约 6 分 20 秒', 380);
+    pair(at(1, 3, 12), 1450, 'link_loss', 'hk-1', 'la-1', 'hk-1 → la-1 丢包 34.2%（阈值 > 20.0%），已持续 3 分 0 秒', '34.2%',
+      'hk-1 → la-1 丢包 0.4%，异常持续约 24 分 10 秒', '0.4%');
+    pair(at(2, 21, 40), 520, 'cpu_high', 'fra-1', '', 'CPU 97.3%（阈值 > 90.0%），已持续 5 分 0 秒', '97.3%', 'CPU 21.8%，异常持续约 8 分 40 秒', '21.8%');
+    pair(at(5, 14, 5), 2140, 'offline', 'syd-1', '', '已 1 分 2 秒 没有上报', fmtDur(62), '已恢复上报，离线约 35 分 40 秒', fmtDur(0));
+    pair(at(8, 6, 30), 5400, 'disk_full', 'tw-1', '/data', '磁盘 /data 91.4%（阈值 > 90.0%），已持续 10 分 0 秒', '91.4%',
+      '磁盘 /data 62.0%，异常持续约 1 小时 30 分', '62.0%');
+    pair(at(11, 23, 18), 700, 'mem_high', 'hk-2', '', '内存 93.6%（阈值 > 90.0%），已持续 5 分 0 秒', '93.6%', '内存 71.2%，异常持续约 11 分 40 秒', '71.2%');
+    pair(at(16, 2, 47), 960, 'ddos', 'tyo-1', '', '疑似 DDoS：入站 212.4 Mbps，出站 6.0 Mbps（35.4 倍）（阈值 >= 50.0 Mbps，且不低于出站的 4 倍），已持续 2 分 0 秒',
+      '212.4 Mbps', '入站 4.1 Mbps，出站 3.8 Mbps，异常持续约 16 分 0 秒', '4.1 Mbps');
+    pair(at(22, 17, 2), 380, 'offline', 'sg-1', '', '已 1 分 5 秒 没有上报', fmtDur(65), '已恢复上报，离线约 6 分 20 秒', fmtDur(0));
 
     // Every Monday 10:00, and the settlement when a period ends.
     for (let i = dayIndex(T0), weeks = 0; weeks < 5; i--) {
@@ -536,8 +553,8 @@
       weeks++;
       const ts = dayStart(i) + 10 * 3600;
       if (ts > T0) continue;
-      h.push({ ts, rule: 'weekly_report', node: '', target: stamp(ts).slice(0, 16), event: 'report', value: 0,
-        message: ['📊 每周流量 weekly_report', ...NODES.filter(x => since(x) < ts - 7 * DAY).map(x => weeklyLine(x, ts)),
+      h.push({ ts, rule: 'weekly', node: '', target: stamp(ts).slice(0, 16), event: 'report', value: '',
+        message: ['📊 每周流量', ...NODES.filter(x => since(x) < ts - 7 * DAY).map(x => weeklyLine(x, ts)),
           '即将到期：新加坡（sg-1） ' + expiry(sg) + `（还剩 ${dayIndex(fromYMD(expiry(sg))) - i} 天）`, stamp(ts)].join('\n') });
     }
     for (const x of NODES) {
@@ -546,8 +563,8 @@
       const p = period(x, prev, first), total = p.rx + p.tx, used = usedOf(x, p);
       let peak = { v: 0 };
       for (let i = prev; i < first; i++) { const d = dayTraffic(x, i); if (d.rx + d.tx > peak.v) peak = { v: d.rx + d.tx, day: ymd(dayStart(i)) }; }
-      add(dayStart(first) + 20, 'period_report', x.id, p.start, 'report', x.quota ? r3(100 * used / x.quota / GB) : 0, '📊 流量结算',
-        `${p.start} 至 ${ymd(dayStart(first - 1))}（${first - prev} 天）：下行 ${fmtBytes(p.rx)}，上行 ${fmtBytes(p.tx)}，合计 ${fmtBytes(total)}`,
+      add(dayStart(first) + 20, 'period', x.id, ymd(p.start), 'report', x.quota ? (100 * used / x.quota / GB).toFixed(1) + '%' : '', '📊 流量结算',
+        `${ymd(p.start)} 至 ${ymd(p.end)}（${first - prev} 天）：下行 ${fmtBytes(p.rx)}，上行 ${fmtBytes(p.tx)}，合计 ${fmtBytes(total)}`,
         ...(x.quota ? [`配额 ${fmtBytes(x.quota * GB)}（计费：${MODES[x.mode]}），用了 ${(100 * used / x.quota / GB).toFixed(1)}%`] : []),
         `日均 ${fmtBytes(total / (first - prev))}，最多的一天 ${peak.day}（${fmtBytes(peak.v)}）`);
     }
@@ -565,9 +582,9 @@
     const la = byId.get('la-1');
     return {
       active: [
-        { rule: 'ddos', metric: 'net_in', node: 'la-1', target: '', state: 'firing', since: DDOS_AT, value: r3(inst(la, lastTick(la)).rx * 8 / 1e6) },
-        { rule: 'offline', metric: 'offline', node: 'lon-1', target: '', state: 'firing', since: OFFLINE_AT + 10, value: now() - OFFLINE_AT },
-        { rule: 'link_loss', metric: 'ping_loss', node: 'hk-1', target: 'la-1', state: 'pending', since: now() - 95, value: 41.5 },
+        { rule: 'ddos', node: 'la-1', target: '', firing: true, since: DDOS_AT, value: mbps(inst(la, lastTick(la)).rx) },
+        { rule: 'offline', node: 'lon-1', target: '', firing: true, since: OFFLINE_AT, value: fmtDur(now() - OFFLINE_AT) },
+        { rule: 'link_loss', node: 'hk-1', target: 'la-1', firing: false, since: now() - 95, value: '41.5%' },
       ],
       history: history.slice(0, 500), truncated: history.length > 500,
       facets: { nodes: uniq(e => e.node), rules: uniq(e => e.rule) },
@@ -578,7 +595,7 @@
   const stats = () => ({
     ingest: { accepted: Math.floor((now() - 1.75e9) * 2.7), auth_failed: 37, decode_failed: 0, duplicate: 1204 + Math.floor((now() - T0) / 60),
       fields_dropped: 0, malformed: 5519, store_failed: 0, ts_out_of_range: 3, unknown_node: 12, wrong_type: 0 },
-    db_bytes: 187 * MB + (now() % 3600) * 600, server_time: now(), timezone: 'Asia/Shanghai', version: 'demo',
+    db_bytes: 187 * MB + (now() % 3600) * 600, server_time: now(), timezone: 'Asia/Shanghai', version: 'demo', interval: 10,
   });
 
   // ---- routing ------------------------------------------------------------
@@ -596,10 +613,17 @@
     switch (seg[1]) {
       case 'nodes':
         if (seg.length === 2) return [200, NODES.map(nodeView)];
-        if (!node || seg.length !== 4) return [404, 'not found'];
+        if (!node) return [404, 'not found'];
+        if (seg[3] === 'ping' && seg.length === 5) return [200, ping(node, seg[4], ...range())];
+        if (seg[3] === 'traffic' && seg[4] === 'daily' && seg.length === 5) {
+          return q.has('period') && !/^\d+$/.test(q.get('period')) ? [400, 'period: want its start in unix seconds']
+            : [200, daily(node, Number(q.get('period')))];
+        }
+        if (seg.length !== 4) return [404, 'not found'];
         if (seg[3] === 'metrics') return [200, metrics(node, ...range())];
         if (seg[3] === 'net') return [200, net(node, ...range())];
         if (seg[3] === 'disks') return [200, disks(node, ...range())];
+        if (seg[3] === 'ping') return [200, pings(node, ...range())];
         break;
       case 'ping':
         if (seg[2] === 'matrix') {
@@ -611,15 +635,15 @@
           const r = q.get('range') || '24h';
           return AVAIL[r] ? [200, availability(r)] : [400, 'range: want 24h, 7d or 30d'];
         }
-        if (node && seg.length === 4) return [200, ping(node, seg[3], ...range())];
         break;
       case 'traffic':
         if (seg.length === 2) {
           const limit = Number(q.get('periods') || 24);
-          return [200, NODES.map(n => ({ id: n.id, name: n.name, ...(n.quota ? { traffic_quota_gb: n.quota } : {}),
-            traffic_quota_mode: n.mode || 'sum', periods: periods(n, limit) }))];
+          return [200, NODES.map(n => {
+            const ps = periods(n, limit).map(p => ({ ...p, billable: usedOf(n, p) }));
+            return { id: n.id, name: n.name, quota: quotaOf(n, ps[0]), periods: ps };
+          })];
         }
-        if (node && seg[3] === 'daily') return [200, daily(node, q.get('period'))];
         break;
       case 'sparks': return [200, sparks()];
       case 'stats': return [200, stats()];
