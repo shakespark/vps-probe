@@ -13,7 +13,7 @@ var version = "dev"
 const usage = `usage: vps-probe-server COMMAND [-config FILE] [flags]
 
 Run:
-  run [-debug]             run the server (also when no command is given)
+  run [-debug]             run the server
   check                    validate the config and exit
   backup -o FILE           write a consistent copy of the database
   test-notify              send a test message to every notify channel

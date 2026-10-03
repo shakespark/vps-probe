@@ -50,6 +50,18 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Both ports are taken before the database is opened: a second server
+	// started by mistake stops here, instead of upgrading the schema and
+	// holding the write lock through a rollup under the one that is running.
+	in, err := ingest.Listen(cfg.Listen.Ingest, cfg.Nodes, log)
+	if err != nil {
+		return fmt.Errorf("ingest: %w (is the server already running?)", err)
+	}
+	ln, err := net.Listen("tcp", cfg.Listen.Web)
+	if err != nil {
+		return fmt.Errorf("web: %w (is the server already running?)", err)
+	}
+
 	st, err := openStore(cfg, log)
 	if err != nil {
 		return err
@@ -79,10 +91,6 @@ func run(args []string) error {
 		return err
 	}
 
-	in, err := ingest.Listen(cfg.Listen.Ingest, cfg.Nodes, st, log)
-	if err != nil {
-		return fmt.Errorf("ingest: %w", err)
-	}
 	channels := make([]*notify.Channel, len(cfg.Notify))
 	var notifier notify.Notifier = notify.Log{Log: log}
 	if len(channels) > 0 {
@@ -100,10 +108,6 @@ func run(args []string) error {
 		return fmt.Errorf("alerts: %w", err)
 	}
 
-	ln, err := net.Listen("tcp", cfg.Listen.Web)
-	if err != nil {
-		return fmt.Errorf("web: %w", err)
-	}
 	warnIfExposed(cfg, log)
 	ui, err := web.New()
 	if err != nil {
@@ -134,7 +138,7 @@ func run(args []string) error {
 	var writers sync.WaitGroup
 	writers.Add(4)
 	go func() { defer writers.Done(); ev.Run(ctx) }()
-	go func() { defer writers.Done(); in.Run(ctx) }()
+	go func() { defer writers.Done(); in.Run(ctx, st) }()
 	go func() { defer writers.Done(); maintain(ctx, cfg, st, log) }()
 	go func() {
 		defer writers.Done()

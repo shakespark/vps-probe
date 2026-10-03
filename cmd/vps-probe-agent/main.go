@@ -22,7 +22,7 @@ import (
 var version = "dev"
 
 const usage = `usage:
-  vps-probe-agent [run] [-config FILE] [-debug] [-dry-run]   run the agent; -dry-run prints reports instead of
+  vps-probe-agent run [-config FILE] [-debug] [-dry-run]     run the agent; -dry-run prints reports instead of
                                                              sending them and is safe next to a running agent
   vps-probe-agent check [-config FILE]                       validate the config and exit
   vps-probe-agent version

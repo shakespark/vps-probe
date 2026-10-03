@@ -17,7 +17,7 @@ import (
 var version = "dev"
 
 const usage = `usage:
-  vps-probe-echo [run] [-config FILE] [-debug]   run the responder
+  vps-probe-echo run [-config FILE] [-debug]     run the responder
   vps-probe-echo check [-config FILE]            validate the config and exit
   vps-probe-echo version
 `

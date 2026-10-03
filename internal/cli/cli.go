@@ -1,6 +1,5 @@
 // Package cli holds what the three programs' command lines share, so that
-// they look and behave alike: a subcommand first ("run" when there is none),
-// then its flags.
+// they look and behave alike: a subcommand first, then its flags.
 package cli
 
 import (
@@ -9,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 )
 
@@ -18,12 +18,13 @@ type Command struct {
 	Run  func(args []string) error
 }
 
-// Main runs the subcommand named by the first argument, or the first of
-// cmds when the arguments start with a flag or there are none, and exits.
-// "version" and "help" are always available.
+// Main runs the subcommand named by the first argument and exits. "version"
+// and "help" are always available. Without a subcommand it prints the usage
+// and fails: nothing is started by a command line that did not ask for it,
+// such as a bare program name typed to see what it does.
 func Main(version, usage string, cmds ...Command) {
-	name, args := cmds[0].Name, os.Args[1:]
-	if len(args) > 0 && args[0] != "" && args[0][0] != '-' {
+	name, args := "", os.Args[1:]
+	if len(args) > 0 {
 		name, args = args[0], args[1:]
 	}
 	switch name {
@@ -42,6 +43,11 @@ func Main(version, usage string, cmds ...Command) {
 			}
 			return
 		}
+	}
+	if name == "" || name[0] == '-' {
+		fmt.Fprintf(os.Stderr, "error: no command given; to start the service: %s %s\n\n", filepath.Base(os.Args[0]), cmds[0].Name)
+	} else {
+		fmt.Fprintf(os.Stderr, "error: unknown command %q\n\n", name)
 	}
 	fmt.Fprint(os.Stderr, usage)
 	os.Exit(2)

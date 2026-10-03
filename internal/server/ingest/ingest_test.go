@@ -56,13 +56,13 @@ func (f *fakeWriter) count() int {
 
 func start(t *testing.T, w Writer) *Server {
 	t.Helper()
-	s, err := Listen("127.0.0.1:0", []config.Node{{ID: node, Token: token}}, w, discard)
+	s, err := Listen("127.0.0.1:0", []config.Node{{ID: node, Token: token}}, discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { s.Run(ctx); close(done) }()
+	go func() { s.Run(ctx, w); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
 	return s
 }
@@ -346,13 +346,13 @@ func TestAgentSenderToStore(t *testing.T) {
 
 // The default ingest address has an empty host so IPv6 agents get through.
 func TestDualStack(t *testing.T) {
-	s, err := Listen(":0", []config.Node{{ID: node, Token: token}}, &fakeWriter{}, discard)
+	s, err := Listen(":0", []config.Node{{ID: node, Token: token}}, discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go s.Run(ctx)
+	go s.Run(ctx, &fakeWriter{})
 	port := s.Addr().(*net.UDPAddr).Port
 	a := aead(t, token)
 	for _, host := range []string{"127.0.0.1", "::1"} {
@@ -372,11 +372,12 @@ func TestDualStack(t *testing.T) {
 // and packets that fail authentication don't count against it.
 func TestNodeRateLimit(t *testing.T) {
 	w := &fakeWriter{}
-	s, err := Listen("127.0.0.1:0", []config.Node{{ID: node, Token: token}}, w, discard)
+	s, err := Listen("127.0.0.1:0", []config.Node{{ID: node, Token: token}}, discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.conn.Close()
+	s.store = w
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	from := netip.MustParseAddrPort("127.0.0.1:9")

@@ -78,10 +78,10 @@ type Server struct {
 	lastLog map[string]time.Time
 }
 
-// Listen binds the UDP port. Keys are derived once here.
-func Listen(addr string, nodes []config.Node, store Writer, log *slog.Logger) (*Server, error) {
+// Listen binds the UDP port; nothing is read from it until Run. Keys are
+// derived once here.
+func Listen(addr string, nodes []config.Node, log *slog.Logger) (*Server, error) {
 	s := &Server{
-		store:    store,
 		log:      log,
 		now:      time.Now,
 		nodes:    make(map[string]cipher.AEAD, len(nodes)),
@@ -122,9 +122,11 @@ func (s *Server) Stats() map[string]uint64 {
 	return out
 }
 
-// Run reads packets until ctx is done. Packets are handled one at a time on
-// this goroutine, which also makes it the only writer of report data.
-func (s *Server) Run(ctx context.Context) {
+// Run reads packets until ctx is done and stores the reports in store.
+// Packets are handled one at a time on this goroutine, which also makes it
+// the only writer of report data.
+func (s *Server) Run(ctx context.Context, store Writer) {
+	s.store = store
 	go func() {
 		<-ctx.Done()
 		s.conn.Close()
