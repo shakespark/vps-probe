@@ -894,7 +894,8 @@ function trafficPage() {
 // ---------- alerts ----------
 
 const METRICS = { cpu: 'CPU', steal: 'Steal', load1: '负载(1m)', mem: '内存', swap: 'Swap', disk: '磁盘',
-  offline: '离线', ping_loss: '丢包', ping_avg: '时延', traffic: '流量配额', expiry: '到期', ip_change: 'IP 变化' };
+  offline: '离线', ping_loss: '丢包', ping_avg: '时延', traffic: '流量配额', expiry: '到期', ip_change: 'IP 变化',
+  net_in: '入站', net_out: '出站' };
 const EVENTS = { firing: '告警', repeat: '仍在告警', recovered: '恢复', level: '流量档位', changed: 'IP 变化' };
 // Rules that notify once per event rather than fire and recover.
 const NOTICE_METRICS = ['traffic', 'expiry', 'ip_change'];
@@ -905,6 +906,7 @@ function fmtRuleValue(metric, v) {
   if (metric === 'offline') return v < 60 ? Math.round(v) + ' 秒' : fmtDur(v);
   if (metric === 'ping_avg') return fmtMs(v);
   if (metric === 'load1') return v.toFixed(2);
+  if (metric === 'net_in' || metric === 'net_out') return v.toFixed(1) + ' Mbps';
   return fmtPct(v);
 }
 
@@ -923,6 +925,7 @@ function ruleText(r) {
   }
   if (r.metric === 'ip_change') return '上报来源 IP 变化时通知';
   let t = `${METRICS[r.metric] || r.metric} ${r.op} ${fmtRuleValue(r.metric, r.threshold)}`;
+  if (r.ratio) t += `，且不低于${r.metric === 'net_in' ? '出站' : '入站'}的 ${r.ratio} 倍`;
   if (r.for !== '0s') t += `，持续 ${r.for}`;
   return t;
 }
@@ -1003,7 +1006,8 @@ function alertsPage() {
       rules.replaceChildren(d.rules.length
         ? table(['名称', '条件', '节点', '重复提醒', '恢复通知'], d.rules.map(r => h('tr', null,
           cell(r.name), cell(ruleText(r)),
-          cell(r.nodes === 'all' ? '全部' : r.nodes.map(nodeText).join('、')),
+          cell(r.nodes === 'all' ? (r.exclude ? '全部，除 ' + r.exclude.map(nodeText).join('、') : '全部')
+            : r.nodes.map(nodeText).join('、')),
           cell(NOTICE_METRICS.includes(r.metric) ? '—' : r.repeat === '0s' ? '不重复' : '每 ' + r.repeat),
           cell(NOTICE_METRICS.includes(r.metric) ? '—' : r.notify_recovery === false ? '否' : '是'))))
         : h('div', { class: 'empty', text: '没有配置告警规则' }));

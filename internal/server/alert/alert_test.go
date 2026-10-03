@@ -15,6 +15,7 @@ import (
 type fakeSrc struct {
 	status map[string]*store.Status
 	links  []store.Link
+	net    map[string][]store.NetSum
 	states map[key]store.AlertState
 	events []store.AlertEvent
 }
@@ -23,6 +24,15 @@ func (f *fakeSrc) Status(_ context.Context, id string) (*store.Status, error) {
 	return f.status[id], nil
 }
 func (f *fakeSrc) Matrix(context.Context, time.Duration) ([]store.Link, error) { return f.links, nil }
+func (f *fakeSrc) NetSums(_ context.Context, node string, from, to int64) ([]store.NetSum, error) {
+	var out []store.NetSum
+	for _, n := range f.net[node] {
+		if n.TS >= from && n.TS <= to {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
 func (f *fakeSrc) AlertStates() ([]store.AlertState, error) {
 	var out []store.AlertState
 	for _, s := range f.states {
@@ -105,6 +115,17 @@ func (h *harness) report(node string, cpu float64) {
 	}
 	st.FreshAt = h.now.Unix()
 	st.CPU = &cpu
+}
+
+// traffic makes node fresh at the current time with one network sample,
+// in Mbps.
+func (h *harness) traffic(node string, in, out float64) {
+	h.report(node, 1)
+	h.src.status[node].MaxTS = h.now.Unix()
+	if h.src.net == nil {
+		h.src.net = map[string][]store.NetSum{}
+	}
+	h.src.net[node] = append(h.src.net[node], store.NetSum{TS: h.now.Unix(), RX: in * 1e6 / 8, TX: out * 1e6 / 8})
 }
 
 // step advances the clock, optionally reporting, and runs one round.
@@ -476,5 +497,107 @@ func TestIPChange(t *testing.T) {
 	h.step(10*time.Second, from("a", "203.0.113.9"))
 	if h.msgs() != 1 {
 		t.Fatalf("repeated: %q", h.n.msgs)
+	}
+}
+
+func TestNetInFlood(t *testing.T) {
+	h := setup(t, `  - {name: ddos, metric: net_in, op: ">=", threshold: 50, ratio: 4, for: 1m}`)
+	h.src.links = []store.Link{{Src: "b", Dst: "a", Sent: 60, Lost: 30, LossPct: 50},
+		{Src: "a", Dst: "b", Sent: 60, Lost: 60, LossPct: 100}}
+	// A relay forwarding 300 Mbps each way is busy, not attacked.
+	for i := 0; i < 12; i++ {
+		h.step(10*time.Second, func() { h.traffic("a", 300, 290); h.traffic("b", 1, 1) })
+	}
+	if h.msgs() != 0 || len(h.e.Active()) != 0 {
+		t.Fatalf("symmetric load alerted: %v", h.n.msgs)
+	}
+	// Inbound jumps; the 60s average crosses the floor and stays lopsided.
+	for i := 0; i < 12; i++ {
+		h.step(10*time.Second, func() { h.traffic("a", 800, 40); h.traffic("b", 1, 1) })
+	}
+	m := h.n.msgs
+	if len(m) != 1 || !strings.Contains(m[0], "🔴 告警 ddos · 香港（a）\n疑似 DDoS：入站 800.0 Mbps，出站 40.0 Mbps（20.0 倍）（阈值 >= 50.0 Mbps，且不低于出站的 4 倍），已持续 1 分 0 秒\n1 个节点中 1 个到它丢包 ≥ 20%\n2026-") {
+		t.Fatalf("flood: %q", m)
+	}
+	// Back to normal: recovers after the debounce, with plain rates.
+	h.src.links = nil
+	for i := 0; i < 13; i++ {
+		h.step(10*time.Second, func() { h.traffic("a", 20, 20); h.traffic("b", 1, 1) })
+	}
+	if h.msgs() != 2 || !strings.Contains(h.n.msgs[1], "🟢 恢复 ddos · 香港（a）\n入站 20.0 Mbps，出站 20.0 Mbps，异常持续约 2 分 20 秒\n2026-") {
+		t.Fatalf("recovery: %q", h.n.msgs)
+	}
+}
+
+func TestNetInRecoveryUnderNullRoute(t *testing.T) {
+	h := setup(t, `  - {name: ddos, metric: net_in, op: ">=", threshold: 50, ratio: 4}`)
+	h.step(0, func() { h.traffic("a", 800, 40) })
+	// The provider drops traffic to a; its own reports still get out.
+	h.src.links = []store.Link{{Src: "b", Dst: "a", Sent: 60, Lost: 60, LossPct: 100}}
+	for i := 0; i < 6; i++ {
+		h.step(10*time.Second, func() { h.traffic("a", 0, 0.1) })
+	}
+	if h.msgs() != 2 || !strings.Contains(h.n.msgs[1], "🟢 恢复 ddos · 香港（a）\n入站 0.0 Mbps，出站 0.1 Mbps，异常持续约") ||
+		!strings.Contains(h.n.msgs[1], "\n入站已回落，但 1 个节点中 1 个到它仍丢包 ≥ 20%，可能已被商家黑洞\n") {
+		t.Fatalf("null-route recovery: %q", h.n.msgs)
+	}
+}
+
+func TestNetOutAndNoRatio(t *testing.T) {
+	h := setup(t, `  - {name: abuse_out, metric: net_out, op: ">=", threshold: 50, ratio: 4}
+  - {name: busy, metric: net_in, op: ">", threshold: 100}`)
+	h.step(0, func() { h.traffic("a", 10, 200); h.traffic("b", 150, 150) })
+	m := h.n.msgs
+	if len(m) != 1 || strings.Count(m[0], "🔴") != 2 ||
+		!strings.Contains(m[0], "abuse_out · 香港（a）\n疑似被利用对外攻击：入站 10.0 Mbps，出站 200.0 Mbps（20.0 倍）") ||
+		!strings.Contains(m[0], "busy · b\n入站 150.0 Mbps，出站 150.0 Mbps（阈值 > 100.0 Mbps）") {
+		t.Fatalf("net: %q", m)
+	}
+}
+
+func TestExcludedNodeDoesNotAlert(t *testing.T) {
+	h := setup(t, `  - {name: abuse_out, metric: net_out, op: ">=", threshold: 50, ratio: 4, exclude: [b]}
+  - {name: offline, metric: offline, for: 1m, exclude: [a]}`)
+	h.step(0, func() { h.traffic("a", 1, 200); h.traffic("b", 1, 200) })
+	if h.msgs() != 1 || !strings.Contains(h.n.msgs[0], "abuse_out · 香港（a）") || strings.Contains(h.n.msgs[0], "· b") {
+		t.Fatalf("exclude: %q", h.n.msgs)
+	}
+	// After the startup grace both fall silent; only b is covered by offline.
+	for i := 0; i < 13; i++ {
+		h.step(10*time.Second, nil)
+	}
+	if h.msgs() != 2 || !strings.Contains(h.n.msgs[1], "🔴 告警 offline · b") || strings.Contains(h.n.msgs[1], "香港") {
+		t.Fatalf("offline exclude: %q", h.n.msgs)
+	}
+}
+
+func TestNetAverageSmoothsSpikes(t *testing.T) {
+	h := setup(t, `  - {name: ddos, metric: net_in, op: ">=", threshold: 50, ratio: 4}`)
+	// One 10s spike to 200 Mbps among 0s averages to 33 Mbps over a minute.
+	for _, in := range []float64{0, 0, 0, 0, 0, 0, 200, 0, 0, 0, 0, 0, 0} {
+		h.step(10*time.Second, func() { h.traffic("a", in, 0) })
+	}
+	if h.msgs() != 0 {
+		t.Fatalf("spike alerted: %v", h.n.msgs)
+	}
+}
+
+func TestOfflineAfterFloodHintsNullRoute(t *testing.T) {
+	h := setup(t, `  - {name: offline, metric: offline, for: 1m}
+  - {name: ddos, metric: net_in, op: ">=", threshold: 50, ratio: 4, for: 5m, nodes: [a]}`)
+	for i := 0; i < 12; i++ {
+		h.step(10*time.Second, func() { h.traffic("a", 2, 2); h.traffic("b", 2, 2) })
+	}
+	// a is flooded for a minute then goes silent; b just goes silent.
+	for i := 0; i < 6; i++ {
+		h.step(10*time.Second, func() { h.traffic("a", 900, 30) })
+	}
+	for i := 0; i < 6; i++ {
+		h.step(10*time.Second, nil)
+	}
+	m := strings.Join(h.n.msgs, "\n---\n")
+	if !strings.Contains(m, "· 香港（a）\n已 1 分 0 秒 没有上报；停止上报前入站 900.0 Mbps、出站 30.0 Mbps，疑似被攻击后遭商家黑洞") ||
+		strings.Count(m, "黑洞") != 1 || strings.Count(m, "🔴 告警 offline") != 2 {
+		t.Fatalf("offline: %q", h.n.msgs)
 	}
 }

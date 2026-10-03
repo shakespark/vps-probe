@@ -26,6 +26,14 @@ const (
 	// Ping metrics are summed over this window; one 10s sample of 10
 	// pings is too noisy.
 	pingWindow = time.Minute
+	// net_in / net_out average this much of the node's newest samples.
+	netWindow = 60 // seconds, agent clock
+	// The offline alert looks this far back from a node's last report for
+	// an inbound surge, the usual sign of a provider null-routing it.
+	peakLookback = 5 * 60
+	// A peer whose pings to a node lose at least this much counts towards
+	// the evidence in a net_in alert.
+	fanInLoss = 20.0
 	// A firing alert recovers only after its condition has been false
 	// for min(for, maxDebounce).
 	maxDebounce = time.Minute
@@ -47,6 +55,7 @@ const (
 type Source interface {
 	Status(ctx context.Context, node string) (*store.Status, error)
 	Matrix(ctx context.Context, window time.Duration) ([]store.Link, error)
+	NetSums(ctx context.Context, node string, from, to int64) ([]store.NetSum, error)
 	AlertStates() ([]store.AlertState, error)
 	SaveAlerts(put, del []store.AlertState, events []store.AlertEvent) error
 	PruneAlertStates(rules []string) error
@@ -168,32 +177,93 @@ type obs struct {
 	detail       string // human-readable current value, e.g. "CPU 95.2%"
 }
 
+// rate is a node's network speed in Mbps, summed over its interfaces.
+type rate struct{ in, out float64 }
+
 type snapshot struct {
 	status map[string]*store.Status
 	links  []store.Link
+	net    map[string]rate // online nodes: the last netWindow on average
+	peak   map[string]rate // offline nodes: the busiest inbound netWindow before they went silent
 }
 
-func (e *Evaluator) snapshot(ctx context.Context) (*snapshot, error) {
-	s := &snapshot{status: map[string]*store.Status{}}
+func (e *Evaluator) snapshot(ctx context.Context, now time.Time) (*snapshot, error) {
+	s := &snapshot{status: map[string]*store.Status{}, net: map[string]rate{}, peak: map[string]rate{}}
+	var needNet, needPeak bool
+	for _, r := range e.cfg.Alerts {
+		needNet = needNet || r.Metric == config.MetricNetIn || r.Metric == config.MetricNetOut
+		needPeak = needPeak || r.Metric == config.MetricNetIn && r.Ratio > 0
+	}
 	for _, n := range e.cfg.Nodes {
 		st, err := e.src.Status(ctx, n.ID)
 		if err != nil {
 			return nil, err
 		}
 		s.status[n.ID] = st
+		if st == nil {
+			continue
+		}
+		online := now.Sub(time.Unix(st.FreshAt, 0)) <= time.Duration(e.cfg.OfflineAfter)
+		switch {
+		case online && needNet:
+			sums, err := e.src.NetSums(ctx, n.ID, st.MaxTS-netWindow+1, st.MaxTS)
+			if err != nil {
+				return nil, err
+			}
+			if len(sums) > 0 {
+				s.net[n.ID] = average(sums)
+			}
+		case !online && needPeak:
+			sums, err := e.src.NetSums(ctx, n.ID, st.MaxTS-peakLookback-netWindow+1, st.MaxTS)
+			if err != nil {
+				return nil, err
+			}
+			if r, ok := busiestIn(sums); ok {
+				s.peak[n.ID] = r
+			}
+		}
 	}
 	var err error
 	s.links, err = e.src.Matrix(ctx, pingWindow)
 	return s, err
 }
 
+func average(sums []store.NetSum) rate {
+	var rx, tx float64
+	for _, n := range sums {
+		rx, tx = rx+n.RX, tx+n.TX
+	}
+	k := float64(len(sums))
+	return rate{in: mbps(rx / k), out: mbps(tx / k)}
+}
+
+// busiestIn averages every netWindow of samples ending at a sample and
+// returns the one with the most inbound traffic. Windows begin at the
+// first sample, so the earliest ones may be shorter.
+func busiestIn(sums []store.NetSum) (rate, bool) {
+	var best rate
+	found := false
+	for i, end := range sums {
+		j := i
+		for j > 0 && sums[j-1].TS > end.TS-netWindow {
+			j--
+		}
+		if r := average(sums[j : i+1]); !found || r.in > best.in {
+			best, found = r, true
+		}
+	}
+	return best, found
+}
+
+func mbps(bytesPerSec float64) float64 { return bytesPerSec * 8 / 1e6 }
+
 // Tick runs one evaluation round and sends one merged message for it.
 func (e *Evaluator) Tick(ctx context.Context) error {
-	snap, err := e.snapshot(ctx)
+	now := e.now()
+	snap, err := e.snapshot(ctx, now)
 	if err != nil {
 		return err
 	}
-	now := e.now()
 
 	e.mu.Lock()
 	var put, del []store.AlertState
@@ -331,12 +401,26 @@ func (e *Evaluator) nodeName(id string) string {
 
 func (e *Evaluator) message(title string, r *config.Rule, k key, detail string, now time.Time, extra string) string {
 	var b strings.Builder
+	// A second line of detail is supporting evidence; it goes after the
+	// threshold so that doesn't read as the evidence's threshold.
+	detail, note, _ := strings.Cut(detail, "\n")
 	fmt.Fprintf(&b, "%s %s · %s\n%s", title, r.Name, e.nodeName(k.node), detail)
 	if r.Threshold != nil && !strings.HasPrefix(title, "🟢") {
-		fmt.Fprintf(&b, "（阈值 %s %s）", r.Op, fmtValue(r.Metric, *r.Threshold))
+		fmt.Fprintf(&b, "（阈值 %s %s", r.Op, fmtValue(r.Metric, *r.Threshold))
+		if r.Ratio > 0 {
+			other := "出站"
+			if r.Metric == config.MetricNetOut {
+				other = "入站"
+			}
+			fmt.Fprintf(&b, "，且不低于%s的 %g 倍", other, r.Ratio)
+		}
+		b.WriteString("）")
 	}
 	if extra != "" {
 		b.WriteString("，" + extra)
+	}
+	if note != "" {
+		b.WriteString("\n" + note)
 	}
 	b.WriteString("\n" + now.In(e.cfg.Location).Format("2006-01-02 15:04:05"))
 	return b.String()
@@ -347,7 +431,7 @@ func (e *Evaluator) message(title string, r *config.Rule, k key, detail string, 
 func (e *Evaluator) observe(r *config.Rule, snap *snapshot, now time.Time) []obs {
 	var out []obs
 	for _, n := range e.cfg.Nodes {
-		if !r.Nodes.Has(n.ID) {
+		if !r.Covers(n.ID) {
 			continue
 		}
 		st := snap.status[n.ID]
@@ -365,6 +449,9 @@ func (e *Evaluator) observe(r *config.Rule, snap *snapshot, now time.Time) []obs
 				detail = "从未上报"
 			} else if silent < time.Duration(r.For) {
 				detail = "已恢复上报"
+			} else if p, ok := snap.peak[n.ID]; ok && e.floodBefore(n.ID, p) {
+				detail += fmt.Sprintf("；停止上报前入站 %s、出站 %s，疑似被攻击后遭商家黑洞",
+					fmtMbps(p.in), fmtMbps(p.out))
 			}
 			out = append(out, obs{node: n.ID, value: silent.Seconds(), cond: silent >= time.Duration(r.For), detail: detail})
 			continue
@@ -403,6 +490,42 @@ func (e *Evaluator) observe(r *config.Rule, snap *snapshot, now time.Time) []obs
 					add(d.Mount, 100*float64(d.Used)/float64(d.Total), "磁盘 "+d.Mount)
 				}
 			}
+		case config.MetricNetIn, config.MetricNetOut:
+			rt, ok := snap.net[n.ID]
+			if !ok {
+				continue
+			}
+			own, other := rt.in, rt.out
+			if r.Metric == config.MetricNetOut {
+				own, other = other, own
+			}
+			cond := compare(own, r.Op, *r.Threshold) && own >= r.Ratio*other
+			detail := fmt.Sprintf("入站 %s，出站 %s", fmtMbps(rt.in), fmtMbps(rt.out))
+			if !cond && r.Ratio > 0 && r.Metric == config.MetricNetIn {
+				// An inbound-only null-route ends the flood at the NIC while
+				// the agent's reports still get out: the alert would recover
+				// although nothing can reach the node.
+				if lossy, measured := fanIn(n.ID, snap); measured > 0 && lossy*2 >= measured {
+					detail += fmt.Sprintf("\n入站已回落，但 %d 个节点中 %d 个到它仍丢包 ≥ %.0f%%，可能已被商家黑洞",
+						measured, lossy, fanInLoss)
+				}
+			}
+			if cond && r.Ratio > 0 {
+				what := "疑似 DDoS"
+				if r.Metric == config.MetricNetOut {
+					what = "疑似被利用对外攻击"
+				}
+				detail = what + "：" + detail
+				if other > 0 {
+					detail += fmt.Sprintf("（%.1f 倍）", own/other)
+				}
+				if r.Metric == config.MetricNetIn {
+					if lossy, measured := fanIn(n.ID, snap); measured > 0 {
+						detail += fmt.Sprintf("\n%d 个节点中 %d 个到它丢包 ≥ %.0f%%", measured, lossy, fanInLoss)
+					}
+				}
+			}
+			out = append(out, obs{node: n.ID, value: own, cond: cond, detail: detail})
 		case config.MetricPingLoss, config.MetricPingAvg:
 			for _, l := range snap.links {
 				if l.Src != n.ID || l.Sent == 0 || e.reportedDown(l.Dst, snap, now) {
@@ -432,7 +555,35 @@ func (e *Evaluator) reportedDown(dst string, snap *snapshot, now time.Time) bool
 		return false
 	}
 	for i := range e.cfg.Alerts {
-		if r := &e.cfg.Alerts[i]; r.Metric == config.MetricOffline && r.Nodes.Has(dst) {
+		if r := &e.cfg.Alerts[i]; r.Metric == config.MetricOffline && r.Covers(dst) {
+			return true
+		}
+	}
+	return false
+}
+
+// fanIn counts the nodes pinging id over the last minute and those of
+// them losing at least fanInLoss: a flood fills the node's inbound link,
+// so every peer sees loss at once, while a bad route affects only some.
+func fanIn(id string, snap *snapshot) (lossy, measured int) {
+	for _, l := range snap.links {
+		if l.Dst != id || l.Sent == 0 {
+			continue
+		}
+		measured++
+		if l.LossPct >= fanInLoss {
+			lossy++
+		}
+	}
+	return lossy, measured
+}
+
+// floodBefore reports whether the busiest inbound minute before a node
+// went silent meets a net_in rule with a ratio that covers the node.
+func (e *Evaluator) floodBefore(id string, p rate) bool {
+	for _, r := range e.cfg.Alerts {
+		if r.Metric == config.MetricNetIn && r.Ratio > 0 && r.Covers(id) &&
+			compare(p.in, r.Op, *r.Threshold) && p.in >= r.Ratio*p.out {
 			return true
 		}
 	}
@@ -444,7 +595,7 @@ func (e *Evaluator) traffic(r *config.Rule, snap *snapshot, now time.Time,
 	emit func(key, string, float64, string), persist func(key, *instance)) {
 	for _, n := range e.cfg.Nodes {
 		st := snap.status[n.ID]
-		if !r.Nodes.Has(n.ID) || n.QuotaGB <= 0 || st == nil || st.Traffic == nil {
+		if !r.Covers(n.ID) || n.QuotaGB <= 0 || st == nil || st.Traffic == nil {
 			continue
 		}
 		t := st.Traffic
@@ -486,7 +637,7 @@ func (e *Evaluator) expiry(r *config.Rule, now time.Time,
 	for i := range e.cfg.Nodes {
 		n := &e.cfg.Nodes[i]
 		date, days, ok := n.Expiry(now, e.cfg.Location)
-		if !r.Nodes.Has(n.ID) || !ok {
+		if !r.Covers(n.ID) || !ok {
 			continue
 		}
 		k := key{r.Name, n.ID, date}
@@ -537,7 +688,7 @@ func (e *Evaluator) ipChange(r *config.Rule, snap *snapshot, now time.Time,
 	emit func(key, string, float64, string), persist func(key, *instance), drop func(key)) {
 	for _, n := range e.cfg.Nodes {
 		st := snap.status[n.ID]
-		if !r.Nodes.Has(n.ID) || st == nil || st.IP == "" {
+		if !r.Covers(n.ID) || st == nil || st.IP == "" {
 			continue
 		}
 		k := key{r.Name, n.ID, st.IP}
@@ -595,9 +746,13 @@ func fmtValue(metric string, v float64) string {
 		return fmt.Sprintf("%.2f", v)
 	case config.MetricPingAvg:
 		return fmt.Sprintf("%.1f ms", v)
+	case config.MetricNetIn, config.MetricNetOut:
+		return fmtMbps(v)
 	}
 	return fmt.Sprintf("%.1f%%", v)
 }
+
+func fmtMbps(v float64) string { return fmt.Sprintf("%.1f Mbps", v) }
 
 func fmtDur(d time.Duration) string {
 	d = d.Round(time.Second)

@@ -457,3 +457,19 @@ func TestSocketsAndThreads(t *testing.T) {
 		t.Fatalf("rollup: tcp %v max %v threads_max %v", *m.Cols["tcp"][0], *m.Cols["tcp_max"][0], *m.Cols["threads_max"][0])
 	}
 }
+
+func TestNetSums(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().Truncate(time.Minute)
+	for i, ts := int64(0), now.Unix(); i < 4; i, ts = i+1, ts+10 {
+		write(t, s, "a", &pb.Report{Ts: ts, Net: []*pb.NetRate{{Iface: "eth0", RxRate: 100, TxRate: 10},
+			{Iface: "eth1", RxRate: uint64(i), TxRate: 1}}}, time.Unix(ts, 0))
+	}
+	got, err := s.NetSums(ctx, "a", now.Unix()+10, now.Unix()+20)
+	if err != nil || len(got) != 2 || got[0] != (NetSum{TS: now.Unix() + 10, RX: 101, TX: 11}) || got[1].RX != 102 {
+		t.Fatalf("sums: %+v %v", got, err)
+	}
+	if got, _ := s.NetSums(ctx, "zz", 0, now.Unix()+100); got != nil {
+		t.Fatalf("unknown node: %+v", got)
+	}
+}

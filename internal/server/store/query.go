@@ -493,6 +493,33 @@ func (s *Store) Matrix(ctx context.Context, window time.Duration) ([]Link, error
 	return out, err
 }
 
+// NetSum is one sample's rates summed over the node's interfaces.
+type NetSum struct {
+	TS int64
+	RX float64 // bytes/s
+	TX float64
+}
+
+// NetSums lists the node's samples with from <= ts <= to (agent clock),
+// oldest first.
+func (s *Store) NetSums(ctx context.Context, node string, from, to int64) ([]NetSum, error) {
+	rid, ok := s.nodeID(node)
+	if !ok {
+		return nil, nil
+	}
+	var out []NetSum
+	err := s.each(ctx, `SELECT ts, sum(rx), sum(tx) FROM net_raw WHERE node = ? AND ts >= ? AND ts <= ?
+		GROUP BY ts ORDER BY ts`, []any{rid, from, to}, func(r *sql.Rows) error {
+		var n NetSum
+		if err := r.Scan(&n.TS, &n.RX, &n.TX); err != nil {
+			return err
+		}
+		out = append(out, n)
+		return nil
+	})
+	return out, err
+}
+
 func (s *Store) each(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error {
 	rows, err := s.r.QueryContext(ctx, q, args...)
 	if err != nil {

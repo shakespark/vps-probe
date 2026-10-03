@@ -92,6 +92,7 @@ alerts:
   - {name: disk, metric: disk, op: ">=", threshold: 85, nodes: [b], notify_recovery: false}
   - {name: down, metric: offline, for: 60s, nodes: all}
   - {name: quota, metric: traffic, levels: [50, 100]}
+  - {name: ddos, metric: net_in, op: ">=", threshold: 50, ratio: 4, for: 2m, exclude: [b]}
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +101,8 @@ alerts:
 		t.Fatalf("telegram: %+v", c.Telegram)
 	}
 	r := c.Alerts
-	if len(r) != 4 || !r[0].Nodes.Has("a") || r[1].Nodes.Has("a") || !r[1].Nodes.Has("b") {
+	if len(r) != 5 || r[4].Ratio != 4 || *r[4].Threshold != 50 || !r[4].Covers("a") || r[4].Covers("b") ||
+		!r[1].Covers("b") || r[1].Covers("a") || !r[0].Nodes.Has("a") || r[1].Nodes.Has("a") || !r[1].Nodes.Has("b") {
 		t.Fatalf("nodes: %+v", r)
 	}
 	if !r[0].Recovers() || r[1].Recovers() || time.Duration(r[0].Repeat) != time.Hour {
@@ -136,6 +138,13 @@ func TestBadAlertRules(t *testing.T) {
 		"expiry negative":   "  - {name: x, metric: expiry, levels: [-1]}",
 		"ip_change for":     "  - {name: x, metric: ip_change, for: 1m}",
 		"ip_change levels":  "  - {name: x, metric: ip_change, levels: [1]}",
+		"exclude unknown":   "  - {name: x, metric: cpu, op: '>', threshold: 1, exclude: [zz]}",
+		"exclude and nodes": "  - {name: x, metric: cpu, op: '>', threshold: 1, nodes: [a], exclude: [a]}",
+		"exclude empty":     "  - {name: x, metric: cpu, op: '>', threshold: 1, exclude: []}",
+		"ratio on cpu":      "  - {name: x, metric: cpu, op: '>', threshold: 1, ratio: 2}",
+		"ratio below 1":     "  - {name: x, metric: net_in, op: '>', threshold: 1, ratio: 0.5}",
+		"ratio with <":      "  - {name: x, metric: net_in, op: '<', threshold: 1, ratio: 2}",
+		"net no threshold":  "  - {name: x, metric: net_out, op: '>', ratio: 2}",
 		"unknown node":      "  - {name: x, metric: cpu, op: '>', threshold: 1, nodes: [zz]}",
 		"nodes typo":        "  - {name: x, metric: cpu, op: '>', threshold: 1, nodes: everyone}",
 		"short repeat":      "  - {name: x, metric: cpu, op: '>', threshold: 1, repeat: 10s}",

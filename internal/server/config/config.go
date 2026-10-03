@@ -125,9 +125,13 @@ type Rule struct {
 	Threshold      *float64  `yaml:"threshold" json:"threshold,omitempty"`
 	For            Duration  `yaml:"for" json:"for"`
 	Nodes          NodeSet   `yaml:"nodes" json:"nodes"`
+	Exclude        []string  `yaml:"exclude" json:"exclude,omitempty"` // with nodes: all
 	Repeat         Duration  `yaml:"repeat" json:"repeat"`
 	NotifyRecovery *bool     `yaml:"notify_recovery" json:"notify_recovery"`
 	Levels         []float64 `yaml:"levels" json:"levels,omitempty"`
+	// net_in / net_out: also require this direction >= Ratio x the other
+	// one; 0 = no such check.
+	Ratio float64 `yaml:"ratio" json:"ratio,omitempty"`
 }
 
 // Metrics a rule can watch.
@@ -144,13 +148,19 @@ const (
 	MetricTraffic  = "traffic"
 	MetricExpiry   = "expiry"
 	MetricIPChange = "ip_change"
+	MetricNetIn    = "net_in"  // Mbps, summed over the reported interfaces
+	MetricNetOut   = "net_out" // Mbps
 )
 
 var (
 	metrics = []string{MetricCPU, MetricSteal, MetricLoad1, MetricMem, MetricSwap, MetricDisk,
-		MetricOffline, MetricPingLoss, MetricPingAvg, MetricTraffic, MetricExpiry, MetricIPChange}
+		MetricOffline, MetricPingLoss, MetricPingAvg, MetricTraffic, MetricExpiry, MetricIPChange,
+		MetricNetIn, MetricNetOut}
 	ops = []string{">", ">=", "<", "<="}
 )
+
+// Covers reports whether the rule applies to node id.
+func (r *Rule) Covers(id string) bool { return r.Nodes.Has(id) && !slices.Contains(r.Exclude, id) }
 
 // Recovers reports whether recovery messages are sent (default true).
 func (r *Rule) Recovers() bool { return r.NotifyRecovery == nil || *r.NotifyRecovery }
@@ -214,6 +224,8 @@ func DefaultRules() []Rule {
 		{Name: "link_loss", Metric: MetricPingLoss, Op: ">", Threshold: ptr(20), For: Duration(3 * time.Minute)},
 		{Name: "traffic_quota", Metric: MetricTraffic, Levels: []float64{80, 90, 100}},
 		{Name: "expiry", Metric: MetricExpiry, Levels: []float64{7, 1}},
+		{Name: "ddos", Metric: MetricNetIn, Op: ">=", Threshold: ptr(50), Ratio: 4, For: Duration(2 * time.Minute)},
+		{Name: "abuse_out", Metric: MetricNetOut, Op: ">=", Threshold: ptr(50), Ratio: 4, For: Duration(5 * time.Minute)},
 	}
 }
 
@@ -468,6 +480,19 @@ func (c *Config) validate() error {
 				bad("%s: nodes: %q is not a configured node", where, id)
 			}
 		}
+		if r.Exclude != nil {
+			if r.Nodes.IDs != nil {
+				bad("%s: exclude only goes with nodes: all; drop the node from the nodes list instead", where)
+			}
+			if len(r.Exclude) == 0 {
+				bad("%s: exclude: empty list; omit it", where)
+			}
+			for _, id := range r.Exclude {
+				if _, ok := ids[id]; !ok {
+					bad("%s: exclude: %q is not a configured node", where, id)
+				}
+			}
+		}
 		if r.For < 0 || r.Repeat < 0 {
 			bad("%s: for/repeat must not be negative", where)
 		}
@@ -510,6 +535,16 @@ func (c *Config) validate() error {
 			}
 			if r.Levels != nil {
 				bad("%s: levels only apply to traffic", where)
+			}
+		}
+		if r.Ratio != 0 {
+			switch {
+			case r.Metric != MetricNetIn && r.Metric != MetricNetOut:
+				bad("%s: ratio only applies to net_in / net_out", where)
+			case r.Ratio < 1:
+				bad("%s: ratio: want >= 1 (this direction at least ratio x the other), or omit it", where)
+			case r.Op != ">" && r.Op != ">=":
+				bad("%s: ratio needs op > or >=", where)
 			}
 		}
 	}

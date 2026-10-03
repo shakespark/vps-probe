@@ -410,11 +410,12 @@ backup:
 ```yaml
 alerts:
   - name: cpu_high
-    metric: cpu            # cpu | mem | swap | disk | load1 | steal | offline | ping_loss | ping_avg | traffic | expiry | ip_change
+    metric: cpu            # cpu | mem | swap | disk | load1 | steal | offline | ping_loss | ping_avg | net_in | net_out | traffic | expiry | ip_change
     op: ">"
     threshold: 90
     for: 5m                # 持续多久才触发
     nodes: all             # 或 [hk-1, jp-1]
+    # exclude: [hk-2]      # 只能配 nodes: all：除这些节点外全部（以后新加的节点自动包含）
     repeat: 1h             # 仍未恢复时的重复提醒间隔，0 表示不重复
     notify_recovery: true
   - name: disk_full
@@ -430,6 +431,18 @@ alerts:
     op: ">"
     threshold: 20
     for: 3m
+  - name: ddos
+    metric: net_in         # 入站 Mbps，最近 60s 平均
+    op: ">="
+    threshold: 50
+    ratio: 4               # 且入站 ≥ 4 × 出站
+    for: 2m
+  - name: abuse_out
+    metric: net_out        # 出站，被利用对外攻击
+    op: ">="
+    threshold: 50
+    ratio: 4
+    for: 5m
   - name: traffic_quota
     metric: traffic        # 按配额百分比，每个周期每个档位只提醒一次
     levels: [80, 90, 100]
@@ -447,12 +460,19 @@ alerts:
   - ping_loss、ping_avg 按 (src, dst) 链路取最近 60s 的汇总（单个 10s 样本只有 10 个包，太抖）；
   - offline = 超过 `for` 没有新鲜报文（从未上报的节点也算），不经过 pending；
   - 目标节点已离线（超过 `offline_after` 没有新鲜报文）且有 offline 规则覆盖它时，指向它的链路不评估 ping_loss / ping_avg：节点宕机时其他节点必然全部 ping 不通，离线告警已经说明了，不再每条链路各报一次。目标还在上报、只是 ping 不通时照常告警；没有 offline 规则覆盖的目标也照常告警。
+  - net_in / net_out：节点最近 60s（按 agent 时钟，到最新一条报文为止）的每个采样把各网卡速率相加，再取平均，单位 Mbps（10^6 bit/s）；按平均而不是单个 10s 采样，一次几秒的下载尖峰不会触发。可选 `ratio`：本方向还要 ≥ ratio × 反方向才算满足（只能配 `>` / `>=`）。
+    - 用途是识别 DDoS：中转机的正常流量收发大致对称（从一边收进来，从另一边发出去），被流量型攻击（UDP flood、反射放大）时入站远大于出站；被利用去打别人时出站远大于入站。比例条件让阈值不必按端口带宽精调，对称的大流量不会误报。下载为主（入站多）或做种（出站多）的节点用 `exclude` 排除。
+    - 写了 ratio 的规则在告警时标明「疑似 DDoS」/「疑似被利用对外攻击」并给出倍数；net_in 另附「N 个节点中 M 个到它丢包 ≥ 20%」（按最近 60s 的链路汇总），作为入口被打满的佐证：流量打满入口时所有对端同时丢包，线路问题只影响部分对端。只是佐证、不是条件——有的节点没人 ping，有的只有少数几个对端。
+    - 2026-10 用线上 48 小时数据回测：阈值 50 Mbps、ratio 4 时，单向流量最长持续 130s（下载为主的家宽节点之外入站方向为 0），所以默认入站 `for: 2m`、出站 `for: 5m`。
+    - 识别不了「包多但流量不大」的攻击（SYN flood、小包 UDP flood）：需要每秒包数和软中断占比，见 §12。
+  - 黑洞提示：offline 告警触发时，回看节点最后一条报文之前 5 分钟内入站最高的 60s 平均；它满足某条覆盖该节点、写了 ratio 的 net_in 规则时，离线消息附「停止上报前入站 X、出站 Y，疑似被攻击后遭商家黑洞」。商家通常在被打时把 IP 丢进黑洞，流量到不了网卡，这时只剩离线告警会响。被打期间丢失的报文 agent 会在恢复后补传，所以提示依据的是服务端当时已经收到的数据。
+  - 只封入站的黑洞（目标是该 IP 的流量被丢弃，机器自己发出的包照常出去）不会让节点离线：入站回落到 0，ddos 规则会恢复。所以写了 ratio 的 net_in 规则恢复时，若最近 60s 至少一半 ping 它的节点丢包 ≥ 20%，恢复消息附「入站已回落，但 N 个节点中 M 个到它仍丢包 ≥ 20%，可能已被商家黑洞」。只加说明，不阻止恢复。
   - expiry 只评估写了 `expire_at` 的节点：剩余天数 ≤ 某档且该档比已提醒过的更紧迫时提醒一次（一轮跨过多档只发最紧迫的一档，首次配置时已过期也只发一条）。状态按 (规则, 节点, 到期日) 记录，续费改了 `expire_at` 或按 `renew_months` 顺延后是新的到期日，重新计档，旧日期的状态删除。
   - ip_change：最新报文的来源 IP 与记录的不同时通知一次「旧 → 新」，没有告警中/恢复状态；某节点第一次看到的 IP 只记录不通知（升级后不会每个节点报一遍）。当前 IP 存在 `alert_state.target`，重启不重复。agent 重新解析服务端地址时换了地址族（v4 ↔ v6）也会算作变化。
   - traffic 按节点的 `traffic_quota_mode` 计算已用量，没设配额的节点跳过；状态按 (规则, 节点, 周期起始) 记录，每个周期每个档位只提醒一次，下个周期自动重新计。
 - **数据缺失**（节点离线、没有对应数据）时：firing 的告警保持不动，不发恢复；pending 的归零。
 - 服务端启动后的前 2 分钟不评估 offline，避免服务端重启时误报所有节点离线。
-- 未配置 `alerts` 时使用默认规则：offline 60s、cpu > 90% 5m、mem > 90% 5m、disk > 90% 10m、ping_loss > 20% 3m、traffic [80, 90, 100]、expiry [7, 1]。ip_change 不在默认规则里（动态 IP 的节点会频繁触发）。写了 `alerts` 就只用写的规则。
+- 未配置 `alerts` 时使用默认规则：offline 60s、cpu > 90% 5m、mem > 90% 5m、disk > 90% 10m、ping_loss > 20% 3m、traffic [80, 90, 100]、expiry [7, 1]、ddos（net_in ≥ 50 Mbps 且 ≥ 4 × 出站 2m）、abuse_out（net_out ≥ 50 Mbps 且 ≥ 4 × 入站 5m）。ip_change 不在默认规则里（动态 IP 的节点会频繁触发）。写了 `alerts` 就只用写的规则。
 - firing 状态和流量档位持久化在 `alert_state`，服务端重启不会重复告警；`alert_history` 保留 400 天（跟随 `retention.h1`）。配置里删掉的规则，其状态在启动时清理。
 
 Telegram：
@@ -552,6 +572,7 @@ docs/
 
 ## 12. 暂不做
 
+- 每秒包数（`/proc/net/dev` 的包计数）和软中断占比（`/proc/stat` 的 softirq）：识别 SYN flood 等「包多流量小」的攻击，可做 `pps_in` 规则。只读 `/proc`，但要发 agent 新版本，留到下一次 agent 发版
 - TCP 时延（后续可做 TCP connect 到对端已有端口）；经端口转发隧道的时延已由 DNS 探测和隧道回显覆盖
 - 容器型 VPS（OpenVZ/LXC 的 venet 网卡识别）
 - 多用户 / 权限体系（依赖 CF Access）

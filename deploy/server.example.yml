@@ -61,7 +61,7 @@ offline_after: 30s
 #   aud: "0123...（64 位十六进制 AUD tag）"
 
 # 告警规则，见 docs/DESIGN.md §7。整段不写 = 使用下面这组默认规则；写 `alerts: []` = 不告警。
-# metric: cpu | steal | load1 | mem | swap | disk | offline | ping_loss | ping_avg | traffic | expiry | ip_change
+# metric: cpu | steal | load1 | mem | swap | disk | offline | ping_loss | ping_avg | net_in | net_out | traffic | expiry | ip_change
 alerts:
   - name: offline
     metric: offline
@@ -72,6 +72,7 @@ alerts:
     threshold: 90
     for: 5m                   # 持续多久才告警
     # nodes: [hk-1]           # 默认 all
+    # exclude: [hk-2]         # 配合 nodes: all，除这些节点外全部（新加的节点自动包含）
     # repeat: 1h              # 仍未恢复时每隔多久提醒一次，默认不提醒
     # notify_recovery: false  # 默认恢复时也发消息
   - name: mem_high
@@ -90,6 +91,20 @@ alerts:
     op: ">"
     threshold: 20
     for: 3m
+  - name: ddos
+    metric: net_in            # 入站 Mbps，最近 60s 平均，各网卡相加
+    op: ">="
+    threshold: 50
+    ratio: 4                  # 且入站 >= 4 倍出站：中转的对称大流量不报
+    for: 2m
+    # exclude: [home-1]       # 以下载为主的节点
+  - name: abuse_out
+    metric: net_out           # 出站远大于入站：机器可能被利用去打别人
+    op: ">="
+    threshold: 50
+    ratio: 4
+    for: 5m
+    # exclude: [seedbox-1]    # 做种的节点
   - name: traffic_quota
     metric: traffic           # 只对设置了 traffic_quota_gb 的节点生效
     levels: [80, 90, 100]     # 每个周期每档只提醒一次
