@@ -1,4 +1,4 @@
-module vpsprobe
+module github.com/shakespark/vps-probe
 
 go 1.24.0
 

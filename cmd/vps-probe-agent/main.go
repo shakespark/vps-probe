@@ -14,11 +14,11 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
-	"vpsprobe/internal/agent"
-	"vpsprobe/internal/agent/config"
-	"vpsprobe/internal/agent/report"
-	pb "vpsprobe/internal/proto/probev1"
-	"vpsprobe/internal/wire"
+	"github.com/shakespark/vps-probe/internal/agent"
+	"github.com/shakespark/vps-probe/internal/agent/config"
+	"github.com/shakespark/vps-probe/internal/agent/report"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/wire"
 )
 
 var version = "dev"

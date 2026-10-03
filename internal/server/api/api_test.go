@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	pb "vpsprobe/internal/proto/probev1"
-	"vpsprobe/internal/server/alert"
-	"vpsprobe/internal/server/config"
-	"vpsprobe/internal/server/store"
-	"vpsprobe/web"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/server/alert"
+	"github.com/shakespark/vps-probe/internal/server/config"
+	"github.com/shakespark/vps-probe/internal/server/store"
+	"github.com/shakespark/vps-probe/web"
 )
 
 type noStats struct{}

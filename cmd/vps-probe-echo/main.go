@@ -20,7 +20,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"vpsprobe/internal/echo"
+	"github.com/shakespark/vps-probe/internal/echo"
 )
 
 var version = "dev"

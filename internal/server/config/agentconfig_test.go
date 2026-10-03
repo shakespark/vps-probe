@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	agentconfig "vpsprobe/internal/agent/config"
+	agentconfig "github.com/shakespark/vps-probe/internal/agent/config"
 )
 
 func TestAgentConfigRoundTrip(t *testing.T) {

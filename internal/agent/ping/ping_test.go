@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"vpsprobe/internal/echo"
+	"github.com/shakespark/vps-probe/internal/echo"
 )
 
 var discard = slog.New(slog.NewTextHandler(io.Discard, nil))

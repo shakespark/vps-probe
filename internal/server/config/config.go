@@ -20,9 +20,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"vpsprobe/internal/echo"
-	"vpsprobe/internal/server/basicauth"
-	"vpsprobe/internal/wire"
+	"github.com/shakespark/vps-probe/internal/echo"
+	"github.com/shakespark/vps-probe/internal/server/basicauth"
+	"github.com/shakespark/vps-probe/internal/wire"
 )
 
 type Config struct {

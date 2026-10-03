@@ -82,7 +82,7 @@ test:
 # Requires protoc and protoc-gen-go on PATH. Generated code is committed, so
 # this is only needed after editing proto/.
 proto:
-	protoc --go_out=. --go_opt=module=vpsprobe proto/probe/v1/probe.proto
+	protoc --go_out=. --go_opt=module=github.com/shakespark/vps-probe proto/probe/v1/probe.proto
 
 clean:
 	rm -rf dist

@@ -5,7 +5,7 @@ import (
 	"time"
 	"unicode"
 
-	pb "vpsprobe/internal/proto/probev1"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
 )
 
 // Limits for values from an authenticated agent. A compromised or buggy

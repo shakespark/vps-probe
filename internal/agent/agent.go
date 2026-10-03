@@ -13,11 +13,11 @@ import (
 	"syscall"
 	"time"
 
-	"vpsprobe/internal/agent/collect"
-	"vpsprobe/internal/agent/config"
-	"vpsprobe/internal/agent/ping"
-	"vpsprobe/internal/agent/traffic"
-	pb "vpsprobe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/agent/collect"
+	"github.com/shakespark/vps-probe/internal/agent/config"
+	"github.com/shakespark/vps-probe/internal/agent/ping"
+	"github.com/shakespark/vps-probe/internal/agent/traffic"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
 )
 
 const (

@@ -22,16 +22,16 @@ import (
 
 	"golang.org/x/term"
 
-	"vpsprobe/internal/release"
-	"vpsprobe/internal/server/alert"
-	"vpsprobe/internal/server/api"
-	"vpsprobe/internal/server/basicauth"
-	"vpsprobe/internal/server/cfaccess"
-	"vpsprobe/internal/server/config"
-	"vpsprobe/internal/server/ingest"
-	"vpsprobe/internal/server/notify"
-	"vpsprobe/internal/server/store"
-	"vpsprobe/web"
+	"github.com/shakespark/vps-probe/internal/release"
+	"github.com/shakespark/vps-probe/internal/server/alert"
+	"github.com/shakespark/vps-probe/internal/server/api"
+	"github.com/shakespark/vps-probe/internal/server/basicauth"
+	"github.com/shakespark/vps-probe/internal/server/cfaccess"
+	"github.com/shakespark/vps-probe/internal/server/config"
+	"github.com/shakespark/vps-probe/internal/server/ingest"
+	"github.com/shakespark/vps-probe/internal/server/notify"
+	"github.com/shakespark/vps-probe/internal/server/store"
+	"github.com/shakespark/vps-probe/web"
 )
 
 var version = "dev"

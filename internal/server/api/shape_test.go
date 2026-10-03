@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	pb "vpsprobe/internal/proto/probev1"
-	"vpsprobe/internal/server/alert"
-	"vpsprobe/internal/server/config"
-	"vpsprobe/internal/server/store"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/server/alert"
+	"github.com/shakespark/vps-probe/internal/server/config"
+	"github.com/shakespark/vps-probe/internal/server/store"
 )
 
 // The demo site (docs/DESIGN.md §14) answers the API from a script, which

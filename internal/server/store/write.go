@@ -8,7 +8,7 @@ import (
 	"net/netip"
 	"time"
 
-	pb "vpsprobe/internal/proto/probev1"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
 )
 
 // Write stores one (already validated) report piece in a single transaction.

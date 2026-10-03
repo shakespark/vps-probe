@@ -1003,7 +1003,7 @@ const file_proto_probe_v1_probe_proto_rawDesc = "" +
 	"\x03max\x18\a \x01(\x02R\x03max\x12\x16\n" +
 	"\x06jitter\x18\b \x01(\x02R\x06jitter\"\x17\n" +
 	"\x03Ack\x12\x10\n" +
-	"\x03ids\x18\x01 \x03(\x04R\x03idsB!Z\x1fvpsprobe/internal/proto/probev1b\x06proto3"
+	"\x03ids\x18\x01 \x03(\x04R\x03idsB8Z6github.com/shakespark/vps-probe/internal/proto/probev1b\x06proto3"
 
 var (
 	file_proto_probe_v1_probe_proto_rawDescOnce sync.Once

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"vpsprobe/internal/server/config"
-	"vpsprobe/internal/server/store"
+	"github.com/shakespark/vps-probe/internal/server/config"
+	"github.com/shakespark/vps-probe/internal/server/store"
 )
 
 type fakeSrc struct {

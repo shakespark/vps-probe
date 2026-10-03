@@ -9,8 +9,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	pb "vpsprobe/internal/proto/probev1"
-	"vpsprobe/internal/wire"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/wire"
 )
 
 // Packet is one sealed datagram and the report id it carries.

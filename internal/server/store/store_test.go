@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	pb "vpsprobe/internal/proto/probev1"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
 )
 
 var (

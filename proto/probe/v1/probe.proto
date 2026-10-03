@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package probe.v1;
 
-option go_package = "vpsprobe/internal/proto/probev1";
+option go_package = "github.com/shakespark/vps-probe/internal/proto/probev1";
 
 // Report is one sample from an agent. A single (node, ts) sample may be split
 // across several Reports (e.g. pings in a separate packet); the server merges

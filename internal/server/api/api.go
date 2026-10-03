@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"vpsprobe/internal/server/alert"
-	"vpsprobe/internal/server/config"
-	"vpsprobe/internal/server/store"
+	"github.com/shakespark/vps-probe/internal/server/alert"
+	"github.com/shakespark/vps-probe/internal/server/config"
+	"github.com/shakespark/vps-probe/internal/server/store"
 )
 
 const (

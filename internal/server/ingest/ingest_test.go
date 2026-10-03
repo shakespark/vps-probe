@@ -16,11 +16,11 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"vpsprobe/internal/agent/report"
-	pb "vpsprobe/internal/proto/probev1"
-	"vpsprobe/internal/server/config"
-	"vpsprobe/internal/server/store"
-	"vpsprobe/internal/wire"
+	"github.com/shakespark/vps-probe/internal/agent/report"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/server/config"
+	"github.com/shakespark/vps-probe/internal/server/store"
+	"github.com/shakespark/vps-probe/internal/wire"
 )
 
 const (

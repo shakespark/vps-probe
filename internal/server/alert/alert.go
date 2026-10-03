@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
-	"vpsprobe/internal/agent/traffic"
-	"vpsprobe/internal/server/config"
-	"vpsprobe/internal/server/notify"
-	"vpsprobe/internal/server/store"
+	"github.com/shakespark/vps-probe/internal/agent/traffic"
+	"github.com/shakespark/vps-probe/internal/server/config"
+	"github.com/shakespark/vps-probe/internal/server/notify"
+	"github.com/shakespark/vps-probe/internal/server/store"
 )
 
 const (

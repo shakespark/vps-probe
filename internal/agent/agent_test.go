@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"vpsprobe/internal/agent/collect"
-	"vpsprobe/internal/agent/config"
+	"github.com/shakespark/vps-probe/internal/agent/collect"
+	"github.com/shakespark/vps-probe/internal/agent/config"
 )
 
 // A machine with a public and a private NIC: while there is no default
