@@ -193,7 +193,7 @@ func (c *Config) validate(p *problems) {
 
 	r := c.Retention
 	if time.Duration(r.Raw) < 6*time.Hour {
-		p.add("retention.raw: must be at least 6h (rollups recompute the last 3h from raw)")
+		p.add("retention.raw: must be at least 6h (rollups recompute about the last 4h from raw)")
 	}
 	if r.M5 < r.Raw || r.H1 < r.M5 {
 		p.add("retention: want raw <= m5 <= h1")

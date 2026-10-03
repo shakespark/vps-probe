@@ -8,7 +8,13 @@ import (
 	"time"
 
 	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/wire"
 )
+
+// liveSlack is how far a report's ts may be from its arrival for the report
+// to count as live: sent just now by an agent whose clock agrees with the
+// server's.
+const liveSlack = int64(wire.OfflineAfter / time.Second)
 
 // Write stores one (already validated) report in a single transaction.
 // Every statement is idempotent, so duplicates and replays change nothing,
@@ -16,6 +22,15 @@ import (
 // agent divided them: a field a piece does not carry is left as it is.
 // from is the packet's source address; it is recorded only when the report
 // is the node's newest.
+//
+// Newest means the highest ts. An agent whose clock ran ahead and was then
+// set back would lose to its own earlier reports until the clock caught up,
+// and count as offline meanwhile. So a live report always shows the node is
+// alive, and it is the newest against anything dated in the server's
+// future: max_ts, the system description and traffic totals. The caller has dropped duplicates, so a replay only passes as
+// live within liveSlack of the original, and only after a restart emptied
+// the caller's memory of report ids. The source address still needs a
+// higher ts, which no replay has.
 func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time.Time) error {
 	rid, ok := s.nodeID(node)
 	if !ok {
@@ -27,17 +42,29 @@ func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time
 	}
 	defer tx.Rollback()
 	ts := rep.Ts
+	skew := arrival.Unix() - ts
+	live := skew >= -liveSlack && skew <= liveSlack
+	// A stored ts above this was written by a clock that ran ahead.
+	future := arrival.Unix() + liveSlack
 
-	res, err := tx.Exec(`INSERT INTO node_status(node, max_ts, fresh_at, skew) VALUES (?, ?, ?, ?)
-		ON CONFLICT(node) DO UPDATE SET max_ts = excluded.max_ts, fresh_at = excluded.fresh_at, skew = excluded.skew
-		WHERE excluded.max_ts > node_status.max_ts`,
-		rid, ts, arrival.Unix(), arrival.Unix()-ts)
+	var maxTS sql.NullInt64
+	if err := tx.QueryRow(`SELECT max_ts FROM node_status WHERE node = ?`, rid).Scan(&maxTS); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	newer := !maxTS.Valid || ts > maxTS.Int64
+	switch {
+	case newer, live && maxTS.Int64 > future:
+		_, err = tx.Exec(`INSERT INTO node_status(node, max_ts, fresh_at, skew) VALUES (?, ?, ?, ?)
+			ON CONFLICT(node) DO UPDATE SET max_ts = excluded.max_ts, fresh_at = excluded.fresh_at, skew = excluded.skew`,
+			rid, ts, arrival.Unix(), skew)
+	case live:
+		// Out of order by a retry: alive, but not the newest data.
+		_, err = tx.Exec(`UPDATE node_status SET fresh_at = max(fresh_at, ?) WHERE node = ?`, arrival.Unix(), rid)
+	}
 	if err != nil {
 		return err
 	}
-	if fresh, err := res.RowsAffected(); err != nil {
-		return err
-	} else if fresh > 0 && from.IsValid() {
+	if newer && from.IsValid() {
 		ip := from.Unmap().String()
 		if _, err := tx.Exec(`UPDATE node_status SET ip = ?, ip_since = ? WHERE node = ? AND ip IS NOT ?`,
 			ip, arrival.Unix(), rid, ip); err != nil {
@@ -47,8 +74,8 @@ func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time
 	if y := rep.Sys; y != nil {
 		if _, err := tx.Exec(`UPDATE node_status SET sys_ts = ?, hostname = ?, os = ?, kernel = ?, arch = ?,
 				cores = ?, boot_time = ?, agent_version = ?
-			WHERE node = ? AND (sys_ts IS NULL OR sys_ts <= ?)`,
-			ts, y.Hostname, y.Os, y.Kernel, y.Arch, y.Cores, y.BootTime, y.AgentVersion, rid, ts); err != nil {
+			WHERE node = ? AND (sys_ts IS NULL OR sys_ts <= ? OR ? AND sys_ts > ?)`,
+			ts, y.Hostname, y.Os, y.Kernel, y.Arch, y.Cores, y.BootTime, y.AgentVersion, rid, ts, live, future); err != nil {
 			return err
 		}
 	}
@@ -111,13 +138,13 @@ func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time
 	day := time.Unix(ts, 0).In(s.loc).Format(time.DateOnly)
 	for _, t := range rep.Traffic {
 		if c := t.Cur; c != nil {
-			if err := upsertPeriod(tx, rid, t.Iface, c, ts); err != nil {
+			if err := upsertPeriod(tx, rid, t.Iface, c, ts, live, future); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(`INSERT INTO traffic_daily(node, iface, day, start, rx, tx, ts) VALUES (?, ?, ?, ?, ?, ?, ?)
-				ON CONFLICT(node, iface, day) DO UPDATE SET start = excluded.start, rx = excluded.rx, tx = excluded.tx, ts = excluded.ts
-				WHERE excluded.ts > traffic_daily.ts`,
-				rid, t.Iface, day, c.Start, int64(c.Rx), int64(c.Tx), ts); err != nil {
+				ON CONFLICT(node, start, iface, day) DO UPDATE SET rx = excluded.rx, tx = excluded.tx, ts = excluded.ts
+				WHERE excluded.ts > traffic_daily.ts OR ? AND traffic_daily.ts > ?`,
+				rid, t.Iface, day, c.Start, int64(c.Rx), int64(c.Tx), ts, live, future); err != nil {
 				return err
 			}
 		}
@@ -125,7 +152,7 @@ func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time
 		// also keeps an agent that lost its state file from zeroing the
 		// last month's record.
 		if p := t.Prev; p != nil && (p.Rx > 0 || p.Tx > 0) {
-			if err := upsertPeriod(tx, rid, t.Iface, p, ts); err != nil {
+			if err := upsertPeriod(tx, rid, t.Iface, p, ts, live, future); err != nil {
 				return err
 			}
 		}
@@ -133,11 +160,11 @@ func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time
 	return tx.Commit()
 }
 
-func upsertPeriod(tx *sql.Tx, rid int64, iface string, p *pb.Period, ts int64) error {
+func upsertPeriod(tx *sql.Tx, rid int64, iface string, p *pb.Period, ts int64, live bool, future int64) error {
 	_, err := tx.Exec(`INSERT INTO traffic_period(node, iface, start, end, rx, tx, ts) VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(node, iface, start) DO UPDATE SET end = excluded.end, rx = excluded.rx, tx = excluded.tx, ts = excluded.ts
-		WHERE excluded.ts > traffic_period.ts`,
-		rid, iface, p.Start, p.End, int64(p.Rx), int64(p.Tx), ts)
+		WHERE excluded.ts > traffic_period.ts OR ? AND traffic_period.ts > ?`,
+		rid, iface, p.Start, p.End, int64(p.Rx), int64(p.Tx), ts, live, future)
 	return err
 }
 

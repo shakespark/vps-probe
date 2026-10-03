@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path"
 	"slices"
 	"strings"
 	"time"
@@ -25,6 +26,11 @@ type Node struct {
 	Traffic Traffic `yaml:"traffic"`
 	Plan    Plan    `yaml:"plan"`
 	Ping    Ping    `yaml:"ping"`
+
+	// What the agent measures when its own defaults don't fit. Like the
+	// period settings these are only written into the node's agent.yml.
+	Disks      []string `yaml:"disks"`      // mount points; none = the agent's default, /
+	Interfaces []string `yaml:"interfaces"` // counted for traffic; none = the agent detects them
 }
 
 // Traffic is the node's data allowance and when its billing period begins.
@@ -130,6 +136,17 @@ func (c *Config) validateNodes(p *problems) map[string]bool {
 		}
 		n.Traffic.validate(p, n.ID)
 		n.Plan.validate(p, n.ID)
+		// The same checks as the agent's, so a generated agent.yml loads.
+		for _, d := range n.Disks {
+			if !path.IsAbs(d) {
+				p.add("nodes[%s].disks: %q is not an absolute path", n.ID, d)
+			}
+		}
+		for _, x := range n.Interfaces {
+			if x == "" || strings.ContainsAny(x, "/ ") {
+				p.add("nodes[%s].interfaces: invalid name %q", n.ID, x)
+			}
+		}
 	}
 	// Ping settings name other nodes, so they are checked once all ids are known.
 	for i := range c.Nodes {

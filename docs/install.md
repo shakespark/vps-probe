@@ -156,7 +156,9 @@ rm ../hk-1.yml                               # 服务端上的那一份也删掉
 
 流量统计默认自动识别网卡：物理网卡；有两块以上时只算带默认路由的（第二块通常是内网）；容器里没有物理网卡，算默认路由所在的那块。默认路由走隧道（WireGuard、WARP 等）的机器算全部物理网卡。
 
-识别得不对时在那台机器的 `/etc/vps-probe/agent.yml` 里写 `interfaces: [eth0]`，比如第二块网卡也走计费流量、但上面没有默认路由。手工改过 `agent.yml` 的节点以后用 `install-cmd -upgrade` 升级（见下），不要用 `install-cmd -node`，它会覆盖配置。
+识别得不对时（比如第二块网卡也走计费流量、但上面没有默认路由），在 `server.yml` 那个节点下面写 `interfaces: [eth0, eth1]`，再用 `install-cmd -node ID` 重新安装它的配置。要多看几个挂载点的磁盘也一样，写 `disks: ["/", "/data"]`。
+
+`install-cmd -node` 每次都按 `server.yml` 重写整个 `agent.yml`，所以这类设置要写在 `server.yml` 里；直接在节点的 `agent.yml` 里手改的内容，下次重新安装配置时会丢（只升级程序的 `install-cmd -upgrade` 不动配置）。
 
 ### LXC 容器
 
@@ -192,6 +194,8 @@ for h in vps1 vps2 vps3; do vps-probe-server install-cmd -upgrade | ssh root@$h 
 ```
 
 agent 停止前会把流量最后读一次并保存，升级不会丢流量。升级服务端前建议先备份（下一节）。
+
+新版本需要新的数据库格式时，服务端在启动时自动升级数据库，日志里有一行 `database schema upgraded`。升级过的数据库旧版本打不开（它会报 `schema version … is newer than this build`），要退回旧版本只能用升级前的备份。0.3.0 就有这样一次升级。
 
 ### 从 0.1.x 升级
 
@@ -255,7 +259,7 @@ agent 停止前会把流量最后读一次并保存，升级不会丢流量。�
 | 网页 403 | 开了 `cf_access`：只能经 Cloudflare Access 访问；服务端日志 `cf_access: request rejected` 写明原因 |
 | 网页 401 / 429 | 开了 `basic_auth`：401 是用户名或密码不对，429 是同一来源输错太多次，等一分钟 |
 | 时延矩阵里对不上 | agent 的 `peers[].name` 要写对端的节点 id；服务端生成的配置自动满足 |
-| agent 日志 `traffic is not counted yet` | 自动识别定不下来算哪块网卡：在 `agent.yml` 写 `interfaces: [网卡名]` |
+| agent 日志 `traffic is not counted yet` | 自动识别定不下来算哪块网卡：在 `server.yml` 那个节点下写 `interfaces: [网卡名]`，重新安装它的配置 |
 | ping 全部丢包、日志 `ping disabled` | `install.sh` 会自动处理 ICMP 权限；手工安装的看上面「ICMP」 |
 | 某一项显示「—」 | agent 读不到那一项，它的日志里有 `cannot read …`；LXC 里见上面「LXC 容器」 |
 | 服务端启动报 `written by vps-probe 0.1.x` | 数据库是旧版本的：见「从 0.1.x 升级」 |

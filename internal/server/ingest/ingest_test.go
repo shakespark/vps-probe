@@ -367,3 +367,50 @@ func TestDualStack(t *testing.T) {
 		}
 	}
 }
+
+// One node cannot take more of the write loop than an agent ever needs,
+// and packets that fail authentication don't count against it.
+func TestNodeRateLimit(t *testing.T) {
+	w := &fakeWriter{}
+	s, err := Listen("127.0.0.1:0", []config.Node{{ID: node, Token: token}}, w, discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.conn.Close()
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	from := netip.MustParseAddrPort("127.0.0.1:9")
+	a := aead(t, token)
+	id := uint64(0)
+	send := func(a cipher.AEAD, n int) {
+		for range n {
+			id++
+			s.handle(sealReport(t, a, wire.TypeReport, &pb.Report{Id: id, Ts: now.Unix()}), from)
+		}
+	}
+
+	send(aead(t, "ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210zyxwvut"), 3*nodeBurst)
+	if st := s.Stats(); st[AuthFailed] != 3*nodeBurst || st[RateLimited] != 0 {
+		t.Fatalf("forged packets: %v", st)
+	}
+	send(a, nodeBurst+10)
+	if st := s.Stats(); st[Accepted] != nodeBurst || st[RateLimited] != 10 || w.count() != nodeBurst {
+		t.Fatalf("burst: %v, stored %d", st, w.count())
+	}
+	now = now.Add(time.Second)
+	send(a, nodeRate+10)
+	if st := s.Stats(); st[Accepted] != nodeBurst+nodeRate || st[RateLimited] != 20 {
+		t.Fatalf("after a second: %v", st)
+	}
+
+	// The memory of ids is bounded too.
+	seen := s.seen[node]
+	for i := uint64(1 << 32); len(seen) < maxSeen; i++ {
+		seen[i] = now.Unix()
+	}
+	now = now.Add(time.Second)
+	send(a, 1)
+	if st := s.Stats(); st[RateLimited] != 21 || len(seen) != maxSeen {
+		t.Fatalf("full id memory: %v, %d ids", st, len(seen))
+	}
+}

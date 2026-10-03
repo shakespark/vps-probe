@@ -594,7 +594,7 @@
 
   const stats = () => ({
     ingest: { accepted: Math.floor((now() - 1.75e9) * 2.7), auth_failed: 37, decode_failed: 0, duplicate: 1204 + Math.floor((now() - T0) / 60),
-      fields_dropped: 0, malformed: 5519, store_failed: 0, ts_out_of_range: 3, unknown_node: 12, wrong_type: 0 },
+      fields_dropped: 0, malformed: 5519, rate_limited: 0, store_failed: 0, ts_out_of_range: 3, unknown_node: 12, wrong_type: 0 },
     db_bytes: 187 * MB + (now() % 3600) * 600, server_time: now(), timezone: 'Asia/Shanghai', version: 'demo', interval: 10,
   });
 

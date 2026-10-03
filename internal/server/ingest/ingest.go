@@ -26,6 +26,15 @@ const (
 	seenPruneEvery = time.Minute
 	logEvery       = time.Minute
 	readBuffer     = 2048 // > wire.MaxPacket, so oversized packets are seen as such
+
+	// Limits on one node's authenticated packets, so that a node whose
+	// token leaked cannot starve the others of the write loop or fill the
+	// memory of seen ids. An agent catching up after an outage resends at
+	// most 20 packets a second; a node's two hours of reports are a few
+	// thousand ids.
+	nodeRate  = 40 // packets per second
+	nodeBurst = 200
+	maxSeen   = 50000
 )
 
 // Drop and outcome counters, reported by the API.
@@ -40,10 +49,11 @@ const (
 	TSOutOfRange  = "ts_out_of_range"
 	StoreFailed   = "store_failed"
 	FieldsDropped = "fields_dropped" // report accepted, some values out of range
+	RateLimited   = "rate_limited"   // more packets from one node than any agent sends
 )
 
 var counterNames = []string{Accepted, Duplicate, Malformed, UnknownNode, AuthFailed, WrongType,
-	DecodeFailed, TSOutOfRange, StoreFailed, FieldsDropped}
+	DecodeFailed, TSOutOfRange, StoreFailed, FieldsDropped, RateLimited}
 
 // Writer persists an accepted report.
 type Writer interface {
@@ -62,6 +72,7 @@ type Server struct {
 	// Touched only by the read loop.
 	seen      map[string]map[uint64]int64 // node -> report id -> ts
 	lastPrune time.Time
+	buckets   map[string]*bucket
 
 	logMu   sync.Mutex
 	lastLog map[string]time.Time
@@ -76,6 +87,7 @@ func Listen(addr string, nodes []config.Node, store Writer, log *slog.Logger) (*
 		nodes:    make(map[string]cipher.AEAD, len(nodes)),
 		counters: make(map[string]*atomic.Uint64, len(counterNames)),
 		seen:     map[string]map[uint64]int64{},
+		buckets:  map[string]*bucket{},
 		lastLog:  map[string]time.Time{},
 	}
 	for _, n := range counterNames {
@@ -154,6 +166,14 @@ func (s *Server) handle(pkt []byte, from netip.AddrPort) {
 		return
 	}
 	// Authenticated from here on; the header was part of the AEAD input.
+	// Only now is the packet counted against the node: the node id of an
+	// unauthenticated packet is anyone's to write.
+	if !s.allow(h.Node, now) {
+		s.count(RateLimited)
+		s.rateLog("rate:"+h.Node, "ingest: too many packets from one node, dropping the excess; is its token used elsewhere?",
+			"node", h.Node, "from", from.Addr())
+		return
+	}
 	if h.Type != wire.TypeReport {
 		s.count(WrongType)
 		return
@@ -180,6 +200,12 @@ func (s *Server) handle(pkt []byte, from netip.AddrPort) {
 	if _, dup := seen[rep.Id]; dup {
 		s.count(Duplicate)
 		s.ack(aead, h.Node, rep.Id, from)
+		return
+	}
+	if len(seen) >= maxSeen {
+		s.count(RateLimited)
+		s.rateLog("seen:"+h.Node, "ingest: too many distinct reports from one node within the accepted time range, dropping new ones",
+			"node", h.Node, "from", from.Addr())
 		return
 	}
 	if dropped := Sanitize(rep); dropped > 0 {
@@ -210,6 +236,32 @@ func (s *Server) ack(aead cipher.AEAD, node string, id uint64, to netip.AddrPort
 	if _, err := s.conn.WriteToUDPAddrPort(pkt, to); err != nil {
 		s.rateLog("ack", "ingest: sending ack", "to", to, "err", err)
 	}
+}
+
+// bucket is a token bucket: nodeBurst packets at once, nodeRate a second
+// after that.
+type bucket struct {
+	tokens float64
+	last   time.Time
+}
+
+// allow takes one packet from node's bucket and reports whether there was
+// one to take.
+func (s *Server) allow(node string, now time.Time) bool {
+	b := s.buckets[node]
+	if b == nil {
+		b = &bucket{tokens: nodeBurst, last: now}
+		s.buckets[node] = b
+	}
+	if d := now.Sub(b.last); d > 0 {
+		b.tokens = min(nodeBurst, b.tokens+d.Seconds()*nodeRate)
+		b.last = now
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
 }
 
 func (s *Server) pruneSeen(now time.Time) {

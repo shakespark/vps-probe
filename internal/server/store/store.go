@@ -17,9 +17,13 @@ import (
 	_ "modernc.org/sqlite" // pure Go, keeps CGO_ENABLED=0 builds
 )
 
-// schemaVersion 10 is the 0.2 schema. Versions below it are 0.1.x files,
-// which are not carried over.
-const schemaVersion = 10
+// firstVersion is the 0.2.0 schema. Versions below it are 0.1.x files, which
+// are not carried over; later versions are reached from it one step at a
+// time, see migrations.
+const (
+	firstVersion  = 10
+	schemaVersion = 11
+)
 
 // Rollup buckets, in seconds.
 const (
@@ -104,8 +108,9 @@ func (s *Store) Close() error {
 	return errors.Join(errs...)
 }
 
-// migrate creates the schema in a new file and checks the version of an
-// existing one. Later schema changes become further steps here.
+// migrate creates the schema in a new file and brings an older 0.2 file up
+// to schemaVersion. All of it is one transaction: a failed upgrade leaves
+// the file as it was.
 func (s *Store) migrate() error {
 	var v int
 	err := s.w.QueryRow("SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'schema_version'").Scan(&v)
@@ -117,7 +122,7 @@ func (s *Store) migrate() error {
 		return nil
 	case v > schemaVersion:
 		return fmt.Errorf("schema version %d is newer than this build (%d); use a newer vps-probe-server", v, schemaVersion)
-	case v != 0:
+	case v != 0 && v < firstVersion:
 		return errors.New("this database was written by vps-probe 0.1.x, which 0.2 cannot read; move the file away and start a new one")
 	}
 	tx, err := s.w.Begin()
@@ -125,16 +130,57 @@ func (s *Store) migrate() error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, stmt := range schema {
-		if _, err := tx.Exec(stmt); err != nil {
-			return fmt.Errorf("%w in %.60q", err, stmt)
+	exec := func(stmts []string) error {
+		for _, stmt := range stmts {
+			if _, err := tx.Exec(stmt); err != nil {
+				return fmt.Errorf("%w in %.60q", err, stmt)
+			}
+		}
+		return nil
+	}
+	if v == 0 {
+		if err := exec(schema); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO meta(key, value) VALUES ('created_at', ?), ('schema_version', ?)`,
+			time.Now().UTC().Format(time.RFC3339), strconv.Itoa(schemaVersion)); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	from := v
+	for ; v < schemaVersion; v++ {
+		if err := exec(migrations[v]); err != nil {
+			return fmt.Errorf("upgrading schema %d to %d: %w", v, v+1, err)
 		}
 	}
-	if _, err := tx.Exec(`INSERT INTO meta(key, value) VALUES ('created_at', ?), ('schema_version', ?)`,
-		time.Now().UTC().Format(time.RFC3339), strconv.Itoa(schemaVersion)); err != nil {
+	if _, err := tx.Exec(`UPDATE meta SET value = ? WHERE key = 'schema_version'`, strconv.Itoa(schemaVersion)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if s.log != nil {
+		s.log.Info("database schema upgraded", "from", from, "to", schemaVersion)
+	}
+	return nil
+}
+
+// migrations[v] turns schema version v into v+1. A step is never edited
+// once released; schema below is always the newest version.
+var migrations = map[int][]string{
+	// The billing period joins traffic_daily's key: a period that begins
+	// in the middle of a day no longer replaces the old period's last day.
+	10: {
+		`CREATE TABLE traffic_daily_new (
+			node INTEGER NOT NULL, iface TEXT NOT NULL, day TEXT NOT NULL, start INTEGER NOT NULL,
+			rx INTEGER NOT NULL, tx INTEGER NOT NULL, ts INTEGER NOT NULL,
+			PRIMARY KEY (node, start, iface, day)
+		) WITHOUT ROWID`,
+		`INSERT INTO traffic_daily_new SELECT node, iface, day, start, rx, tx, ts FROM traffic_daily`,
+		`DROP TABLE traffic_daily`,
+		`ALTER TABLE traffic_daily_new RENAME TO traffic_daily`,
+	},
 }
 
 // Metrics come in three resolutions: raw (one row per report), 5m and 1h
@@ -143,11 +189,12 @@ var schema = []string{
 	`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 	`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)`,
 
-	// max_ts: newest report ts seen. fresh_at: server time when a report
-	// raised max_ts; replays of old packets never do, so they can't make a
-	// dead node look alive. ip: the source of that newest report, and since
-	// when; a replay from elsewhere can't change it either. The sys_ columns
-	// are the newest system description (sent on start and hourly).
+	// max_ts: ts of the newest report, see Write for what counts as newest.
+	// fresh_at: server time when that report arrived; replays of old packets
+	// never count, so they can't make a dead node look alive. ip: the source
+	// of that newest report, and since when; a replay from elsewhere can't
+	// change it either. The sys_ columns are the newest system description
+	// (sent on start and hourly).
 	`CREATE TABLE node_status (
 		node     INTEGER PRIMARY KEY,
 		max_ts   INTEGER NOT NULL,
@@ -200,11 +247,12 @@ var schema = []string{
 		rx INTEGER NOT NULL, tx INTEGER NOT NULL, ts INTEGER NOT NULL,
 		PRIMARY KEY (node, iface, start)
 	) WITHOUT ROWID`,
-	// The current period's total as last seen on each day.
+	// A period's total as last seen on each day. On the day a period
+	// begins, the old and the new one each have a row.
 	`CREATE TABLE traffic_daily (
 		node INTEGER NOT NULL, iface TEXT NOT NULL, day TEXT NOT NULL, start INTEGER NOT NULL,
 		rx INTEGER NOT NULL, tx INTEGER NOT NULL, ts INTEGER NOT NULL,
-		PRIMARY KEY (node, iface, day)
+		PRIMARY KEY (node, start, iface, day)
 	) WITHOUT ROWID`,
 
 	// Alerts that are pending or firing, so a restart neither repeats nor

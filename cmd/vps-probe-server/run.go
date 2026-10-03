@@ -26,7 +26,6 @@ import (
 
 const (
 	rollupEvery   = time.Minute
-	rollupWindow  = 3 * time.Hour // agents deliver backlog up to 2h late
 	cleanupEvery  = time.Hour
 	backupHour    = 4 // local time; the daily backup runs after this hour
 	shutdownGrace = 10 * time.Second
@@ -194,7 +193,7 @@ func maintain(ctx context.Context, cfg *config.Config, st *store.Store, log *slo
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
-			if err := st.Rollup(now.Add(-rollupWindow)); err != nil {
+			if err := st.Rollup(now.Add(-store.RollupWindow)); err != nil {
 				log.Error("rollup", "err", err)
 			}
 			if now.Sub(lastCleanup) < cleanupEvery {

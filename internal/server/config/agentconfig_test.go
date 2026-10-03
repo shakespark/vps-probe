@@ -38,6 +38,10 @@ nodes:
 	if !strings.Contains(out, "没有 ping（server.yml 里没写 ping.addr）：us-1") {
 		t.Fatalf("missing-addr note:\n%s", out)
 	}
+	// Not set on the node: left to the agent's defaults.
+	if strings.Contains(out, "disks:") || strings.Contains(out, "interfaces:") || len(a.Interfaces) != 0 {
+		t.Fatalf("disks or interfaces written without being set:\n%s", out)
+	}
 	// A node with no peers still produces a valid file.
 	out, _ = c.AgentConfig("us-1", "[2001:db8::1]:9527")
 	if _, err := agentconfig.Parse([]byte(out)); err != nil {
@@ -159,5 +163,38 @@ func TestBadExtraPeers(t *testing.T) {
 	dup := "nodes:\n  - {id: a, token: " + tokA + ", ping: {extra: [{name: x, addr: 1.1.1.1}, {name: x, addr: 8.8.8.8}]}}\n"
 	if _, err := Parse([]byte(dup)); err == nil {
 		t.Error("duplicate accepted")
+	}
+}
+
+// Regenerating a node's config must not lose what it measures.
+func TestDisksAndInterfaces(t *testing.T) {
+	c, err := Parse([]byte(`
+nodes:
+  - {id: hk-1, token: ` + tokA + `, disks: [/, "/mnt/my data"], interfaces: [eth0, ens3.100]}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := c.AgentConfig("hk-1", "198.51.100.1:9527")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := agentconfig.Parse([]byte(out))
+	if err != nil {
+		t.Fatalf("generated config does not load: %v\n%s", err, out)
+	}
+	if !slices.Equal(a.Disks, []string{"/", "/mnt/my data"}) || !slices.Equal(a.Interfaces, []string{"eth0", "ens3.100"}) {
+		t.Fatalf("disks %q interfaces %q\n%s", a.Disks, a.Interfaces, out)
+	}
+
+	for name, node := range map[string]string{
+		"relative disk":   `disks: [data]`,
+		"empty interface": `interfaces: [""]`,
+		"interface path":  `interfaces: [../eth0]`,
+		"interface space": `interfaces: ["eth0 eth1"]`,
+	} {
+		if _, err := Parse([]byte("nodes:\n  - {id: hk-1, token: " + tokA + ", " + node + "}\n")); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }

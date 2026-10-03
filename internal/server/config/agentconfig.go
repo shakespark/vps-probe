@@ -8,8 +8,8 @@ import (
 	"github.com/shakespark/vps-probe/internal/peer"
 )
 
-// AgentConfig renders agent.yml for one node: its token, its billing
-// period, and its peers: every other node that has a ping.addr, except
+// AgentConfig renders agent.yml for one node: its token, its disks and
+// interfaces when the node sets them, its billing period, and its peers: every other node that has a ping.addr, except
 // those excluded by either side, and its ping.extra. The result is a local
 // file for the agent; nothing is ever pushed to agents.
 func (c *Config) AgentConfig(id, serverAddr string) (string, error) {
@@ -24,6 +24,12 @@ func (c *Config) AgentConfig(id, serverAddr string) (string, error) {
 	fmt.Fprintf(&b, "# 由 `vps-probe-server agent-config -node %s` 生成，安装：./install.sh agent --config <本文件>\n", id)
 	fmt.Fprintf(&b, "# 含本节点的 token，不要公开。各项含义见发布包里的 examples/agent.example.yml。\n\n")
 	fmt.Fprintf(&b, "node: %q\nserver: %q\ntoken: %q\n", n.ID, serverAddr, n.Token)
+	if len(n.Disks) > 0 {
+		fmt.Fprintf(&b, "disks: %s\n", quotedList(n.Disks))
+	}
+	if len(n.Interfaces) > 0 {
+		fmt.Fprintf(&b, "interfaces: %s\n", quotedList(n.Interfaces))
+	}
 	fmt.Fprintf(&b, "traffic:\n  timezone: %q\n  reset_day: %d\n  reset_time: %q\n", c.Timezone, n.Traffic.ResetDay, n.Traffic.ResetTime)
 
 	var peers []peer.Peer
@@ -62,4 +68,13 @@ func (c *Config) AgentConfig(id, serverAddr string) (string, error) {
 		fmt.Fprintf(&b, "# 没有 ping（server.yml 里的 ping.exclude）：%s\n", strings.Join(excluded, ", "))
 	}
 	return b.String(), nil
+}
+
+// quotedList is a YAML flow sequence of strings.
+func quotedList(items []string) string {
+	q := make([]string, len(items))
+	for i, s := range items {
+		q[i] = fmt.Sprintf("%q", s)
+	}
+	return "[" + strings.Join(q, ", ") + "]"
 }

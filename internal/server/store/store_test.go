@@ -13,6 +13,7 @@ import (
 	"time"
 
 	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/wire"
 )
 
 var (
@@ -552,5 +553,163 @@ func TestPacketRatesAndSoftIRQ(t *testing.T) {
 	n, err := s.Net(ctx, "a", now.Unix(), now.Add(7*24*time.Hour).Unix())
 	if err != nil || *n["eth0"].Cols["rx_pps"][0] != 200 || *n["eth0"].Cols["rx_pps_max"][0] != 300 {
 		t.Fatalf("net 5m: %v", err)
+	}
+}
+
+// An agent's clock ran an hour ahead and was set back: its reports are
+// below max_ts for an hour, and must still count.
+func TestClockSetBack(t *testing.T) {
+	s := newStore(t)
+	t0 := time.Date(2026, 9, 10, 12, 0, 0, 0, sh)
+	rep := func(ts time.Time, cpu float32, host string, rx uint64) *pb.Report {
+		r := traffic(ts.Unix(), rx, 0, 0, 0)
+		r.Cpu, r.Sys = &pb.CPU{Usage: cpu}, &pb.SysInfo{Hostname: host}
+		return r
+	}
+	write(t, s, "a", rep(t0.Add(time.Hour), 90, "ahead", 5000), t0)
+
+	// A replay or backlog from far behind arrival changes nothing.
+	write(t, s, "a", rep(t0.Add(-time.Hour), 1, "replay", 1), t0.Add(5*time.Second))
+	st, _ := s.Status(ctx, "a")
+	if st.FreshAt != t0.Unix() || st.MaxTS != t0.Add(time.Hour).Unix() || st.Sys.Hostname != "ahead" || st.Traffic.RX != 5000 {
+		t.Fatalf("after replay: %+v sys %+v traffic %+v", st, st.Sys, st.Traffic)
+	}
+
+	// The clock is right again.
+	at := t0.Add(10 * time.Second)
+	if err := s.Write("a", rep(at, 20, "back", 5010), netip.MustParseAddr("203.0.113.9"), at.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = s.Status(ctx, "a")
+	if st.FreshAt != at.Unix()+1 || st.MaxTS != at.Unix() || st.Skew != 1 {
+		t.Fatalf("status not reset: fresh_at=%d max_ts=%d skew=%d", st.FreshAt, st.MaxTS, st.Skew)
+	}
+	if st.CPU == nil || *st.CPU != 20 || st.Sys.Hostname != "back" || st.Traffic.RX != 5010 {
+		t.Fatalf("latest values are from the clock that ran ahead: cpu=%v sys=%+v traffic=%+v", st.CPU, st.Sys, st.Traffic)
+	}
+	// The address waits for a report with a higher ts, which a replay
+	// never has.
+	if st.IP != testIP.String() {
+		t.Fatalf("ip = %q", st.IP)
+	}
+	days, _ := s.Daily(ctx, "a", sep)
+	if len(days) != 1 || days[0].RX != 5010 {
+		t.Fatalf("daily = %+v", days)
+	}
+}
+
+// A retried report that arrives after its successor shows the node is
+// alive but is not its newest data.
+func TestLiveOutOfOrder(t *testing.T) {
+	s := newStore(t)
+	t0 := time.Now().Truncate(time.Second)
+	write(t, s, "a", traffic(t0.Unix(), 1000, 0, 0, 0), t0)
+	write(t, s, "a", traffic(t0.Unix()-10, 900, 0, 0, 0), t0.Add(5*time.Second))
+	st, _ := s.Status(ctx, "a")
+	if st.FreshAt != t0.Unix()+5 || st.MaxTS != t0.Unix() || st.Traffic.RX != 1000 {
+		t.Fatalf("fresh_at=%d max_ts=%d rx=%d", st.FreshAt-t0.Unix(), st.MaxTS-t0.Unix(), st.Traffic.RX)
+	}
+}
+
+// A period that begins in the middle of a day must not take the old
+// period's last day with it.
+func TestDailyAcrossMidDayReset(t *testing.T) {
+	s := newStore(t)
+	at := func(d, h int) int64 { return time.Date(2026, 9, d, h, 0, 0, 0, sh).Unix() }
+	p1, p2, p3 := at(1, 18)-30*86400, at(21, 18), at(21, 18)+30*86400
+	period := func(ts, start, end int64, rx uint64) {
+		t.Helper()
+		write(t, s, "a", &pb.Report{Ts: ts, Traffic: []*pb.IfaceTraffic{{
+			Iface: "eth0", Cur: &pb.Period{Start: start, End: end, Rx: rx, Tx: rx}}}}, time.Unix(ts, 0))
+	}
+	period(at(20, 23), p1, p2, 1000)
+	period(at(21, 17), p1, p2, 1300) // the old period's last day: +300
+	period(at(21, 19), p2, p3, 40)
+	period(at(22, 12), p2, p3, 100)
+
+	old, err := s.Daily(ctx, "a", p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(old) != 2 || old[1] != (DayTraffic{"2026-09-21", 300, 300}) {
+		t.Fatalf("old period: %+v", old)
+	}
+	cur, _ := s.Daily(ctx, "a", p2)
+	if len(cur) != 2 || cur[0] != (DayTraffic{"2026-09-21", 40, 40}) || cur[1] != (DayTraffic{"2026-09-22", 60, 60}) {
+		t.Fatalf("new period: %+v", cur)
+	}
+}
+
+// A 0.2.0 file (schema 10) is upgraded in place and keeps its history.
+func TestMigrateFrom10(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "probe.db")
+	s := open(t, path)
+	for _, q := range []string{
+		`DROP TABLE traffic_daily`,
+		`CREATE TABLE traffic_daily (
+			node INTEGER NOT NULL, iface TEXT NOT NULL, day TEXT NOT NULL, start INTEGER NOT NULL,
+			rx INTEGER NOT NULL, tx INTEGER NOT NULL, ts INTEGER NOT NULL,
+			PRIMARY KEY (node, iface, day)
+		) WITHOUT ROWID`,
+		`INSERT INTO traffic_daily VALUES (1, 'eth0', '2026-09-01', ` + fmt.Sprint(sep) + `, 100, 10, 1),
+			(1, 'eth0', '2026-09-02', ` + fmt.Sprint(sep) + `, 250, 25, 2)`,
+		`UPDATE meta SET value = '10' WHERE key = 'schema_version'`,
+	} {
+		if _, err := s.w.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s = open(t, path)
+	defer s.Close()
+	var v, pk string
+	s.r.QueryRow(`SELECT value FROM meta WHERE key = 'schema_version'`).Scan(&v)
+	s.r.QueryRow(`SELECT group_concat(name) FROM (SELECT name FROM pragma_table_info('traffic_daily') WHERE pk > 0 ORDER BY pk)`).Scan(&pk)
+	if v != fmt.Sprint(schemaVersion) || pk != "node,start,iface,day" {
+		t.Fatalf("version %s, key %s", v, pk)
+	}
+	days, err := s.Daily(ctx, "a", sep)
+	if err != nil || len(days) != 2 || days[1] != (DayTraffic{"2026-09-02", 150, 15}) {
+		t.Fatalf("history after upgrade: %+v %v", days, err)
+	}
+	// And it takes new rows under the new key.
+	write(t, s, "a", traffic(time.Date(2026, 9, 3, 1, 0, 0, 0, sh).Unix(), 300, 30, 0, 0), time.Now())
+	if days, _ = s.Daily(ctx, "a", sep); len(days) != 3 {
+		t.Fatalf("after a write: %+v", days)
+	}
+
+	// 0.1.x files are still refused, untouched.
+	old := filepath.Join(t.TempDir(), "old.db")
+	s2 := open(t, old)
+	s2.w.Exec(`UPDATE meta SET value = '5' WHERE key = 'schema_version'`)
+	s2.Close()
+	if _, err := Open(old, Options{Location: sh, Retention: ret, Log: discard}); err == nil || !strings.Contains(err.Error(), "0.1.x") {
+		t.Fatalf("schema 5: %v", err)
+	}
+}
+
+// A report from the last seconds of an hour, arriving as late as ingest
+// allows, still reaches its hour bucket on the next periodic rollup.
+func TestRollupWindowCoversLateReports(t *testing.T) {
+	s := newStore(t)
+	h := time.Now().Truncate(time.Hour).Add(-6 * time.Hour)
+	write(t, s, "a", &pb.Report{Ts: h.Unix(), Cpu: &pb.CPU{Usage: 10}}, time.Now())
+	if err := s.Rollup(h); err != nil {
+		t.Fatal(err)
+	}
+	late := h.Add(time.Hour - time.Second)
+	arrival := late.Add(wire.MaxSkew)
+	write(t, s, "a", &pb.Report{Ts: late.Unix(), Cpu: &pb.CPU{Usage: 90}}, arrival)
+	tick := arrival.Add(2 * time.Minute)
+	if err := s.Rollup(tick.Add(-RollupWindow)); err != nil {
+		t.Fatal(err)
+	}
+	var cpu float64
+	s.r.QueryRow("SELECT cpu FROM metrics_1h WHERE ts = ?", h.Unix()).Scan(&cpu)
+	if cpu != 50 {
+		t.Fatalf("1h bucket cpu = %v, want 50", cpu)
 	}
 }

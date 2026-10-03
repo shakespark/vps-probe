@@ -117,9 +117,12 @@ func (s *Store) Status(ctx context.Context, node string) (*Status, error) {
 		st.Sys = &y
 	}
 
+	// Nothing newer than max_ts is the latest: rows above it were written
+	// by a clock that ran ahead and has been set back since.
+
 	err = s.r.QueryRowContext(ctx, `SELECT ts, cpu, steal, softirq, load1, load5, load15, mem_total, mem_used, swap_total, swap_used,
 			tcp, udp, tcp_tw, threads
-		FROM metrics_raw WHERE node = ? ORDER BY ts DESC LIMIT 1`, rid).
+		FROM metrics_raw WHERE node = ? AND ts <= ? ORDER BY ts DESC LIMIT 1`, rid, st.MaxTS).
 		Scan(&st.MetricsTS, &st.CPU, &st.Steal, &st.SoftIRQ, &st.Load1, &st.Load5, &st.Load15,
 			&st.MemTotal, &st.MemUsed, &st.SwapTotal, &st.SwapUsed, &st.TCP, &st.UDP, &st.TCPTW, &st.Threads)
 	if err != nil && err != sql.ErrNoRows {
@@ -128,8 +131,8 @@ func (s *Store) Status(ctx context.Context, node string) (*Status, error) {
 
 	st.Net = []IfaceRate{}
 	if err := s.each(ctx, `SELECT iface, rx, tx FROM net_raw
-		WHERE node = ?1 AND ts = (SELECT max(ts) FROM net_raw WHERE node = ?1) ORDER BY iface`,
-		[]any{rid}, func(r *sql.Rows) error {
+		WHERE node = ?1 AND ts = (SELECT max(ts) FROM net_raw WHERE node = ?1 AND ts <= ?2) ORDER BY iface`,
+		[]any{rid, st.MaxTS}, func(r *sql.Rows) error {
 			var n IfaceRate
 			if err := r.Scan(&n.Iface, &n.RX, &n.TX); err != nil {
 				return err
@@ -144,9 +147,9 @@ func (s *Store) Status(ctx context.Context, node string) (*Status, error) {
 	// its last value rather than vanishing.
 	st.Disks = []Disk{}
 	if err := s.each(ctx, `SELECT d.mount, d.total, d.used, d.avail, d.inode_pct FROM disk_raw d
-		JOIN (SELECT mount, max(ts) AS ts FROM disk_raw WHERE node = ?1 GROUP BY mount) m
+		JOIN (SELECT mount, max(ts) AS ts FROM disk_raw WHERE node = ?1 AND ts <= ?2 GROUP BY mount) m
 		ON d.mount = m.mount AND d.ts = m.ts WHERE d.node = ?1 ORDER BY d.mount`,
-		[]any{rid}, func(r *sql.Rows) error {
+		[]any{rid, st.MaxTS}, func(r *sql.Rows) error {
 			var d Disk
 			if err := r.Scan(&d.Mount, &d.Total, &d.Used, &d.Avail, &d.InodePct); err != nil {
 				return err

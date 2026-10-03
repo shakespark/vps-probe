@@ -4,7 +4,15 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/shakespark/vps-probe/internal/wire"
 )
+
+// RollupWindow is how far back the periodic rollup must reach. A report in
+// the last seconds of an hour bucket may arrive wire.MaxSkew after the
+// bucket ended, and the bucket is only recomputed while it starts inside
+// the window; the half hour on top covers the tick that picks it up.
+const RollupWindow = time.Hour + wire.MaxSkew + 30*time.Minute
 
 // Rollup recomputes every 5m and 1h bucket that starts at or after since.
 // The first bucket is rounded up, never down: its raw rows may already be
