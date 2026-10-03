@@ -1,10 +1,10 @@
 package collect
 
 import (
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -163,12 +163,9 @@ func TestFixtureReads(t *testing.T) {
 	if up, err := fs.Uptime(); err != nil || up != 12345 {
 		t.Fatalf("uptime = %v, %v", up, err)
 	}
-	ifaces, err := fs.DetectInterfaces()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(ifaces, []string{"ens4", "eth0"}) {
-		t.Fatalf("ifaces = %v", ifaces)
+	// Two physical NICs (eth0, ens4) and no route table: cannot choose yet.
+	if ifaces, err := fs.DetectInterfaces(); !errors.Is(err, ErrNoDefaultRoute) {
+		t.Fatalf("ifaces = %v, %v", ifaces, err)
 	}
 	si := fs.ReadSysInfo()
 	if si.OS != "Debian GNU/Linux 12 (bookworm)" || si.Kernel != "6.1.0-test" || si.Cores < 1 {
@@ -181,6 +178,57 @@ func TestDetectInterfacesNone(t *testing.T) {
 	os.MkdirAll(filepath.Join(fs.Sys, "class", "net", "lo"), 0o755)
 	if _, err := fs.DetectInterfaces(); err == nil {
 		t.Fatal("expected error with no physical NIC")
+	}
+}
+
+// Of several physical NICs only those with a default route are counted; one
+// physical NIC is counted whatever the routes say.
+func TestDetectInterfacesMultiNIC(t *testing.T) {
+	const hdr = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+	v4 := func(iface string) string { return iface + "\t00000000\t0100A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n" }
+	v6 := func(iface string) string {
+		return "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003     " + iface + "\n"
+	}
+	lan := "eth1\t0014A8C0\t00000000\t0001\t0\t0\t0\t00FCFFFF\t0\t0\t0\n"
+	for name, c := range map[string]struct {
+		phys          []string
+		route, route6 string
+		want          string
+		noRoute       bool
+	}{
+		"public eth0, private eth1":      {phys: []string{"eth0", "eth1"}, route: hdr + v4("eth0") + lan, route6: v6("eth0"), want: "eth0"},
+		"IPv4 on eth0, IPv6 on eth1":     {phys: []string{"eth0", "eth1"}, route: hdr + v4("eth0"), route6: v6("eth1"), want: "eth0,eth1"},
+		"two uplinks":                    {phys: []string{"eth0", "eth1", "eth2"}, route: hdr + v4("eth0") + v4("eth2"), want: "eth0,eth2"},
+		"default route through a tunnel": {phys: []string{"eth0", "eth1"}, route: hdr + v4("wg0") + lan, want: "eth0,eth1"},
+		"no default route":               {phys: []string{"eth0", "eth1"}, route: hdr + lan, noRoute: true},
+		"no route table":                 {phys: []string{"eth0", "eth1"}, noRoute: true},
+		"one NIC, tunnel default":        {phys: []string{"eth0"}, route: hdr + v4("wg0"), want: "eth0"},
+		"one NIC, no default route":      {phys: []string{"eth0"}, route: hdr, want: "eth0"},
+	} {
+		fs := FS{Sys: t.TempDir(), Proc: t.TempDir()}
+		for _, n := range append([]string{"lo", "wg0"}, c.phys...) {
+			os.MkdirAll(filepath.Join(fs.Sys, "class", "net", n), 0o755)
+		}
+		for _, n := range c.phys {
+			os.MkdirAll(filepath.Join(fs.Sys, "class", "net", n, "device"), 0o755)
+		}
+		os.MkdirAll(filepath.Join(fs.Proc, "net"), 0o755)
+		if c.route != "" {
+			os.WriteFile(filepath.Join(fs.Proc, "net", "route"), []byte(c.route), 0o644)
+		}
+		if c.route6 != "" {
+			os.WriteFile(filepath.Join(fs.Proc, "net", "ipv6_route"), []byte(c.route6), 0o644)
+		}
+		got, err := fs.DetectInterfaces()
+		if c.noRoute {
+			if !errors.Is(err, ErrNoDefaultRoute) {
+				t.Errorf("%s: got %v, %v; want ErrNoDefaultRoute", name, got, err)
+			}
+			continue
+		}
+		if err != nil || strings.Join(got, ",") != c.want {
+			t.Errorf("%s: got %v, %v; want %q", name, got, err, c.want)
+		}
 	}
 }
 

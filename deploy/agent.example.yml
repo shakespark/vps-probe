@@ -15,7 +15,8 @@ state_dir: /var/lib/vps-probe
 # Mount points to report disk usage for.
 disks: ["/"]
 
-# Interfaces to count traffic on. Empty = auto-detect physical NICs.
+# Interfaces to count traffic on. Empty = auto-detect: the physical NICs; of
+# several, only those with a default route (a second NIC is usually private).
 interfaces: []
 
 traffic:

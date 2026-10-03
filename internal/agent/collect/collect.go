@@ -371,9 +371,18 @@ var virtualPrefixes = []string{
 	"tailscale", "zt", "cni", "flannel", "cali", "kube", "dummy", "ifb", "bond", "team",
 }
 
+// ErrNoDefaultRoute is returned by DetectInterfaces when a machine has
+// several physical NICs and no default route at all, so which of them face
+// the internet cannot be told yet.
+var ErrNoDefaultRoute = errors.New("collect: several physical network interfaces and no default route yet; set interfaces in config to choose")
+
 // DetectInterfaces returns physical NICs: entries in /sys/class/net with a
 // "device" link (virtio NICs have one too), minus well-known virtual names.
-// Without any, it falls back to the interfaces of the default route.
+// Without any, it falls back to the interfaces of the default route. Of
+// several, it returns those carrying a default route: a second NIC is
+// usually a private network that must not count against the quota. When
+// the default route is on none of them (it goes through a tunnel) all
+// are returned; when there is no default route, ErrNoDefaultRoute.
 func (f FS) DetectInterfaces() ([]string, error) {
 	dir := filepath.Join(f.Sys, "class", "net")
 	entries, err := os.ReadDir(dir)
@@ -395,6 +404,14 @@ func (f FS) DetectInterfaces() ([]string, error) {
 		// Containers (OpenVZ's venet0, LXC's veth-backed eth0) have no
 		// device behind their NIC: count the one the default route uses.
 		out = f.defaultRouteInterfaces()
+	} else if len(out) > 1 {
+		routed := f.defaultRouteInterfaces()
+		if len(routed) == 0 {
+			return nil, ErrNoDefaultRoute
+		}
+		if sel := slices.DeleteFunc(slices.Clone(out), func(n string) bool { return !slices.Contains(routed, n) }); len(sel) > 0 {
+			out = sel
+		}
 	}
 	slices.Sort(out)
 	if len(out) == 0 {

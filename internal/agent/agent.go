@@ -187,10 +187,28 @@ func (a *Agent) refreshIfaces(now time.Time) error {
 	}
 	a.ifacesAt = now
 	found, err := a.fs.DetectInterfaces()
+	if errors.Is(err, collect.ErrNoDefaultRoute) {
+		// Typically the network is not up yet, or a lease is being renewed.
+		// Keep the previous choice. Counting every NIC meanwhile would put
+		// a private NIC's whole counter into the period (a new interface
+		// is counted since boot), so with no previous choice count none
+		// and look again at the next sample.
+		if len(a.ifaces) == 0 {
+			if a.ifaces == nil {
+				a.log.Warn("several physical interfaces and no default route yet: traffic is not counted until there is one", "hint", "set interfaces in the config to choose")
+				a.ifaces = []string{}
+			}
+			a.ifacesAt = time.Time{}
+		}
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if a.ifaces != nil && !slices.Equal(found, a.ifaces) {
+	if a.ifaces != nil && len(a.ifaces) == 0 {
+		a.log.Info("default route found: counting traffic", "interfaces", found)
+	}
+	if len(a.ifaces) > 0 && !slices.Equal(found, a.ifaces) {
 		a.log.Warn("physical interfaces changed", "from", a.ifaces, "to", found)
 	}
 	a.ifaces = found

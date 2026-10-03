@@ -85,7 +85,7 @@
 从 [GitHub Releases](https://github.com/shakespark/vps-probe/releases) 下载，连同同一版本的 `.sha256` 和 `.sha256.sig`：
 
 ```sh
-V=0.1.19
+V=0.1.20
 B=https://github.com/shakespark/vps-probe/releases/download/v$V
 curl -fLO $B/vps-probe-$V-linux-amd64.tar.gz -fLO $B/vps-probe-$V.sha256 -fLO $B/vps-probe-$V.sha256.sig
 ```
@@ -284,7 +284,7 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
 无论哪种方式，生成的都只是一个本地配置文件：**agent 不会从服务端拉取任何东西**。
 
 - 如果系统的 `net.ipv4.ping_group_range` 不允许普通用户 ping，`install.sh` 会只给 agent 服务加 `CAP_NET_RAW`（`/etc/systemd/system/vps-probe-agent.service.d/icmp.conf`），不改系统设置。
-- 默认自动识别物理网卡（有 `/sys/class/net/<网卡>/device` 的）；OpenVZ、LXC 这类没有物理网卡的容器，改为统计默认路由所在的网卡（agent ≥ 0.1.18）。想自己指定就在 agent.yml 里写 `interfaces: [eth0]`。
+- 默认自动识别物理网卡（有 `/sys/class/net/<网卡>/device` 的）；OpenVZ、LXC 这类没有物理网卡的容器，改为统计默认路由所在的网卡（agent ≥ 0.1.18）。有两块以上物理网卡时只统计带默认路由的那几块，内网网卡不计入（agent ≥ 0.1.20）；默认路由走隧道（WireGuard、WARP 等）的机器仍然统计全部物理网卡。想自己指定就在 agent.yml 里写 `interfaces: [eth0]`：比如第二块网卡也走公网计费流量、但上面没有默认路由。
 - 某些节点之间不想互 ping：在其中一方写 `no_ping: [对方 id, ...]`（双向生效），然后给涉及的节点重新生成 agent.yml 并安装。
 - 测经隧道的时延：在发起探测的节点下写 `extra_peers`，再重新生成它的 agent.yml。
   - VPN 型隧道：`{ name: cf-vpn, addr: 1.1.1.1 }`，到目标的路由要走隧道。
