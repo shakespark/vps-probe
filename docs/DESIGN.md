@@ -410,7 +410,7 @@ backup:
 ```yaml
 alerts:
   - name: cpu_high
-    metric: cpu            # cpu | mem | swap | disk | load1 | steal | offline | ping_loss | ping_avg | net_in | net_out | traffic | expiry | ip_change
+    metric: cpu            # cpu | mem | swap | disk | load1 | steal | offline | ping_loss | ping_avg | net_in | net_out | traffic | expiry | ip_change | period_report | weekly_report
     op: ">"
     threshold: 90
     for: 5m                # 持续多久才触发
@@ -451,6 +451,11 @@ alerts:
     levels: [7, 1]
   - name: ip_change
     metric: ip_change      # 只接受 nodes
+  - name: period_report
+    metric: period_report  # 每个节点的流量周期结束时发一份结算，只接受 nodes / exclude
+  - name: weekly_report
+    metric: weekly_report  # 每周一份所有节点的流量汇总
+    at: "Mon 09:00"        # 星期（Mon…Sun）+ 时刻，按 timezone
 ```
 
 - 状态机：`ok → pending（满足条件但未达到 for）→ firing → ok`；进入 firing 和恢复时各发一条 TG 消息。
@@ -469,10 +474,13 @@ alerts:
   - 只封入站的黑洞（目标是该 IP 的流量被丢弃，机器自己发出的包照常出去）不会让节点离线：入站回落到 0，ddos 规则会恢复。所以写了 ratio 的 net_in 规则恢复时，若最近 60s 至少一半 ping 它的节点丢包 ≥ 20%，恢复消息附「入站已回落，但 N 个节点中 M 个到它仍丢包 ≥ 20%，可能已被商家黑洞」。只加说明，不阻止恢复。
   - expiry 只评估写了 `expire_at` 的节点：剩余天数 ≤ 某档且该档比已提醒过的更紧迫时提醒一次（一轮跨过多档只发最紧迫的一档，首次配置时已过期也只发一条）。状态按 (规则, 节点, 到期日) 记录，续费改了 `expire_at` 或按 `renew_months` 顺延后是新的到期日，重新计档，旧日期的状态删除。
   - ip_change：最新报文的来源 IP 与记录的不同时通知一次「旧 → 新」，没有告警中/恢复状态；某节点第一次看到的 IP 只记录不通知（升级后不会每个节点报一遍）。当前 IP 存在 `alert_state.target`，重启不重复。agent 重新解析服务端地址时换了地址族（v4 ↔ v6）也会算作变化。
+  - period_report：节点最新的周期起始日变了，说明上一周期结束，发一份上一周期的结算：起止日期和天数、下行/上行/合计、配额使用率（有配额时）、日均、用量最多的一天。周期起止都取自 agent 上报的周期起始日，天数是两个起始日之差，日均 = 合计 ÷ 天数（`reset_time` 不是 00:00 时按日明细缺最后半天，所以不用按日记录条数去除）。agent 每次上报都带上一周期的最终总量，新周期的第一条报文到达时上一周期已经结清。当前周期起始日存在 `alert_state.target`，重启不重复；某节点第一次看到时只记录不发（升级后不会把每个节点上个月的结算补发一遍）。服务端停机跨过了好几个周期时只结算最近结束的那一个。起始日变小（agent 状态重建、改了重置日）只记录不发。
+  - weekly_report：每周在 `at` 指定的时刻发一条汇总（不是每个节点一条），每个覆盖的节点一行：本周期已用（有配额时带百分比）、近 7 天用量（按日明细中今天之前的 7 个完整自然日；刚开始上报、不足 7 天的节点按实际天数，显示「近 N 天」）、按近 7 天的日均速率推算的周期末用量（下行和上行分别推算后再按计费方式合计，`max` 模式才正确；推算超过配额时标 ⚠️）、下次重置日期。末尾列出 30 天内到期或已过期的节点。推算和重置日期依赖服务端配置里该节点的 `reset_day` / `reset_time`：用它们算不出 agent 上报的当前周期起始日（两边配置不一致）时，只显示已用量。错过发送时刻（服务端停机）后 24 小时内补发，超过就跳过这一周；部署当周已经过了发送时刻超过 24 小时也不补发。已发送的时刻存在 `alert_state.target`（节点字段为空），重启不重复。
+  - 告警和报告消息里的流量单位最大到 GB（不换算成 TB）：配额按 GB 配置，`1146.88 GB / 1000.00 GB` 比 `1.12 TB / 1000.00 GB` 好比较。
   - traffic 按节点的 `traffic_quota_mode` 计算已用量，没设配额的节点跳过；状态按 (规则, 节点, 周期起始) 记录，每个周期每个档位只提醒一次，下个周期自动重新计。
 - **数据缺失**（节点离线、没有对应数据）时：firing 的告警保持不动，不发恢复；pending 的归零。
 - 服务端启动后的前 2 分钟不评估 offline，避免服务端重启时误报所有节点离线。
-- 未配置 `alerts` 时使用默认规则：offline 60s、cpu > 90% 5m、mem > 90% 5m、disk > 90% 10m、ping_loss > 20% 3m、traffic [80, 90, 100]、expiry [7, 1]、ddos（net_in ≥ 50 Mbps 且 ≥ 4 × 出站 2m）、abuse_out（net_out ≥ 50 Mbps 且 ≥ 4 × 入站 5m）。ip_change 不在默认规则里（动态 IP 的节点会频繁触发）。写了 `alerts` 就只用写的规则。
+- 未配置 `alerts` 时使用默认规则：offline 60s、cpu > 90% 5m、mem > 90% 5m、disk > 90% 10m、ping_loss > 20% 3m、traffic [80, 90, 100]、expiry [7, 1]、ddos（net_in ≥ 50 Mbps 且 ≥ 4 × 出站 2m）、abuse_out（net_out ≥ 50 Mbps 且 ≥ 4 × 入站 5m）、period_report、weekly_report（Mon 09:00）。ip_change 不在默认规则里（动态 IP 的节点会频繁触发）。写了 `alerts` 就只用写的规则。
 - firing 状态和流量档位持久化在 `alert_state`，服务端重启不会重复告警；`alert_history` 保留 400 天（跟随 `retention.h1`）。配置里删掉的规则，其状态在启动时清理。
 
 Telegram：

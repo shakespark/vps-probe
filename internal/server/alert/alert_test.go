@@ -16,6 +16,8 @@ type fakeSrc struct {
 	status map[string]*store.Status
 	links  []store.Link
 	net    map[string][]store.NetSum
+	period map[string][]store.Period     // newest first
+	daily  map[string][]store.DayTraffic // node + "|" + period start
 	states map[key]store.AlertState
 	events []store.AlertEvent
 }
@@ -32,6 +34,13 @@ func (f *fakeSrc) NetSums(_ context.Context, node string, from, to int64) ([]sto
 		}
 	}
 	return out, nil
+}
+func (f *fakeSrc) Periods(_ context.Context, node string, limit int) ([]store.Period, error) {
+	p := f.period[node]
+	return p[:min(limit, len(p))], nil
+}
+func (f *fakeSrc) Daily(_ context.Context, node, start string) ([]store.DayTraffic, error) {
+	return f.daily[node+"|"+start], nil
 }
 func (f *fakeSrc) AlertStates() ([]store.AlertState, error) {
 	var out []store.AlertState
@@ -599,5 +608,109 @@ func TestOfflineAfterFloodHintsNullRoute(t *testing.T) {
 	if !strings.Contains(m, "· 香港（a）\n已 1 分 0 秒 没有上报；停止上报前入站 900.0 Mbps、出站 30.0 Mbps，疑似被攻击后遭商家黑洞") ||
 		strings.Count(m, "黑洞") != 1 || strings.Count(m, "🔴 告警 offline") != 2 {
 		t.Fatalf("offline: %q", h.n.msgs)
+	}
+}
+
+const gib = 1 << 30
+
+// periods sets node's periods, newest first, and makes it fresh with the
+// newest as its current period.
+func (h *harness) periods(node string, ps ...store.Period) {
+	h.report(node, 1)
+	h.src.status[node].Traffic = &ps[0]
+	if h.src.period == nil {
+		h.src.period, h.src.daily = map[string][]store.Period{}, map[string][]store.DayTraffic{}
+	}
+	h.src.period[node] = ps
+}
+
+// days fills node's daily usage in the period starting at start: one entry
+// per day from first, n days, each rx/tx GiB.
+func (h *harness) days(node, start, first string, n int, rx, tx float64) {
+	d, _ := time.Parse(time.DateOnly, first)
+	var out []store.DayTraffic
+	for i := 0; i < n; i++ {
+		out = append(out, store.DayTraffic{Day: d.AddDate(0, 0, i).Format(time.DateOnly), RX: int64(rx * gib), TX: int64(tx * gib)})
+	}
+	h.src.daily[node+"|"+start] = out
+}
+
+func TestPeriodReport(t *testing.T) {
+	h := setup(t, `  - {name: period_report, metric: period_report}`)
+	sep := store.Period{Start: "2026-09-01", RX: 30 * gib, TX: 20 * gib}
+	h.periods("a", sep)
+	h.step(0, nil)
+	if h.msgs() != 0 {
+		t.Fatalf("first sight reported: %v", h.n.msgs)
+	}
+	h.days("a", "2026-09-01", "2026-09-01", 30, 1, 0.5)
+	h.src.daily["a|2026-09-01"][14] = store.DayTraffic{Day: "2026-09-15", RX: 4 * gib, TX: 1 * gib}
+	h.step(10*time.Second, func() { h.periods("a", store.Period{Start: "2026-10-01", RX: 1}, sep) })
+	want := "📊 流量结算 period_report · 香港（a）\n2026-09-01 至 2026-10-01（30 天）：下行 30.00 GB，上行 20.00 GB，合计 50.00 GB\n" +
+		"配额 100.00 GB（计费：收+发），用了 50.0%\n日均 1.67 GB，最多的一天 2026-09-15（5.00 GB）\n"
+	if h.msgs() != 1 || !strings.HasPrefix(h.n.msgs[0], want) {
+		t.Fatalf("report:\n%q\nwant prefix\n%q", h.n.msgs, want)
+	}
+	ev := h.src.events[len(h.src.events)-1]
+	if ev.Event != "report" || ev.Target != "2026-09-01" || ev.Value != 50 {
+		t.Fatalf("history: %+v", ev)
+	}
+	// Once per period, also across a restart.
+	h.step(10*time.Second, func() { h.periods("a", store.Period{Start: "2026-10-01", RX: 2}, sep) })
+	h.newEvaluator()
+	h.step(10*time.Second, func() { h.periods("a", store.Period{Start: "2026-10-01", RX: 3}, sep) })
+	if h.msgs() != 1 || len(h.e.Active()) != 0 {
+		t.Fatalf("repeated: %v", h.n.msgs)
+	}
+	// A start going backwards (agent state rebuilt) is only recorded.
+	h.step(10*time.Second, func() { h.periods("a", sep) })
+	if h.msgs() != 1 {
+		t.Fatalf("backwards reported: %v", h.n.msgs)
+	}
+}
+
+func TestWeeklyReport(t *testing.T) {
+	h := setupNodes(t, `
+  - {id: a, name: 香港, token: `+tokA+`, traffic_quota_gb: 100}
+  - {id: b, token: `+tokB+`, expire_at: 2026-10-20}
+  - {id: c, token: cdefghijklmnopqrstuvwxyz0123456789ab, reset_day: 15}`,
+		`  - {name: weekly, metric: weekly_report, at: "mon 09:00"}`)
+	if r := h.cfg.Alerts[0]; r.At != "Mon 09:00" {
+		t.Fatalf("at normalized to %q", r.At)
+	}
+	cur := store.Period{Start: "2026-10-01", RX: 8 * gib, TX: 2 * gib}
+	h.periods("a", cur, store.Period{Start: "2026-09-01"})
+	h.days("a", "2026-10-01", "2026-10-01", 4, 3, 0.5)
+	h.days("a", "2026-09-01", "2026-09-28", 3, 3, 0.5)
+	h.periods("c", store.Period{Start: "2026-10-01", RX: 1500 * gib})
+	h.days("c", "2026-10-01", "2026-10-03", 2, 1, 0) // reporting since 10-03
+	// Wednesday: Monday's slot is more than a day old, so a fresh deploy
+	// doesn't send it.
+	h.step(0, nil)
+	if h.msgs() != 0 {
+		t.Fatalf("stale slot sent: %v", h.n.msgs)
+	}
+	// Monday 2026-10-05 10:30 in Asia/Shanghai: 90 minutes late, still sent.
+	h.now = time.Date(2026, 10, 5, 2, 30, 0, 0, time.UTC)
+	h.step(0, func() { h.report("a", 1); h.report("c", 1) })
+	// 3 + 0.5 GiB a day over 7 whole days; 26.5625 days left to 11-01 00:00.
+	want := "📊 每周流量 weekly\n" +
+		"香港（a）：本周期（2026-10-01 起）10.00 GB / 100.00 GB（10.0%），近 7 天 24.50 GB，" +
+		"预计周期末 102.97 GB / 100.00 GB（103.0%） ⚠️ 可能超额，11-01 重置\n" +
+		"b：暂无流量数据\n" +
+		"c：本周期（2026-10-01 起）1500.00 GB，近 2 天 2.00 GB\n" + // reset_day 15 can't start on the 1st: no projection
+		"即将到期：b 2026-10-20（还剩 15 天）\n"
+	if h.msgs() != 1 || !strings.HasPrefix(h.n.msgs[0], want) {
+		t.Fatalf("weekly:\n%q\nwant prefix\n%q", h.n.msgs, want)
+	}
+	if ev := h.src.events[0]; ev.Node != "" || ev.Target != "2026-10-05 09:00" || ev.Event != "report" {
+		t.Fatalf("history: %+v", ev)
+	}
+	// Once per slot, also across a restart.
+	h.step(time.Hour, nil)
+	h.newEvaluator()
+	h.step(time.Hour, nil)
+	if h.msgs() != 1 || len(h.e.Active()) != 0 {
+		t.Fatalf("repeated: %v", h.n.msgs)
 	}
 }

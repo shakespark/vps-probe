@@ -120,3 +120,26 @@ func TestPrevPeriodStart(t *testing.T) {
 		}
 	}
 }
+
+func TestNextPeriodStart(t *testing.T) {
+	sh, _ := time.LoadLocation("Asia/Shanghai")
+	cases := []struct {
+		start string
+		r     Reset
+		want  string
+	}{
+		{"2026-09-01 00:00", Reset{Day: 1}, "2026-10-01 00:00"},
+		{"2026-12-01 00:00", Reset{Day: 1}, "2027-01-01 00:00"},
+		{"2026-09-21 18:21", Reset{Day: 21, Hour: 18, Minute: 21}, "2026-10-21 18:21"},
+		{"2026-01-31 00:00", Reset{Day: 31}, "2026-02-28 00:00"},
+		{"2026-02-28 00:00", Reset{Day: 31}, "2026-03-31 00:00"},
+		{"2026-01-30 00:00", Reset{Day: 30}, "2026-02-28 00:00"},
+		{"2026-02-28 00:00", Reset{Day: 30}, "2026-03-30 00:00"},
+	}
+	for _, c := range cases {
+		start, _ := time.ParseInLocation("2006-01-02 15:04", c.start, sh)
+		if got := NextPeriodStart(start, sh, c.r).Format("2006-01-02 15:04"); got != c.want {
+			t.Errorf("NextPeriodStart(%s, %+v) = %s, want %s", c.start, c.r, got, c.want)
+		}
+	}
+}

@@ -288,7 +288,7 @@ func (a *API) daily(w http.ResponseWriter, r *http.Request) {
 
 const maxAlertHistory = 500
 
-var alertEvents = []string{"firing", "repeat", "recovered", "level", "changed"}
+var alertEvents = []string{"firing", "repeat", "recovered", "level", "changed", "report"}
 
 // alertsView: current alerts, history in ?from&to (default: last 7 days,
 // newest first, at most 500) narrowed by ?node, ?rule and ?event (comma-

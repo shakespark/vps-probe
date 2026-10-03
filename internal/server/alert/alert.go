@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"vpsprobe/internal/agent/traffic"
 	"vpsprobe/internal/server/config"
 	"vpsprobe/internal/server/notify"
 	"vpsprobe/internal/server/store"
@@ -49,6 +50,7 @@ const (
 	stateFiring  = "firing"
 	stateLevel   = "level" // traffic: highest quota level notified this period; expiry: lowest day level
 	stateSeen    = "seen"  // ip_change: the node's last known IP, kept in the target
+	stateSent    = "sent"  // period_report: the current period start; weekly_report: the last slot sent
 )
 
 // Source is what the evaluator needs from the store.
@@ -56,6 +58,8 @@ type Source interface {
 	Status(ctx context.Context, node string) (*store.Status, error)
 	Matrix(ctx context.Context, window time.Duration) ([]store.Link, error)
 	NetSums(ctx context.Context, node string, from, to int64) ([]store.NetSum, error)
+	Periods(ctx context.Context, node string, limit int) ([]store.Period, error)
+	Daily(ctx context.Context, node, start string) ([]store.DayTraffic, error)
 	AlertStates() ([]store.AlertState, error)
 	SaveAlerts(put, del []store.AlertState, events []store.AlertEvent) error
 	PruneAlertStates(rules []string) error
@@ -116,7 +120,7 @@ func (e *Evaluator) Load() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, s := range states {
-		if _, ok := e.cfg.Node(s.Node); !ok {
+		if _, ok := e.cfg.Node(s.Node); !ok && s.Node != "" { // "": weekly_report, not per node
 			continue
 		}
 		e.inst[key{s.Rule, s.Node, s.Target}] = &instance{state: s.State, since: time.Unix(s.Since, 0),
@@ -146,7 +150,7 @@ func (e *Evaluator) Active() []Active {
 	defer e.mu.Unlock()
 	out := []Active{}
 	for k, in := range e.inst {
-		if in.state == stateLevel || in.state == stateSeen {
+		if in.state == stateLevel || in.state == stateSeen || in.state == stateSent {
 			continue
 		}
 		r := e.rule(k.rule)
@@ -300,6 +304,16 @@ func (e *Evaluator) Tick(ctx context.Context) error {
 			continue
 		case config.MetricIPChange:
 			e.ipChange(r, snap, now, emit, persist, drop)
+			continue
+		case config.MetricPeriod, config.MetricWeekly:
+			report := e.periodReport
+			if r.Metric == config.MetricWeekly {
+				report = e.weeklyReport
+			}
+			// A failed query leaves nothing recorded, so the next round retries.
+			if err := report(ctx, r, snap, now, emit, persist, drop); err != nil {
+				e.log.Error("traffic report", "rule", r.Name, "err", err)
+			}
 			continue
 		}
 		seen := map[key]bool{}
@@ -712,6 +726,234 @@ func (e *Evaluator) ipChange(r *config.Rule, snap *snapshot, now time.Time,
 	}
 }
 
+type (
+	emitFn    = func(key, string, float64, string)
+	persistFn = func(key, *instance)
+)
+
+// periodReport sends a node's totals for a period once it has ended,
+// noticed by the newest period start changing. The first start seen for a
+// node is recorded silently.
+func (e *Evaluator) periodReport(ctx context.Context, r *config.Rule, snap *snapshot, now time.Time,
+	emit emitFn, persist persistFn, drop func(key)) error {
+	for i := range e.cfg.Nodes {
+		n := &e.cfg.Nodes[i]
+		st := snap.status[n.ID]
+		if !r.Covers(n.ID) || st == nil || st.Traffic == nil {
+			continue
+		}
+		cur := st.Traffic.Start
+		k := key{r.Name, n.ID, cur}
+		if e.inst[k] != nil {
+			continue
+		}
+		var old string
+		for o := range e.inst {
+			if o.rule == r.Name && o.node == n.ID {
+				old = o.target
+			}
+		}
+		var msg string
+		var ended store.Period
+		var pct float64
+		if old != "" && old < cur { // a smaller start: agent state rebuilt or reset day changed
+			ps, err := e.src.Periods(ctx, n.ID, 2)
+			if err != nil {
+				return err
+			}
+			if len(ps) == 2 && ps[0].Start == cur {
+				days, err := e.src.Daily(ctx, n.ID, ps[1].Start)
+				if err != nil {
+					return err
+				}
+				ended = ps[1]
+				msg, pct = e.periodMessage(r, n, ended, cur, days, now)
+			}
+		}
+		drop(k)
+		in := &instance{state: stateSent, since: now, notified: now}
+		e.inst[k] = in
+		persist(k, in)
+		if msg != "" {
+			emit(key{r.Name, n.ID, ended.Start}, "report", pct, msg)
+		}
+	}
+	return nil
+}
+
+func (e *Evaluator) periodMessage(r *config.Rule, n *config.Node, p store.Period, end string,
+	days []store.DayTraffic, now time.Time) (string, float64) {
+	var b strings.Builder
+	total := float64(p.RX + p.TX)
+	fmt.Fprintf(&b, "📊 流量结算 %s · %s\n%s 至 %s", r.Name, e.nodeName(n.ID), p.Start, end)
+	length := 0
+	if s, err := time.Parse(time.DateOnly, p.Start); err == nil {
+		if t, err := time.Parse(time.DateOnly, end); err == nil {
+			length = int(t.Sub(s).Hours()/24 + 0.5)
+		}
+	}
+	if length > 0 {
+		fmt.Fprintf(&b, "（%d 天）", length)
+	}
+	fmt.Fprintf(&b, "：下行 %s，上行 %s，合计 %s", fmtBytes(float64(p.RX)), fmtBytes(float64(p.TX)), fmtBytes(total))
+	pct := 0.0
+	if n.QuotaGB > 0 {
+		quota := n.QuotaGB * (1 << 30)
+		pct = 100 * float64(billable(p.RX, p.TX, n.QuotaMode)) / quota
+		fmt.Fprintf(&b, "\n配额 %s（计费：%s），用了 %.1f%%", fmtBytes(quota), quotaModes[n.QuotaMode], pct)
+	}
+	if length > 0 {
+		// Not divided by the number of daily rows: with a reset_time other
+		// than 00:00 the period's last half day has none.
+		fmt.Fprintf(&b, "\n日均 %s", fmtBytes(total/float64(length)))
+		var peak *store.DayTraffic
+		for i := range days {
+			if peak == nil || days[i].RX+days[i].TX > peak.RX+peak.TX {
+				peak = &days[i]
+			}
+		}
+		if peak != nil {
+			fmt.Fprintf(&b, "，最多的一天 %s（%s）", peak.Day, fmtBytes(float64(peak.RX+peak.TX)))
+		}
+	}
+	b.WriteString("\n" + now.In(e.cfg.Location).Format("2006-01-02 15:04:05"))
+	return b.String(), pct
+}
+
+// weeklyReport sends one summary of all covered nodes at the rule's weekly
+// slot, or up to a day late if the server was down then.
+func (e *Evaluator) weeklyReport(ctx context.Context, r *config.Rule, snap *snapshot, now time.Time,
+	emit emitFn, persist persistFn, drop func(key)) error {
+	slot := r.WeeklySlot(now, e.cfg.Location)
+	if now.Sub(slot) >= 24*time.Hour {
+		return nil
+	}
+	k := key{r.Name, "", slot.Format("2006-01-02 15:04")}
+	if e.inst[k] != nil {
+		return nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "📊 每周流量 %s", r.Name)
+	var soon []string
+	for i := range e.cfg.Nodes {
+		n := &e.cfg.Nodes[i]
+		if !r.Covers(n.ID) {
+			continue
+		}
+		line, err := e.weeklyLine(ctx, n, snap.status[n.ID], now)
+		if err != nil {
+			return err
+		}
+		b.WriteString("\n" + line)
+		if date, days, ok := n.Expiry(now, e.cfg.Location); ok && days <= 30 {
+			if days >= 0 {
+				soon = append(soon, fmt.Sprintf("%s %s（还剩 %d 天）", e.nodeName(n.ID), date, days))
+			} else {
+				soon = append(soon, fmt.Sprintf("%s %s（已过期 %d 天）", e.nodeName(n.ID), date, -days))
+			}
+		}
+	}
+	if len(soon) > 0 {
+		b.WriteString("\n即将到期：" + strings.Join(soon, "、"))
+	}
+	b.WriteString("\n" + now.In(e.cfg.Location).Format("2006-01-02 15:04:05"))
+	drop(k)
+	in := &instance{state: stateSent, since: now, notified: now}
+	e.inst[k] = in
+	persist(k, in)
+	emit(k, "report", 0, b.String())
+	return nil
+}
+
+// weeklyLine is one node's line: usage this period, the last 7 whole days,
+// and the period's end usage projected at the last 7 days' daily rate.
+func (e *Evaluator) weeklyLine(ctx context.Context, n *config.Node, st *store.Status, now time.Time) (string, error) {
+	name := e.nodeName(n.ID)
+	if st == nil || st.Traffic == nil {
+		return name + "：暂无流量数据", nil
+	}
+	ps, err := e.src.Periods(ctx, n.ID, 2)
+	if err != nil {
+		return "", err
+	}
+	if len(ps) == 0 {
+		return name + "：暂无流量数据", nil
+	}
+	cur := ps[0]
+	loc := e.cfg.Location
+	y, m, d := now.In(loc).Date()
+	today := time.Date(y, m, d, 0, 0, 0, 0, loc)
+	from, to := today.AddDate(0, 0, -7).Format(time.DateOnly), today.Format(time.DateOnly)
+	var rx7, tx7 int64
+	whole := map[string]bool{}
+	for _, p := range ps { // the last 7 days may span the previous period
+		days, err := e.src.Daily(ctx, n.ID, p.Start)
+		if err != nil {
+			return "", err
+		}
+		for _, d := range days {
+			if d.Day >= from && d.Day < to {
+				rx7, tx7 = rx7+d.RX, tx7+d.TX
+				whole[d.Day] = true
+			}
+		}
+	}
+
+	quota := n.QuotaGB * (1 << 30)
+	used := func(rx, tx float64) string {
+		if quota <= 0 {
+			return fmtBytes(rx + tx)
+		}
+		v := float64(billable(int64(rx), int64(tx), n.QuotaMode))
+		return fmt.Sprintf("%s / %s（%.1f%%）", fmtBytes(v), fmtBytes(quota), 100*v/quota)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s：本周期（%s 起）%s", name, cur.Start, used(float64(cur.RX), float64(cur.TX)))
+	if len(whole) > 0 { // fewer than 7 for a node that started reporting lately
+		fmt.Fprintf(&b, "，近 %d 天 %s", len(whole), fmtBytes(float64(rx7+tx7)))
+	}
+	next, ok := e.nextReset(n, cur.Start)
+	if !ok {
+		return b.String(), nil // the server's reset day doesn't match the agent's periods
+	}
+	remain := next.Sub(now).Hours() / 24
+	if remain <= 0 {
+		return b.String(), nil // offline across its reset: no newer period reported yet
+	}
+	if len(whole) > 0 {
+		// rx and tx projected separately: billable() of the sums is what a
+		// max quota bills.
+		k := float64(len(whole))
+		prx, ptx := float64(cur.RX)+float64(rx7)/k*remain, float64(cur.TX)+float64(tx7)/k*remain
+		fmt.Fprintf(&b, "，预计周期末 %s", used(prx, ptx))
+		if quota > 0 && float64(billable(int64(prx), int64(ptx), n.QuotaMode)) >= quota {
+			b.WriteString(" ⚠️ 可能超额")
+		}
+	}
+	layout := "01-02"
+	if next.Hour() != 0 || next.Minute() != 0 {
+		layout = "01-02 15:04"
+	}
+	fmt.Fprintf(&b, "，%s 重置", next.Format(layout))
+	return b.String(), nil
+}
+
+// nextReset is when the period starting on date start ends, from the
+// node's reset day and time in the server config. Those only feed
+// agent-config; if they don't reproduce start, the agent's own differ.
+func (e *Evaluator) nextReset(n *config.Node, start string) (time.Time, bool) {
+	r := traffic.Reset{Day: n.ResetDay}
+	if t, err := time.Parse("15:04", n.ResetTime); err == nil {
+		r.Hour, r.Minute = t.Hour(), t.Minute()
+	}
+	loc := e.cfg.Location
+	at, err := time.ParseInLocation("2006-01-02 15:04", fmt.Sprintf("%s %02d:%02d", start, r.Hour, r.Minute), loc)
+	if err != nil || !traffic.PeriodStart(at, loc, r).Equal(at) {
+		return time.Time{}, false
+	}
+	return traffic.NextPeriodStart(at, loc, r), true
+}
+
 var quotaModes = map[string]string{"sum": "收+发", "max": "取大", "tx": "仅上行", "rx": "仅下行"}
 
 func billable(rx, tx int64, mode string) int64 {
@@ -767,8 +1009,10 @@ func fmtDur(d time.Duration) string {
 	return fmt.Sprintf("%d 秒", int(d.Seconds()))
 }
 
+// fmtBytes stops at GB: quotas are configured in GB, and "1.12 TB / 1000 GB"
+// is harder to compare than "1146.88 GB / 1000.00 GB".
 func fmtBytes(b float64) string {
-	units := []string{"B", "KB", "MB", "GB", "TB", "PB"}
+	units := []string{"B", "KB", "MB", "GB"}
 	i := 0
 	for b >= 1024 && i < len(units)-1 {
 		b /= 1024

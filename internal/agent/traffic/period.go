@@ -27,6 +27,13 @@ func PrevPeriodStart(start time.Time, loc *time.Location, r Reset) time.Time {
 	return PeriodStart(start.Add(-time.Nanosecond), loc, r)
 }
 
+// NextPeriodStart returns the start of the period after the one beginning
+// at start. Periods last 28 to 31 days, so 32 days on is always inside the
+// next one.
+func NextPeriodStart(start time.Time, loc *time.Location, r Reset) time.Time {
+	return PeriodStart(start.In(loc).AddDate(0, 0, 32), loc, r)
+}
+
 func anchor(y int, m time.Month, r Reset, loc *time.Location) time.Time {
 	// time.Date normalizes month overflow, so m-1 in January is fine.
 	first := time.Date(y, m, 1, 0, 0, 0, 0, loc)

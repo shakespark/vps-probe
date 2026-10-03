@@ -116,8 +116,9 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
 
 ## 5. 告警与 Telegram
 
-- 规则写在 `server.yml` 的 `alerts` 里（示例见 `examples/server.example.yml`，完整说明见 `docs/DESIGN.md` §7）。不写则用默认规则：离线 60s、CPU/内存 > 90% 持续 5 分钟、磁盘 > 90% 持续 10 分钟、链路丢包 > 20% 持续 3 分钟、流量配额 80/90/100%、到期前 7/1 天、DDoS（入站）和对外攻击（出站）。已经写了 `alerts` 的，要到期提醒需自己加上 `expiry` 规则。
+- 规则写在 `server.yml` 的 `alerts` 里（示例见 `examples/server.example.yml`，完整说明见 `docs/DESIGN.md` §7）。不写则用默认规则：离线 60s、CPU/内存 > 90% 持续 5 分钟、磁盘 > 90% 持续 10 分钟、链路丢包 > 20% 持续 3 分钟、流量配额 80/90/100%、到期前 7/1 天、DDoS（入站）和对外攻击（出站）、流量周期结算和每周流量汇总。已经写了 `alerts` 的，要到期提醒需自己加上 `expiry` 规则。
 - DDoS 识别（服务端 ≥ 0.1.10，不需要升级 agent）：`metric: net_in` / `net_out` 按最近 60s 平均网速（Mbps）告警，加 `ratio` 要求本方向至少是反方向的几倍。中转机正常流量收发对称，被打时入站远大于出站，被利用去打别人时出站远大于入站。默认规则 `ddos`（入站 ≥ 50 Mbps 且 ≥ 4 倍出站，持续 2 分钟）和 `abuse_out`（出站同理，5 分钟）；以下载为主或做种的节点用 `exclude: [节点 id]` 排除（除这些之外的全部节点，以后新加的节点自动包含）。被打后遭商家黑洞时，离线告警会附上停止上报前的入站峰值。已经写了 `alerts` 的要自己加这两条，写法见 `deploy/server.example.yml`。
+- 流量报告（服务端 ≥ 0.1.11）：`metric: period_report` 在每个节点的流量周期结束时发一份结算（上下行、配额使用率、日均、最多的一天）；`metric: weekly_report` 每周在 `at`（如 `"Mon 09:00"`）发一条所有节点的汇总：本周期已用、近 7 天、按近 7 天速率推算的周期末用量（可能超额时标 ⚠️）、下次重置日，以及 30 天内到期的节点。推算要求服务端配置里节点的 `reset_day` / `reset_time` 与 agent 一致。
 - 上报来源 IP 变化通知（`metric: ip_change`）不在默认规则里，需要时自己加，动态 IP 的节点建议用 `exclude` 排除。
 - Telegram：在 @BotFather 用 `/newbot` 建一个**专用** bot，给它发一条消息，再打开 `https://api.telegram.org/bot<TOKEN>/getUpdates` 找 `"chat":{"id":` 后面的数字。填进 `telegram.bot_token` / `telegram.chat_id`，然后：
 

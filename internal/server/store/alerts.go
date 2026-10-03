@@ -24,7 +24,7 @@ type AlertEvent struct {
 	Rule    string  `json:"rule"`
 	Node    string  `json:"node"`
 	Target  string  `json:"target"`
-	Event   string  `json:"event"` // firing | repeat | recovered | level | changed
+	Event   string  `json:"event"` // firing | repeat | recovered | level | changed | report
 	Value   float64 `json:"value"`
 	Message string  `json:"message"`
 }
@@ -141,7 +141,8 @@ func (s *Store) AlertFacets(ctx context.Context, from, to int64) (nodes, rules [
 		col string
 		out *[]string
 	}{{"node", &nodes}, {"rule", &rules}} {
-		err = s.each(ctx, `SELECT DISTINCT `+c.col+` FROM alert_history WHERE ts >= ? AND ts < ? ORDER BY 1`,
+		// node is empty for fleet-wide events (weekly_report).
+		err = s.each(ctx, `SELECT DISTINCT `+c.col+` FROM alert_history WHERE ts >= ? AND ts < ? AND `+c.col+` != '' ORDER BY 1`,
 			[]any{from, to}, func(r *sql.Rows) error {
 				var v string
 				if err := r.Scan(&v); err != nil {

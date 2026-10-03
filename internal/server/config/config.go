@@ -132,6 +132,11 @@ type Rule struct {
 	// net_in / net_out: also require this direction >= Ratio x the other
 	// one; 0 = no such check.
 	Ratio float64 `yaml:"ratio" json:"ratio,omitempty"`
+	// weekly_report: when to send, "Mon 09:00" in the server timezone.
+	At string `yaml:"at" json:"at,omitempty"`
+
+	atDay time.Weekday
+	atMin int // minutes after midnight
 }
 
 // Metrics a rule can watch.
@@ -150,17 +155,48 @@ const (
 	MetricIPChange = "ip_change"
 	MetricNetIn    = "net_in"  // Mbps, summed over the reported interfaces
 	MetricNetOut   = "net_out" // Mbps
+	MetricPeriod   = "period_report"
+	MetricWeekly   = "weekly_report"
 )
 
 var (
 	metrics = []string{MetricCPU, MetricSteal, MetricLoad1, MetricMem, MetricSwap, MetricDisk,
 		MetricOffline, MetricPingLoss, MetricPingAvg, MetricTraffic, MetricExpiry, MetricIPChange,
-		MetricNetIn, MetricNetOut}
+		MetricNetIn, MetricNetOut, MetricPeriod, MetricWeekly}
 	ops = []string{">", ">=", "<", "<="}
 )
 
 // Covers reports whether the rule applies to node id.
 func (r *Rule) Covers(id string) bool { return r.Nodes.Has(id) && !slices.Contains(r.Exclude, id) }
+
+// WeeklySlot returns the newest send time of a weekly_report rule at or
+// before now.
+func (r *Rule) WeeklySlot(now time.Time, loc *time.Location) time.Time {
+	now = now.In(loc)
+	y, m, d := now.Date()
+	back := (int(now.Weekday()) - int(r.atDay) + 7) % 7
+	slot := time.Date(y, m, d-back, r.atMin/60, r.atMin%60, 0, 0, loc)
+	if slot.After(now) {
+		slot = time.Date(y, m, d-back-7, r.atMin/60, r.atMin%60, 0, 0, loc)
+	}
+	return slot
+}
+
+var weekdays = []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+
+// parseAt reads "Mon 09:00".
+func parseAt(s string) (time.Weekday, int, bool) {
+	day, hm, ok := strings.Cut(strings.TrimSpace(s), " ")
+	if !ok {
+		return 0, 0, false
+	}
+	i := slices.IndexFunc(weekdays, func(w string) bool { return strings.EqualFold(w, day) })
+	t, err := time.Parse("15:04", strings.TrimSpace(hm))
+	if i < 0 || err != nil {
+		return 0, 0, false
+	}
+	return time.Weekday(i), t.Hour()*60 + t.Minute(), true
+}
 
 // Recovers reports whether recovery messages are sent (default true).
 func (r *Rule) Recovers() bool { return r.NotifyRecovery == nil || *r.NotifyRecovery }
@@ -226,6 +262,8 @@ func DefaultRules() []Rule {
 		{Name: "expiry", Metric: MetricExpiry, Levels: []float64{7, 1}},
 		{Name: "ddos", Metric: MetricNetIn, Op: ">=", Threshold: ptr(50), Ratio: 4, For: Duration(2 * time.Minute)},
 		{Name: "abuse_out", Metric: MetricNetOut, Op: ">=", Threshold: ptr(50), Ratio: 4, For: Duration(5 * time.Minute)},
+		{Name: "period_report", Metric: MetricPeriod},
+		{Name: "weekly_report", Metric: MetricWeekly, At: "Mon 09:00"},
 	}
 }
 
@@ -522,9 +560,17 @@ func (c *Config) validate() error {
 				len(slices.Compact(slices.Sorted(slices.Values(r.Levels)))) != len(r.Levels) {
 				bad("%s: levels: want distinct whole days 0-365, e.g. [7, 1] (0 = on the day)", where)
 			}
-		case MetricIPChange:
+		case MetricIPChange, MetricPeriod, MetricWeekly:
 			if r.Op != "" || r.Threshold != nil || r.Levels != nil || r.For != 0 || r.Repeat != 0 {
-				bad("%s: ip_change takes only nodes", where)
+				bad("%s: %s takes only nodes / exclude", where, r.Metric)
+			}
+			if r.Metric == MetricWeekly {
+				d, m, ok := parseAt(r.At)
+				if !ok {
+					bad("%s: at %q: want a weekday and a time, e.g. \"Mon 09:00\"", where, r.At)
+				}
+				r.atDay, r.atMin = d, m
+				r.At = fmt.Sprintf("%s %02d:%02d", weekdays[d], m/60, m%60)
 			}
 		default:
 			if !slices.Contains(ops, r.Op) {
@@ -536,6 +582,9 @@ func (c *Config) validate() error {
 			if r.Levels != nil {
 				bad("%s: levels only apply to traffic", where)
 			}
+		}
+		if r.At != "" && r.Metric != MetricWeekly {
+			bad("%s: at only applies to weekly_report", where)
 		}
 		if r.Ratio != 0 {
 			switch {

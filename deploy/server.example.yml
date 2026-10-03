@@ -61,7 +61,7 @@ offline_after: 30s
 #   aud: "0123...（64 位十六进制 AUD tag）"
 
 # 告警规则，见 docs/DESIGN.md §7。整段不写 = 使用下面这组默认规则；写 `alerts: []` = 不告警。
-# metric: cpu | steal | load1 | mem | swap | disk | offline | ping_loss | ping_avg | net_in | net_out | traffic | expiry | ip_change
+# metric: cpu | steal | load1 | mem | swap | disk | offline | ping_loss | ping_avg | net_in | net_out | traffic | expiry | ip_change | period_report | weekly_report
 alerts:
   - name: offline
     metric: offline
@@ -111,6 +111,11 @@ alerts:
   - name: expiry
     metric: expiry            # 只对写了 expire_at 的节点生效
     levels: [7, 1]            # 到期前几天提醒（0 = 当天），每个到期日每档一次
+  - name: period_report
+    metric: period_report     # 每个节点的流量周期结束时发一份结算
+  - name: weekly_report
+    metric: weekly_report     # 每周一份所有节点的流量汇总
+    at: "Mon 09:00"           # 星期（Mon…Sun）+ 时刻，按 timezone
   # 不在默认规则里：上报来源 IP 变了就通知一次（第一次看到的 IP 只记录）。
   # 动态 IP 的节点会经常触发，可用 nodes 只选固定 IP 的节点。
   # - name: ip_change

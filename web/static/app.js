@@ -895,10 +895,10 @@ function trafficPage() {
 
 const METRICS = { cpu: 'CPU', steal: 'Steal', load1: '负载(1m)', mem: '内存', swap: 'Swap', disk: '磁盘',
   offline: '离线', ping_loss: '丢包', ping_avg: '时延', traffic: '流量配额', expiry: '到期', ip_change: 'IP 变化',
-  net_in: '入站', net_out: '出站' };
-const EVENTS = { firing: '告警', repeat: '仍在告警', recovered: '恢复', level: '流量档位', changed: 'IP 变化' };
+  net_in: '入站', net_out: '出站', period_report: '周期结算', weekly_report: '每周流量' };
+const EVENTS = { firing: '告警', repeat: '仍在告警', recovered: '恢复', level: '流量档位', changed: 'IP 变化', report: '报告' };
 // Rules that notify once per event rather than fire and recover.
-const NOTICE_METRICS = ['traffic', 'expiry', 'ip_change'];
+const NOTICE_METRICS = ['traffic', 'expiry', 'ip_change', 'period_report', 'weekly_report'];
 const eventText = (e, metric) => e.event === 'level' && metric === 'expiry' ? '到期提醒' : EVENTS[e.event] || e.event;
 
 function fmtRuleValue(metric, v) {
@@ -913,6 +913,7 @@ function fmtRuleValue(metric, v) {
 // metric is undefined for events of rules no longer configured.
 function historyValue(e, metric) {
   if (e.event === 'changed') return '—';
+  if (e.event === 'report') return metric === 'period_report' && e.value ? e.value.toFixed(1) + '%' : '—';
   if (e.event === 'level') return metric === 'expiry' ? fmtExpiry(e.value) : e.value + '%';
   return fmtRuleValue(metric, e.value);
 }
@@ -924,16 +925,19 @@ function ruleText(r) {
     return `到期前 ${[...r.levels].sort((a, b) => b - a).map(l => l || '当').join(' / ')} 天提醒（每个到期日每档一次）`;
   }
   if (r.metric === 'ip_change') return '上报来源 IP 变化时通知';
+  if (r.metric === 'period_report') return '每个流量周期结束时发送结算';
+  if (r.metric === 'weekly_report') return `每周${WEEKDAYS[r.at.slice(0, 3)] || ' ' + r.at.slice(0, 3)} ${r.at.slice(4)} 发送流量汇总`;
   let t = `${METRICS[r.metric] || r.metric} ${r.op} ${fmtRuleValue(r.metric, r.threshold)}`;
   if (r.ratio) t += `，且不低于${r.metric === 'net_in' ? '出站' : '入站'}的 ${r.ratio} 倍`;
   if (r.for !== '0s') t += `，持续 ${r.for}`;
   return t;
 }
 
+const WEEKDAYS = { Mon: '一', Tue: '二', Wed: '三', Thu: '四', Fri: '五', Sat: '六', Sun: '日' };
 const ALERT_RANGES = [['1d', '24 小时', 86400], ['7d', '7 天', 7 * 86400], ['30d', '30 天', 30 * 86400],
   ['90d', '90 天', 90 * 86400]];
 const EVENT_FILTERS = [['', '全部事件'], ['firing,repeat', '告警'], ['recovered', '恢复'], ['level', '流量档位 / 到期提醒'],
-  ['changed', 'IP 变化']];
+  ['changed', 'IP 变化'], ['report', '报告']];
 const alertFilter = { range: '7d', node: '', rule: '', event: '' };
 
 function alertsPage() {
@@ -999,7 +1003,7 @@ function alertsPage() {
           cell(fmtTime(e.ts)),
           h('td', null, h('span', { class: 'badge ' + (e.event === 'recovered' ? '' : e.event === 'firing' || e.event === 'repeat' ? 'bad' : 'warn'),
             text: eventText(e, metricOf.get(e.rule)) })),
-          cell(e.rule), cell(nodeText(e.node)), cell(e.target || '—'),
+          cell(e.rule), cell(e.node ? nodeText(e.node) : '全部'), cell(e.target || '—'),
           cell(historyValue(e, metricOf.get(e.rule))))))
         : h('div', { class: 'empty', text: filtered ? '没有符合条件的告警' : `最近 ${range[1]}没有告警` }));
 
