@@ -37,7 +37,7 @@ ssh-keygen -Y verify -f release-signers -I shakespark -n vps-probe-release \
 sha256sum -c --ignore-missing vps-probe-$V.sha256      # 应输出 OK
 ```
 
-公钥以本仓库的 `deploy/release-signers` 为准，以后升级沿用同一个。需要 OpenSSH ≥ 8.1（Debian 11、Ubuntu 20.04 起自带）。
+公钥以本仓库的 `internal/release/release-signers` 为准，以后升级沿用同一个。需要 OpenSSH ≥ 8.1（Debian 11、Ubuntu 20.04 起自带）。
 
 **自己构建**也可以，需要 Go 1.24+：
 
@@ -151,6 +151,43 @@ rm server.yml                          # 已安装到 /etc/vps-probe/server.yml
 
 ## 4. 添加节点（每台 VPS）
 
+需要服务端 ≥ 0.1.17，并且 VPS 能访问 GitHub（或你指定的镜像）。先在 `/etc/vps-probe/server.yml` 里写一次 agent 上报用的地址，以后的命令就不用再带 `-server`：
+
+```yaml
+server_addr: probe.example.com:9527     # 服务端的域名或 IP + UDP 端口
+```
+
+**第一步，在服务端上**登记节点（生成 token 并写进 `server.yml`，原文件留一份 `.bak-时间`）：
+
+```sh
+vps-probe-server add-node -id hk-1 -name "香港 1" -addr hk1.example.com -region HK
+systemctl restart vps-probe-server
+```
+
+- `-addr` 是其他节点 ping 它用的公网地址（IP 或域名）；不写就没有节点 ping 它（家里的机器、NAT 机）。
+- `-name`、`-region`、`-group` 可选。配额、到期日等其他字段照旧手工编辑 `server.yml`。
+- `add-node` 只在文件里插入这一个节点，其余内容（注释、格式）一个字都不动；插入后的配置通不过校验时不会改文件。
+
+**第二步，在这台 VPS 上**以 root 粘贴 `add-node` 打印出的那一行命令。它会：下载与服务端同版本的发布包 → 用发布公钥验证签名和校验和 → 写入这个节点的配置 → 安装并启动 agent。看到 `agent is reporting: the server acknowledged it` 就成功了。
+
+- 这行命令里有该节点的 token，别贴到聊天或工单里。粘贴执行后它会留在这台 VPS 的 root shell 历史里；token 本来就保存在同一台机器的 `/etc/vps-probe/agent.yml`（也只有 root 能读），所以没有多暴露什么。
+- 不想留历史：在服务端（或能同时登录两边的电脑）上直接 `vps-probe-server install-cmd -node hk-1 | ssh root@那台VPS sh`，命令不经过任何终端和历史。
+- 重启服务端后尽快装 agent：从没上报过的新节点约 2 分钟后会触发一次离线告警。
+
+**以后再要这行命令**（重装、升级 agent、对端列表变了）：
+
+```sh
+vps-probe-server install-cmd -node hk-1
+```
+
+- 新节点加了 `-addr` 后，想让已有节点也 ping 它：对每个已有节点执行一次 `install-cmd`，把打印的命令在那台 VPS 上运行（`add-node` 的输出里列出了涉及的节点）。
+- 升级全部 agent：服务端升级后，对每个节点执行一次 `install-cmd` 即可，装的是与服务端相同的版本（`-version` 可指定别的版本）。
+- GitHub 访问不了时用 `-base https://你的镜像/路径`，镜像上放 `v<版本>/` 目录和发布页里的三个文件即可；镜像不需要可信，签名照样验证。
+- VPS 上需要 OpenSSH ≥ 8.1（Debian 11、Ubuntu 20.04 起自带）和 curl 或 wget。
+
+<details>
+<summary>手动方式（不联网下载，或想自己检查配置文件）</summary>
+
 在**服务端**上：
 
 ```sh
@@ -158,11 +195,10 @@ vps-probe-server gen-token                 # 新节点的 token
 vi /etc/vps-probe/server.yml               # nodes 里加一项：id、name、token、addr
 vps-probe-server check -config /etc/vps-probe/server.yml
 systemctl restart vps-probe-server
-vps-probe-server agent-config -config /etc/vps-probe/server.yml \
-    -node hk-1 -server 服务端IP:9527 -o /root/hk-1.yml
+vps-probe-server agent-config -node hk-1 -server 服务端IP:9527 -o /root/hk-1.yml
 ```
 
-`agent-config` 生成该节点的 `agent.yml`（权限 0600）：token、服务端地址，以及所有写了 `addr` 的其他节点作为 ping 对象。它只是生成一个文件，agent 不会从服务端拉取任何东西。
+`agent-config` 生成该节点的 `agent.yml`（权限 0600）：token、服务端地址，以及所有写了 `addr` 的其他节点作为 ping 对象。
 
 在**这台 VPS** 上：
 
@@ -173,11 +209,12 @@ tar xzf vps-probe-0.1.0-linux-amd64.tar.gz && cd vps-probe-0.1.0-linux-amd64
 rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml 也删掉
 ```
 
-看到 `agent is reporting: the server acknowledged it` 就成功了。
+</details>
+
+无论哪种方式，生成的都只是一个本地配置文件：**agent 不会从服务端拉取任何东西**。
 
 - 如果系统的 `net.ipv4.ping_group_range` 不允许普通用户 ping，`install.sh` 会只给 agent 服务加 `CAP_NET_RAW`（`/etc/systemd/system/vps-probe-agent.service.d/icmp.conf`），不改系统设置。
 - 默认自动识别物理网卡（有 `/sys/class/net/<网卡>/device` 的）。识别不到时在 agent.yml 里写 `interfaces: [eth0]`。
-- 新增节点后，想让已有节点也 ping 它：给这些节点重新生成 agent.yml，再各自 `./install.sh agent --config ...`。
 - 某些节点之间不想互 ping：在其中一方写 `no_ping: [对方 id, ...]`（双向生效），然后给涉及的节点重新生成 agent.yml 并安装。
 - 测经隧道的时延：在发起探测的节点下写 `extra_peers`，再重新生成它的 agent.yml。
   - VPN 型隧道：`{ name: cf-vpn, addr: 1.1.1.1 }`，到目标的路由要走隧道。
@@ -212,7 +249,7 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
 
 ```sh
 ./install.sh server      # 服务端
-./install.sh agent       # 每台 VPS
+./install.sh agent       # 每台 VPS（用一行命令装的 agent：在服务端 install-cmd -node ID，把打印的命令再跑一次）
 ./install.sh echo        # 装了隧道探测应答端的机器
 ```
 

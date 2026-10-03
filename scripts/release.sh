@@ -24,7 +24,7 @@ version=${VERSION:-$(cat VERSION)}
 tag=v$version
 sums=vps-probe-$version.sha256
 key=${SIGNING_KEY:-$HOME/.ssh/vps-probe-release}
-signers=${SIGNERS:-deploy/release-signers}
+signers=${SIGNERS:-internal/release/release-signers}
 ns=vps-probe-release
 
 die() {

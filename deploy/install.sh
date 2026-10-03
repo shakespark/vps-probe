@@ -189,8 +189,8 @@ cmd_install() {
 
 			Next steps (see README):
 			  - allow UDP 9527 to this machine (cloud security group / firewall)
-			  - per node: vps-probe-server gen-token, add the node to $CONF,
-			    vps-probe-server agent-config -node ID -server THIS_IP:9527 -o ID.yml
+			  - per node: vps-probe-server add-node -id ID -server THIS_HOST:9527, restart
+			    this service, then paste the command it prints on that VPS
 			  - web UI: publish http://localhost:8080 through cloudflared + Access
 		EOF
 	fi

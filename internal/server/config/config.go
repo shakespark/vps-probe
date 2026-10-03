@@ -25,12 +25,15 @@ import (
 )
 
 type Config struct {
-	Listen    Listen    `yaml:"listen"`
-	DB        string    `yaml:"db"`
-	Timezone  string    `yaml:"timezone"`
-	Nodes     []Node    `yaml:"nodes"`
-	Retention Retention `yaml:"retention"`
-	Backup    Backup    `yaml:"backup"`
+	Listen   Listen `yaml:"listen"`
+	DB       string `yaml:"db"`
+	Timezone string `yaml:"timezone"`
+	// The address agents report to, host:port: the default -server of
+	// agent-config, add-node and install-cmd. The server itself never uses it.
+	ServerAddr string    `yaml:"server_addr"`
+	Nodes      []Node    `yaml:"nodes"`
+	Retention  Retention `yaml:"retention"`
+	Backup     Backup    `yaml:"backup"`
 	// A node is shown offline when no fresh report arrived for this long.
 	// Keep it at about 3x the agents' interval.
 	OfflineAfter Duration  `yaml:"offline_after"`
@@ -507,6 +510,12 @@ func (c *Config) validate() error {
 		bad("offline_after: must be at least 5s")
 	}
 
+	if c.ServerAddr != "" {
+		host, port, err := net.SplitHostPort(c.ServerAddr)
+		if pn, perr := strconv.ParseUint(port, 10, 16); err != nil || perr != nil || pn == 0 || !validHost(host) {
+			bad("server_addr %q: want host:port as agents reach this server, e.g. probe.example.com:9527", c.ServerAddr)
+		}
+	}
 	if (c.Telegram.BotToken == "") != (c.Telegram.ChatID == "") {
 		bad("telegram: set both bot_token and chat_id, or neither")
 	}

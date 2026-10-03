@@ -12,9 +12,14 @@ db: /var/lib/vps-probe-server/probe.db
 # 按日流量的日期划分，须与各 agent 的 traffic.timezone 一致。
 timezone: Asia/Shanghai
 
+# 可选：agent 上报用的地址（本机的域名或公网 IP + ingest 端口）。写了以后
+# add-node / install-cmd / agent-config 不用再带 -server。服务端自己不使用它。
+# server_addr: probe.example.com:9527
+
 nodes:
   # id 与 agent 配置里的 node 一致；各 agent 的 ping.peers[].name 也写这个 id。
-  # token 用 `vps-probe-server gen-token` 生成，每台一个。
+  # 加节点最省事的办法是 `vps-probe-server add-node -id ...`（README 第 4 步），它会生成 token
+  # 并把节点追加到这个列表末尾；也可以手写，token 用 `vps-probe-server gen-token` 生成，每台一个。
   # addr：其他节点 ping 它用的地址；reset_day：流量周期起始日（默认 1）；
   # reset_time：周期在当天几点开始（"HH:MM"，默认 00:00，按 timezone 计）；
   # no_ping：与哪些节点互不 ping（双向，写在任意一方即可）；

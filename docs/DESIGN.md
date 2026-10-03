@@ -284,7 +284,7 @@ ping:
 
 ### 6.1 节点注册
 
-节点只能在服务端配置文件中登记，Web 上不能添加：
+节点只能在服务端配置文件中登记，Web 上不能添加（`add-node` 命令也只是替你改这个文件，见 §6.1.1）：
 
 ```yaml
 listen:
@@ -292,6 +292,7 @@ listen:
   ingest: ":9527"           # UDP，agent 上报（IPv4 + IPv6）
 db: /var/lib/vps-probe-server/probe.db   # 全部数据都在这一个文件里
 timezone: Asia/Shanghai    # 按日流量的日期划分，须与 agent 的 traffic.timezone 一致
+server_addr: probe.example.com:9527   # 可选：agent 上报用的地址，agent-config / add-node / install-cmd 的 -server 默认值
 cf_access:                 # 可选：校验 Web 请求的 Access JWT（见下）
   team_domain: myteam.cloudflareaccess.com
   aud: "<application AUD tag>"
@@ -344,6 +345,33 @@ backup:
 节点的 `addr`（其他节点 ping 它的地址）、`no_ping`（与哪些节点互不 ping，双向生效）、`extra_peers`（该节点额外的非节点目标，原样写进它的 `ping.peers`，`name` 不能与节点 id 重名）、`reset_day` 和 `reset_time` 只供 `vps-probe-server agent-config` 生成 agent.yml 使用；agent 自己的配置文件仍是唯一依据，agent 不从服务端获取任何配置。
 
 提供 `vps-probe-server gen-token` 子命令：生成 32 字节随机 token（base64url），同一个值同时填进 agent 和服务端配置。服务端启动时检查配置文件权限：其他用户可读或组可写则拒绝启动。推荐 `root:vps-probe-server 0640`，服务能读但不能改。
+
+#### 6.1.1 添加节点与一行安装命令
+
+目标：加一台节点从"两台机器上六步、scp 一个带 token 的文件"变成"服务端一条命令，VPS 上粘贴一条命令"，同时不放松 §1：agent 仍然不从服务端获取任何东西，配置和 token 仍然由人带过去，只是从 scp 换成了复制粘贴。
+
+- `vps-probe-server add-node -id ID [-name -addr -region -group]`（root 执行）：
+  - 生成 token，把新节点**以文本方式插入** `server.yml` 的 `nodes` 列表末尾。只用 YAML 解析器定位插入位置和缩进，文件其余部分一个字节都不动（注释、手写的格式都保留）；不整体重新序列化。
+  - 改之前校验：id 不重复；插入后的整份配置必须能通过 `check`，否则原文件不动。
+  - 原文件留一份 `server.yml.bak-<时间>`；新文件写到同目录临时文件再 rename，属主和权限照旧（`root:vps-probe-server 0640`）。
+  - 不重启服务端（没有热加载，见 §12）：打印要执行的 `systemctl restart vps-probe-server`，以及这台节点的安装命令和"其他节点要 ping 它时需要重装哪些节点"的提示。
+- `vps-probe-server install-cmd -node ID`：打印任意已登记节点的安装命令。新装、升级、对端列表变了以后重新生成配置，都是同一条命令。
+- 两个命令都要知道 agent 上报用的地址：`-server host:port`，或配置里的 `server_addr`。
+
+**安装命令**是服务端打印的一行 `sh -c '...'`，在 VPS 上以 root 执行，做这些事：
+
+1. 按 `uname -m` 选 amd64 / arm64，从发布地址下载该版本的 tar 包、`.sha256` 和 `.sha256.sig`（curl，没有则 wget）；
+2. 用命令里带着的发布公钥 `ssh-keygen -Y verify` 验签，再核对 tar 包的 sha256，任何一步不过就停；
+3. 解包，把命令里带着的 agent.yml（base64）写到临时目录，执行包里的 `./install.sh agent --config agent.yml`；
+4. 临时目录（含带 token 的 agent.yml）无论成败都删除。
+
+信任关系：
+
+- 不 `curl | sh` 任何未经校验的脚本。被执行的只有两样：操作者自己的服务端打印出来的这行命令，和签名验证通过的发布包里的 `install.sh`。
+- 发布公钥编进服务端程序（`internal/release/release-signers`，§13.3），而服务端程序本身是操作者验证后装上的。
+- 版本默认是服务端自己的版本（`-version` 可改），发布地址默认 GitHub Releases（`-base` 可换成镜像；镜像不需要可信，因为签名照验）。
+- 命令里有该节点的 token：只影响这一个节点（§1.8）。粘贴执行后它会留在那台 VPS 的 root shell 历史里（Debian 的 root 默认没有设 `HISTCONTROL`，开头的空格只在设了 `ignorespace` 的机器上起作用）；token 本来就在同一台机器的 `agent.yml` 里、同样只有 root 可读，暴露面没有扩大。不想留历史就不经过终端：`vps-probe-server install-cmd -node ID | ssh root@那台VPS sh`。
+- 目标机需要 OpenSSH ≥ 8.1（`ssh-keygen -Y verify`）、`base64`、`sha256sum`、`tar`、systemd。
 
 ### 6.2 Ingest
 
@@ -539,7 +567,7 @@ Telegram：
 ```
 cmd/
   vps-probe-agent/      main.go（含 -dry-run）
-  vps-probe-server/     main.go（serve / check / backup / test-telegram / agent-config / gen-token / hash-password）
+  vps-probe-server/     main.go（serve / check / backup / test-telegram / agent-config / add-node / install-cmd / gen-token / hash-password）
   vps-probe-echo/       main.go：隧道探测应答端（可选，只装在隧道终点）
 proto/probe/v1/         probe.proto
 internal/
@@ -553,8 +581,9 @@ internal/
     traffic/            流量累计与持久化（§4）
     ping/               ICMP 互测、DNS / 隧道回显探测
     report/             拆包、UDP 发送、ACK、补传
+  release/              release-signers 发布签名公钥（§13）、一行安装命令的生成（§6.1.1）
   server/
-    config/             服务端配置、权限检查
+    config/             服务端配置、权限检查、agent.yml 生成、add-node 的文本插入
     store/              SQLite：写入、降采样、清理、查询、备份
     ingest/             UDP 接收、校验、去重、ACK
     api/                只读 HTTP API
@@ -573,7 +602,6 @@ deploy/
   echo.example.yml
   cloudflared.example.yml   本地配置方式的隧道示例
   install.sh              安装 / 升级 / 卸载（agent、server、echo）
-  release-signers         发布签名公钥（§13）
 VERSION                   版本号；`make dist` 生成发布包
 scripts/third_party_licenses.sh   生成 THIRD_PARTY_LICENSES（`make licenses`，`make dist` 时自动执行）
 scripts/release.sh        核对 CI 构建的草稿 Release，签名并发布（`make release-verify` / `make release-sign`，§13）
@@ -611,6 +639,7 @@ docs/
 - 多用户 / 权限体系（依赖 CF Access；`basic_auth` 只有一个账号）
 - 匿名可见的公开状态页（需要单独的监听端口和字段白名单；有需求再做）。演示用途由静态演示站承担（§14）
 - agent 自动更新（安全原则 2）
+- 服务端配置热加载：改了 `server.yml`（包括 `add-node`）要重启服务端。重启不到一秒，期间的报文 agent 会重传
 
 ## 13. 发布与签名
 
@@ -623,7 +652,7 @@ docs/
 3. 维护者在自己电脑上 `make release-sign`：
    - 下载草稿里的文件，用 `.sha256` 核对；
    - 在临时 worktree 里检出同一个 tag（先确认本地 tag 和 GitHub 上的指向同一个 commit），重新 `make dist`，逐个比较 tar 包：文件列表、权限、属主、mtime 和每个文件的字节都要一致；
-   - 用离线签名密钥 `ssh-keygen -Y sign -n vps-probe-release` 签 `.sha256`，得到 `.sha256.sig`，再用仓库里的 `deploy/release-signers` 验一遍；
+   - 用离线签名密钥 `ssh-keygen -Y sign -n vps-probe-release` 签 `.sha256`，得到 `.sha256.sig`，再用仓库里的 `internal/release/release-signers` 验一遍；
    - 上传 `.sig`，把草稿改为正式发布。
 
    只核对、不签名：`make release-verify`。
@@ -642,7 +671,7 @@ docs/
 ### 13.3 密钥
 
 - 专用 ed25519 SSH 密钥，只存在维护者电脑上（`~/.ssh/vps-probe-release`，0600，无口令，以便发布流程无人值守），备份在维护者的密码管理器里；不进 CI，不进 GitHub，和登录 GitHub 的密钥分开。电脑损坏时从备份恢复即可继续发布。
-- 公钥在 `deploy/release-signers`（OpenSSH allowed_signers 格式，限定 namespace `vps-probe-release`）和 README。namespace 让这把密钥的签名不能被挪作他用（比如冒充 git commit 签名）。
+- 公钥在 `internal/release/release-signers`（OpenSSH allowed_signers 格式，限定 namespace `vps-probe-release`）和 README；它同时编进服务端程序，供一行安装命令验签（§6.1.1）。namespace 让这把密钥的签名不能被挪作他用（比如冒充 git commit 签名）。
 - 换密钥：把新公钥加进 `release-signers`（旧的保留，旧版本的签名仍能用旧公钥验证），在 README 和发布说明里写明更换。没有自动化的轮换流程。
 
 ### 13.4 不防什么

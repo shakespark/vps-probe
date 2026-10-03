@@ -183,6 +183,20 @@ func TestCFAccess(t *testing.T) {
 	}
 }
 
+func TestServerAddr(t *testing.T) {
+	base := "nodes:\n  - {id: a, token: " + tokA + "}\n"
+	for _, ok := range []string{"probe.example.com:9527", "203.0.113.1:9527", "[2001:db8::1]:9527"} {
+		if c, err := Parse([]byte(base + "server_addr: \"" + ok + "\"\n")); err != nil || c.ServerAddr != ok {
+			t.Errorf("%s: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"probe.example.com", "probe.example.com:0", "probe.example.com:x", ":9527", "a b:9527"} {
+		if _, err := Parse([]byte(base + "server_addr: \"" + bad + "\"\n")); err == nil {
+			t.Errorf("accepted: %s", bad)
+		}
+	}
+}
+
 func TestBasicAuth(t *testing.T) {
 	base := "nodes:\n  - {id: a, token: " + tokA + "}\n"
 	// Only the format and cost are checked here.

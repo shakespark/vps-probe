@@ -22,6 +22,7 @@ import (
 
 	"golang.org/x/term"
 
+	"vpsprobe/internal/release"
 	"vpsprobe/internal/server/alert"
 	"vpsprobe/internal/server/api"
 	"vpsprobe/internal/server/basicauth"
@@ -51,6 +52,12 @@ func usage() {
   vps-probe-server test-telegram [-config FILE]      send a test message with the configured bot
   vps-probe-server agent-config [-config FILE] -node ID -server HOST:PORT -o FILE
                                                      write agent.yml for a node (mode 0600)
+  vps-probe-server add-node [-config FILE] -id ID [-name NAME] [-addr HOST] [-region R] [-group G]
+                                                     add a node to the config, print its install command
+  vps-probe-server install-cmd [-config FILE] -node ID
+                                                     print the one-line command that installs a node's agent
+                            add-node and install-cmd also take -server HOST:PORT (default: server_addr
+                            in the config), -version V, -base URL and -signers FILE
   vps-probe-server gen-token                         print a new random node token
   vps-probe-server hash-password                     read a password, print its hash for basic_auth
   vps-probe-server version
@@ -74,6 +81,10 @@ func main() {
 		err = testTelegram(args)
 	case "agent-config":
 		err = agentConfig(args)
+	case "add-node":
+		err = addNode(args)
+	case "install-cmd":
+		err = installCmd(args)
 	case "gen-token":
 		err = genToken()
 	case "hash-password":
@@ -96,11 +107,197 @@ func configFlag(fs *flag.FlagSet) *string {
 	return fs.String("config", "/etc/vps-probe/server.yml", "config file")
 }
 
-func genToken() error {
+func newToken() string {
 	b := make([]byte, 32)
 	rand.Read(b)
-	fmt.Println(base64.RawURLEncoding.EncodeToString(b))
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func genToken() error {
+	fmt.Println(newToken())
 	return nil
+}
+
+// installFlags are shared by add-node and install-cmd: where agents report
+// to and which release the command installs.
+type installFlags struct {
+	server, version, base, signers *string
+}
+
+func addInstallFlags(fs *flag.FlagSet) installFlags {
+	return installFlags{
+		server:  fs.String("server", "", "address agents use to reach this server, host:port (default: server_addr in the config)"),
+		version: fs.String("version", "", "release the command installs (default: this server's version)"),
+		base:    fs.String("base", "", "release base URL, e.g. a mirror (default: "+release.DefaultBase+")"),
+		signers: fs.String("signers", "", "allowed_signers file to verify the release with (default: the built-in release keys)"),
+	}
+}
+
+// line builds the install command for a node of cfg.
+func (f installFlags) line(cfg *config.Config, node string) (string, error) {
+	server := *f.server
+	if server == "" {
+		server = cfg.ServerAddr
+	}
+	if server == "" {
+		return "", errors.New("pass -server HOST:PORT (how agents reach this server), or set server_addr in the config")
+	}
+	text, err := cfg.AgentConfig(node, server)
+	if err != nil {
+		return "", err
+	}
+	c := release.Command{Version: *f.version, Base: *f.base, AgentConfig: text}
+	if c.Version == "" {
+		c.Version = version
+	}
+	if *f.signers != "" {
+		b, err := os.ReadFile(*f.signers)
+		if err != nil {
+			return "", err
+		}
+		c.Signers = string(b)
+	}
+	return c.Line()
+}
+
+func installCmd(args []string) error {
+	fs := flag.NewFlagSet("install-cmd", flag.ExitOnError)
+	path := configFlag(fs)
+	node := fs.String("node", "", "node id from server.yml")
+	f := addInstallFlags(fs)
+	fs.Parse(args)
+	if *node == "" {
+		return errors.New("install-cmd: -node is required")
+	}
+	cfg, err := config.Load(*path)
+	if err != nil {
+		return err
+	}
+	line, err := f.line(cfg, *node)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "Run this as root on %s. It contains the node's token; to keep it out of every shell\n"+
+		"history, pipe it instead: vps-probe-server install-cmd -node %s | ssh root@THAT_VPS sh\n\n", *node, *node)
+	fmt.Println(line)
+	return nil
+}
+
+// addNode inserts a node into the config file and prints what to do next.
+// The file is replaced only if the result is a valid config; the previous
+// version stays beside it as a .bak file.
+func addNode(args []string) error {
+	fs := flag.NewFlagSet("add-node", flag.ExitOnError)
+	path := configFlag(fs)
+	n := config.NewNode{}
+	fs.StringVar(&n.ID, "id", "", "node id: letters, digits, - and _")
+	fs.StringVar(&n.Name, "name", "", "display name (default: the id)")
+	fs.StringVar(&n.Addr, "addr", "", "address other nodes ping, IP or domain (default: none, nobody pings it)")
+	fs.StringVar(&n.Region, "region", "", "region code shown as a badge, e.g. HK")
+	fs.StringVar(&n.Group, "group", "", "group for the overview tabs")
+	f := addInstallFlags(fs)
+	fs.Parse(args)
+	if n.ID == "" {
+		return errors.New("add-node: -id is required")
+	}
+	n.Token = newToken()
+
+	// Load also checks the file's permissions.
+	if _, err := config.Load(*path); err != nil {
+		return err
+	}
+	old, err := os.ReadFile(*path)
+	if err != nil {
+		return err
+	}
+	data, err := config.AddNode(old, n)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Parse(data)
+	if err != nil {
+		return err
+	}
+	// Before touching the file: a command that cannot be printed (no
+	// -server, a dev build without -version) should not leave a node behind.
+	line, err := f.line(cfg, n.ID)
+	if err != nil {
+		return err
+	}
+	bak, err := replaceFile(*path, old, data)
+	if err != nil {
+		return err
+	}
+
+	w := os.Stderr
+	fmt.Fprintf(w, "Added node %s to %s (previous version: %s).\n\n", n.ID, *path, bak)
+	fmt.Fprintf(w, "1. Restart the server so it accepts the node:\n\n     systemctl restart vps-probe-server\n\n")
+	fmt.Fprintf(w, "2. Right after that, run this as root on the new VPS. It contains the node's token; to keep\n"+
+		"   it out of every shell history, pipe it instead:\n"+
+		"     vps-probe-server install-cmd -node %s | ssh root@THAT_VPS sh\n\n", n.ID)
+	fmt.Println(line)
+	var others []string
+	for _, p := range cfg.Nodes {
+		if p.ID != n.ID && n.Addr != "" && !cfg.NoPing(n.ID, p.ID) {
+			others = append(others, p.ID)
+		}
+	}
+	if len(others) > 0 {
+		fmt.Fprintf(w, "\n3. Optional: for the other nodes to ping %s, reinstall their config. For each of\n   %s:\n\n"+
+			"     vps-probe-server install-cmd -node ID     # run the printed command on that VPS\n",
+			n.ID, strings.Join(others, ", "))
+	}
+	return nil
+}
+
+// replaceFile swaps path's content for data, keeping owner and mode, after
+// saving the old content beside it. It returns the backup's name.
+func replaceFile(path string, old, data []byte) (string, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	uid, gid := -1, -1
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		uid, gid = int(sys.Uid), int(sys.Gid)
+	}
+	write := func(name string, b []byte) error {
+		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, st.Mode().Perm())
+		if err != nil {
+			return err
+		}
+		_, err = f.Write(b)
+		if err == nil {
+			err = f.Chmod(st.Mode().Perm()) // the umask may have narrowed it
+		}
+		if err == nil && uid >= 0 {
+			err = f.Chown(uid, gid)
+		}
+		if err == nil {
+			err = f.Sync()
+		}
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			os.Remove(name)
+		}
+		return err
+	}
+	bak := path + ".bak-" + time.Now().Format("20060102-150405")
+	if err := write(bak, old); err != nil {
+		return "", err
+	}
+	tmp := path + ".new"
+	os.Remove(tmp)
+	if err := write(tmp, data); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	return bak, nil
 }
 
 // hashPassword prints the bcrypt hash for basic_auth.password_hash. On a
@@ -183,15 +380,21 @@ func agentConfig(args []string) error {
 	fs := flag.NewFlagSet("agent-config", flag.ExitOnError)
 	path := configFlag(fs)
 	node := fs.String("node", "", "node id from server.yml")
-	server := fs.String("server", "", "address agents use to reach this server, host:port (e.g. 203.0.113.1:9527)")
+	server := fs.String("server", "", "address agents use to reach this server, host:port (default: server_addr in the config)")
 	out := fs.String("o", "", "output file, written with mode 0600 (\"-\" for stdout)")
 	fs.Parse(args)
-	if *node == "" || *server == "" || *out == "" {
-		return errors.New("agent-config: -node, -server and -o are required")
+	if *node == "" || *out == "" {
+		return errors.New("agent-config: -node and -o are required")
 	}
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
+	}
+	if *server == "" {
+		*server = cfg.ServerAddr
+	}
+	if *server == "" {
+		return errors.New("agent-config: pass -server HOST:PORT, or set server_addr in the config")
 	}
 	text, err := cfg.AgentConfig(*node, *server)
 	if err != nil {
