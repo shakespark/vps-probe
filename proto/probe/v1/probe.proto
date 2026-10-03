@@ -36,6 +36,9 @@ message SysInfo {
 message CPU {
   float usage = 1; // percent, 0-100
   float steal = 2; // percent, 0-100
+  // Share of time in softirq (mostly network packet processing), percent;
+  // part of usage, not on top of it. Unset before agent 0.1.14.
+  optional float softirq = 3;
 }
 
 message Load {
@@ -71,6 +74,8 @@ message NetRate {
   string iface = 1;
   uint64 rx_rate = 2; // bytes per second
   uint64 tx_rate = 3;
+  optional uint64 rx_pps = 4; // packets per second; unset before agent 0.1.14
+  optional uint64 tx_pps = 5;
 }
 
 message IfaceTraffic {

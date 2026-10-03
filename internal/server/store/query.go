@@ -26,6 +26,7 @@ type Status struct {
 	MetricsTS int64    `json:"metrics_ts,omitempty"`
 	CPU       *float64 `json:"cpu"`
 	Steal     *float64 `json:"steal"`
+	SoftIRQ   *float64 `json:"softirq"` // null before agent 0.1.14
 	Load1     *float64 `json:"load1"`
 	Load5     *float64 `json:"load5"`
 	Load15    *float64 `json:"load15"`
@@ -106,10 +107,10 @@ func (s *Store) Status(ctx context.Context, node string) (*Status, error) {
 		}
 	}
 
-	err = s.r.QueryRowContext(ctx, `SELECT ts, cpu, steal, load1, load5, load15, mem_total, mem_used, swap_total, swap_used,
+	err = s.r.QueryRowContext(ctx, `SELECT ts, cpu, steal, softirq, load1, load5, load15, mem_total, mem_used, swap_total, swap_used,
 			tcp, udp, tcp_tw, threads
 		FROM metrics_raw WHERE node = ? ORDER BY ts DESC LIMIT 1`, rid).
-		Scan(&st.MetricsTS, &st.CPU, &st.Steal, &st.Load1, &st.Load5, &st.Load15,
+		Scan(&st.MetricsTS, &st.CPU, &st.Steal, &st.SoftIRQ, &st.Load1, &st.Load5, &st.Load15,
 			&st.MemTotal, &st.MemUsed, &st.SwapTotal, &st.SwapUsed, &st.TCP, &st.UDP, &st.TCPTW, &st.Threads)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err
@@ -257,6 +258,8 @@ var metricCols = []column{
 	{"cpu_max", "max(cpu)", "max(cpu_max)"},
 	{"steal", "avg(steal)", "avg(steal)"},
 	{"steal_max", "max(steal)", "max(steal_max)"},
+	{"softirq", "avg(softirq)", "avg(softirq)"},
+	{"softirq_max", "max(softirq)", "max(softirq_max)"},
 	{"load1", "avg(load1)", "avg(load1)"},
 	{"load1_max", "max(load1)", "max(load1_max)"},
 	{"load5", "avg(load5)", "avg(load5)"},
@@ -281,6 +284,10 @@ var netCols = []column{
 	{"rx_max", "max(rx)", "max(rx_max)"},
 	{"tx", "avg(tx)", "avg(tx)"},
 	{"tx_max", "max(tx)", "max(tx_max)"},
+	{"rx_pps", "avg(rx_pps)", "avg(rx_pps)"},
+	{"rx_pps_max", "max(rx_pps)", "max(rx_pps_max)"},
+	{"tx_pps", "avg(tx_pps)", "avg(tx_pps)"},
+	{"tx_pps_max", "max(tx_pps)", "max(tx_pps_max)"},
 }
 
 var diskCols = []column{
@@ -498,6 +505,8 @@ type NetSum struct {
 	TS int64
 	RX float64 // bytes/s
 	TX float64
+	// Packets/s; invalid when no interface reported them (agent < 0.1.14).
+	RXPkts, TXPkts sql.NullFloat64
 }
 
 // NetSums lists the node's samples with from <= ts <= to (agent clock),
@@ -508,10 +517,10 @@ func (s *Store) NetSums(ctx context.Context, node string, from, to int64) ([]Net
 		return nil, nil
 	}
 	var out []NetSum
-	err := s.each(ctx, `SELECT ts, sum(rx), sum(tx) FROM net_raw WHERE node = ? AND ts >= ? AND ts <= ?
-		GROUP BY ts ORDER BY ts`, []any{rid, from, to}, func(r *sql.Rows) error {
+	err := s.each(ctx, `SELECT ts, sum(rx), sum(tx), sum(rx_pps), sum(tx_pps) FROM net_raw
+		WHERE node = ? AND ts >= ? AND ts <= ? GROUP BY ts ORDER BY ts`, []any{rid, from, to}, func(r *sql.Rows) error {
 		var n NetSum
-		if err := r.Scan(&n.TS, &n.RX, &n.TX); err != nil {
+		if err := r.Scan(&n.TS, &n.RX, &n.TX, &n.RXPkts, &n.TXPkts); err != nil {
 			return err
 		}
 		out = append(out, n)

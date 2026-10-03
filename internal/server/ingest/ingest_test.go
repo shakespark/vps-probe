@@ -260,6 +260,13 @@ func TestSanitize(t *testing.T) {
 	if n := Sanitize(big); n != 2 || big.Load == nil || big.Load.Threads != 0 || big.Sockets != nil {
 		t.Fatalf("counts: dropped %d, %+v", n, big)
 	}
+	soft, huge, ok := float32(150), uint64(2e9), uint64(5000)
+	opt := &pb.Report{Cpu: &pb.CPU{Usage: 50, Softirq: &soft},
+		Net: []*pb.NetRate{{Iface: "eth0", RxRate: 1, RxPps: &huge, TxPps: &ok}}}
+	if n := Sanitize(opt); n != 2 || opt.Cpu == nil || opt.Cpu.Softirq != nil || opt.Cpu.Usage != 50 ||
+		len(opt.Net) != 1 || opt.Net[0].RxPps != nil || *opt.Net[0].TxPps != 5000 {
+		t.Fatalf("optional fields: dropped %d, %+v", n, opt)
+	}
 	if len(rep.Disks) != 1 || len(rep.Net) != 1 || len(rep.Traffic) != 1 || len(rep.Pings) != 2 {
 		t.Fatalf("lists: disks=%d net=%d traffic=%d pings=%d", len(rep.Disks), len(rep.Net), len(rep.Traffic), len(rep.Pings))
 	}

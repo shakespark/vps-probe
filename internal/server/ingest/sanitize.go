@@ -17,6 +17,7 @@ const (
 	maxText    = 256
 	maxBytes   = math.MaxInt64
 	maxRate    = 1e12 // bytes/s
+	maxPPS     = 1e9  // packets/s
 	maxLoad    = 1e4
 	maxRTT     = 60000 // ms
 	maxPingCnt = 1e5
@@ -38,6 +39,11 @@ func Sanitize(rep *pb.Report) (dropped int) {
 	}
 	if c := rep.Cpu; c != nil && !(pct(c.Usage) && pct(c.Steal)) {
 		rep.Cpu = nil
+		drop()
+	}
+	// Optional fields (agent >= 0.1.14) go on their own; the rest stays.
+	if c := rep.Cpu; c != nil && c.Softirq != nil && !pct(*c.Softirq) {
+		c.Softirq = nil
 		drop()
 	}
 	if l := rep.Load; l != nil && !(inRange(l.L1, 0, maxLoad) && inRange(l.L5, 0, maxLoad) && inRange(l.L15, 0, maxLoad)) {
@@ -62,6 +68,14 @@ func Sanitize(rep *pb.Report) (dropped int) {
 	rep.Net = filter(rep.Net, &dropped, func(n *pb.NetRate) bool {
 		return validName(n.Iface) && n.RxRate <= maxRate && n.TxRate <= maxRate
 	})
+	for _, n := range rep.Net {
+		for _, p := range []**uint64{&n.RxPps, &n.TxPps} {
+			if *p != nil && **p > maxPPS {
+				*p = nil
+				drop()
+			}
+		}
+	}
 	rep.Traffic = filter(rep.Traffic, &dropped, func(t *pb.IfaceTraffic) bool {
 		return validName(t.Iface) && validPeriod(t.Cur) && validPeriod(t.Prev)
 	})

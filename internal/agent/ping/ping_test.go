@@ -289,3 +289,42 @@ func TestBadPeers(t *testing.T) {
 		}
 	}
 }
+
+// slowResolver answers every query after delay.
+func slowResolver(t *testing.T, delay time.Duration) string {
+	t.Helper()
+	c, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, from, err := c.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			resp := append([]byte(nil), buf[:n]...)
+			resp[2] |= 0x80
+			time.AfterFunc(delay, func() { c.WriteTo(resp, from) })
+		}
+	}()
+	return c.LocalAddr().String()
+}
+
+func TestLateReplyIsLost(t *testing.T) {
+	// Replies come back after the timeout but before the next snapshot:
+	// they are losses, not 250 ms round trips.
+	addr := slowResolver(t, 250*time.Millisecond)
+	p, err := New([]Peer{{Name: "cf", Addr: addr, Type: TypeDNS}}, 50*time.Millisecond, 100*time.Millisecond, discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runFor(p, 600*time.Millisecond)
+	time.Sleep(300 * time.Millisecond) // every reply has arrived
+	s := p.Snapshot(time.Now())[0]
+	if s.Sent < 5 || s.Lost != s.Sent || s.Max != 0 {
+		t.Fatalf("late replies counted: %+v", s)
+	}
+}

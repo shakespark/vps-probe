@@ -473,3 +473,45 @@ func TestNetSums(t *testing.T) {
 		t.Fatalf("unknown node: %+v", got)
 	}
 }
+
+func TestPacketRatesAndSoftIRQ(t *testing.T) {
+	s := newStore(t)
+	now := time.Now().Truncate(time.Hour).Add(-2 * time.Hour)
+	u := func(v uint64) *uint64 { return &v }
+	f := func(v float32) *float32 { return &v }
+	for i, ts := 0, now.Unix(); ts < now.Add(5*time.Minute).Unix(); i, ts = i+1, ts+10 {
+		write(t, s, "a", &pb.Report{Ts: ts, Cpu: &pb.CPU{Usage: 20, Softirq: f(float32(2 + i%2*4))},
+			Net: []*pb.NetRate{{Iface: "eth0", RxRate: 1000, TxRate: 500, RxPps: u(uint64(100 + i%2*200)), TxPps: u(50)},
+				{Iface: "eth1", RxRate: 10, TxRate: 10, RxPps: u(1), TxPps: u(0)}}}, time.Unix(ts, 0))
+		write(t, s, "b", &pb.Report{Ts: ts, Cpu: &pb.CPU{Usage: 1},
+			Net: []*pb.NetRate{{Iface: "eth0", RxRate: 1, TxRate: 1}}}, time.Unix(ts, 0)) // old agent
+	}
+	st, err := s.Status(ctx, "a")
+	if err != nil || st.SoftIRQ == nil || *st.SoftIRQ != 6 {
+		t.Fatalf("status a: softirq %v %v", st.SoftIRQ, err)
+	}
+	if st, _ := s.Status(ctx, "b"); st.SoftIRQ != nil {
+		t.Fatalf("old agent softirq %v", *st.SoftIRQ)
+	}
+	sums, err := s.NetSums(ctx, "a", now.Unix()+10, now.Unix()+10)
+	if err != nil || len(sums) != 1 || !sums[0].RXPkts.Valid || sums[0].RXPkts.Float64 != 301 || sums[0].TXPkts.Float64 != 50 {
+		t.Fatalf("sums a: %+v %v", sums, err)
+	}
+	if sums, _ := s.NetSums(ctx, "b", now.Unix(), now.Unix()); len(sums) != 1 || sums[0].RXPkts.Valid {
+		t.Fatalf("sums b: %+v", sums)
+	}
+	if err := s.Rollup(now); err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.Metrics(ctx, "a", now.Unix(), now.Add(7*24*time.Hour).Unix()) // 5m tier
+	if err != nil || m.Tier != "5m" || *m.Cols["softirq"][0] != 4 || *m.Cols["softirq_max"][0] != 6 {
+		t.Fatalf("metrics 5m: %+v %v", m, err)
+	}
+	n, err := s.Net(ctx, "a", now.Unix(), now.Add(7*24*time.Hour).Unix())
+	if err != nil || *n["eth0"].Cols["rx_pps"][0] != 200 || *n["eth0"].Cols["rx_pps_max"][0] != 300 {
+		t.Fatalf("net 5m: %v", err)
+	}
+	if n, _ := s.Net(ctx, "b", now.Unix(), now.Add(7*24*time.Hour).Unix()); n["eth0"].Cols["rx_pps"][0] != nil {
+		t.Fatal("old agent rolled up a packet rate")
+	}
+}

@@ -61,7 +61,7 @@ offline_after: 30s
 #   aud: "0123...（64 位十六进制 AUD tag）"
 
 # 告警规则，见 docs/DESIGN.md §7。整段不写 = 使用下面这组默认规则；写 `alerts: []` = 不告警。
-# metric: cpu | steal | load1 | mem | swap | disk | offline | ping_loss | ping_avg | net_in | net_out | traffic | expiry | ip_change | period_report | weekly_report
+# metric: cpu | steal | load1 | mem | swap | disk | offline | ping_loss | ping_avg | net_in | net_out | pps_in | pps_out | softirq | traffic | expiry | ip_change | period_report | weekly_report
 alerts:
   - name: offline
     metric: offline
@@ -105,6 +105,18 @@ alerts:
     ratio: 4
     for: 5m
     # exclude: [seedbox-1]    # 做种的节点
+  # 不在默认规则里（需 agent >= 0.1.14）：入站包数过多，如 SYN flood（字节速率不高、包很小）。
+  # 阈值先看几天节点详情的「包速率」图再定。
+  # - name: pps_flood
+  #   metric: pps_in          # 包/秒，最近 60s 平均，各网卡相加
+  #   op: ">="
+  #   threshold: 50000
+  #   for: 1m
+  # - name: softirq_high
+  #   metric: softirq         # 软中断占 CPU 的百分比
+  #   op: ">"
+  #   threshold: 30
+  #   for: 2m
   - name: traffic_quota
     metric: traffic           # 只对设置了 traffic_quota_gb 的节点生效
     levels: [80, 90, 100]     # 每个周期每档只提醒一次

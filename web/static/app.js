@@ -31,6 +31,7 @@ function h(tag, props, ...kids) {
 }
 
 const enc = encodeURIComponent;
+const fmtPPS = v => v == null ? '—' : v >= 1e4 ? (v / 1e4).toFixed(1) + ' 万包/秒' : Math.round(v) + ' 包/秒';
 function dec(s) {
   try { return decodeURIComponent(s); } catch { return s; }
 }
@@ -157,6 +158,15 @@ class Chart {
     }
     if (option.tooltip) option.tooltip.showContent = this.tip;
     this.c.setOption(option, { notMerge: true, lazyUpdate: true });
+  }
+  // note shows a line of text under the title, or hides it when empty.
+  note(text) {
+    if (!this.noteEl) {
+      this.noteEl = h('div', { class: 'muted chart-note' });
+      this.el.insertBefore(this.noteEl, this.box);
+    }
+    this.noteEl.textContent = text || '';
+    this.noteEl.hidden = !text;
   }
   dispose() {
     this.ro.disconnect();
@@ -572,7 +582,7 @@ function nodePage(id) {
   const group = new ChartGroup();
   const charts = {
     cpu: new Chart('CPU', group), load: new Chart('负载', group), mem: new Chart('内存 / Swap', group),
-    net: new Chart('网络', group), disk: new Chart('磁盘使用率', group), conns: new Chart('连接与线程', group),
+    net: new Chart('网络', group), pps: new Chart('包速率', group), disk: new Chart('磁盘使用率', group), conns: new Chart('连接与线程', group),
     ping: new Chart('时延（到各 peer）', group),
   };
   const el = h('div', null,
@@ -609,6 +619,8 @@ function nodePage(id) {
       charts.cpu.set(timeOption(from, to, v => v.toFixed(0) + '%', [
         line('CPU', points(m.ts, c.cpu, st)),
         line('Steal', points(m.ts, c.steal, st)),
+        // Part of CPU, not on top of it; agents before 0.1.14 don't report it.
+        c.softirq.some(v => v != null) ? line('软中断', points(m.ts, c.softirq, st)) : null,
         rollup ? line('CPU 峰值', points(m.ts, c.cpu_max, st), { lineStyle: { width: 1, type: 'dashed' } }) : null,
       ].filter(Boolean), { yMax: 100, tipFmt: v => fmtPct(v) }));
       charts.load.set(timeOption(from, to, v => v.toFixed(2), [
@@ -643,6 +655,17 @@ function nodePage(id) {
       }
       charts.net.set(timeOption(from, to, fmtRate, netSeries));
 
+      // Packets: a flood of small packets (SYN) barely shows as bytes.
+      const ppsSeries = [];
+      for (const iface of Object.keys(net).sort()) {
+        const s = net[iface];
+        if (!s.cols.rx_pps.some(v => v != null)) continue; // agent before 0.1.14
+        ppsSeries.push(line(`${iface} ↓`, points(s.ts, s.cols.rx_pps, s.step)));
+        ppsSeries.push(line(`${iface} ↑`, points(s.ts, s.cols.tx_pps, s.step)));
+      }
+      charts.pps.el.hidden = !ppsSeries.length;
+      if (ppsSeries.length) charts.pps.set(timeOption(from, to, fmtPPS, ppsSeries));
+
       charts.disk.set(timeOption(from, to, v => v.toFixed(0) + '%',
         Object.keys(disks).sort().map(mount => {
           const s = disks[mount];
@@ -657,7 +680,9 @@ function nodePage(id) {
         pingSeries.push({ type: 'bar', name: dst + ' 丢包', yAxisIndex: 1, data: points(s.ts, s.cols.loss_pct, s.step),
           barMaxWidth: 4, itemStyle: { opacity: 0.45 }, tooltip: { valueFormatter: v => v == null ? '—' : fmtPct(v, 0) } });
       });
-      charts.ping.set(timeOption(from, to, fmtMs, pingSeries, {
+      const [cap, highest] = latencyCap(pings.flatMap(p => p.cols.avg.filter(v => v != null)));
+      charts.ping.note(capNote(cap, highest));
+      charts.ping.set(timeOption(from, to, fmtMs, pingSeries, { yMax: cap || undefined,
         y2: { type: 'value', min: 0, max: 100, axisLabel: { formatter: '{value}%' }, splitLine: { show: false } } }));
     },
   };
@@ -678,7 +703,8 @@ function renderNodeHead(n, title, dot, sub, summary) {
     kv('状态', n.online ? '在线' : '离线'),
     kv('最后上报', fmtTime(s.fresh_at)),
     kv('运行时间', sys.boot_time ? fmtDur(nowSec() - sys.boot_time) : '—'),
-    kv('CPU', fmtPct(s.cpu) + (sys.cores ? ` / ${sys.cores} 核` : '')),
+    kv('CPU', fmtPct(s.cpu) + (s.softirq != null ? `（软中断 ${fmtPct(s.softirq)}）` : '') +
+      (sys.cores ? ` / ${sys.cores} 核` : '')),
     kv('内存', s.mem_total ? `${fmtBytes(s.mem_used)} / ${fmtBytes(s.mem_total)}` : '—'),
     kv('磁盘 /', d ? `${fmtBytes(d.used)} / ${fmtBytes(d.total)}` : '—'),
     kv('时钟偏差', s.clock_skew + ' s'),
@@ -845,6 +871,26 @@ function renderStrips(box, avail, nodes, cols, nameOf) {
   box.replaceChildren(...out);
 }
 
+// latencyCap is a y-axis top that fits the typical values when a few
+// outliers would squash the rest (one 10 s round trip against a 40 ms
+// line), or null when everything fits anyway. Clipped points run off the
+// top; tooltips keep their real values. Returns [cap, highest].
+function latencyCap(avgs, maxes = []) {
+  const q = (a, p) => {
+    if (!a.length) return 0;
+    const s = [...a].sort((x, y) => x - y);
+    return s[Math.min(s.length - 1, Math.floor(p * s.length))];
+  };
+  // The avg line must stay readable; the max line may clip more readily.
+  const top = Math.max(q(avgs, 0.99), q(maxes, 0.75));
+  const highest = [...avgs, ...maxes].reduce((a, v) => Math.max(a, v), 0);
+  if (!top || highest <= top * 2) return [null, highest];
+  const want = top * 1.15, e = 10 ** Math.floor(Math.log10(want));
+  return [[1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].map(m => m * e).find(v => v >= want), highest];
+}
+
+const capNote = (cap, highest) => cap ? `纵轴上限 ${fmtMs(cap)}，更高的点超出图表顶部（最高 ${fmtMs(highest)}），数值框里是实际值` : '';
+
 // Loss levels of one sample, in the availability strips' colors: below 1%
 // is fine there too, and a 5-minute period losing 20% or more counts as
 // unavailable.
@@ -902,6 +948,8 @@ function linkPage(src, dst) {
       // Min and max stay neutral so no series color reads as a loss level.
       const colors = LOSS_LEVELS.map(l => cssVar('--' + l[1])), gray = cssVar('--muted');
       const avg = points(s.ts, c.avg, st, undefined, [c.loss_pct]);
+      const [cap, highest] = latencyCap(vals('avg'), vals('max'));
+      chart.note(capNote(cap, highest));
       const option = timeOption(from, to, fmtMs, [
         line('最小', points(s.ts, c.min, st), { lineStyle: { width: 1, type: 'dashed' }, itemStyle: { color: gray } }),
         line('平均', avg, { lineStyle: { width: 2 }, itemStyle: { color: colors[0] } }),
@@ -909,7 +957,8 @@ function linkPage(src, dst) {
         { type: 'bar', name: '丢包', yAxisIndex: 1, data: points(s.ts, c.loss_pct, st), barMaxWidth: 6,
           itemStyle: { opacity: 0.6, color: p => colors[p.value[1] == null ? 0 : lossLevel(p.value[1])] },
           tooltip: { valueFormatter: v => v == null ? '—' : fmtPct(v, 1) } },
-      ], { y2: { type: 'value', min: 0, max: 100, axisLabel: { formatter: '{value}%' }, splitLine: { show: false } } });
+      ], { yMax: cap || undefined,
+        y2: { type: 'value', min: 0, max: 100, axisLabel: { formatter: '{value}%' }, splitLine: { show: false } } });
       // The bars' own color varies by level; visible ones always have loss.
       option.legend.data = ['最小', '平均', '最大', { name: '丢包', itemStyle: { color: colors[3] } }];
       option.visualMap = { type: 'piecewise', show: false, dimension: 0, seriesIndex: 1,
@@ -999,7 +1048,7 @@ function trafficPage() {
 
 const METRICS = { cpu: 'CPU', steal: 'Steal', load1: '负载(1m)', mem: '内存', swap: 'Swap', disk: '磁盘',
   offline: '离线', ping_loss: '丢包', ping_avg: '时延', traffic: '流量配额', expiry: '到期', ip_change: 'IP 变化',
-  net_in: '入站', net_out: '出站', period_report: '周期结算', weekly_report: '每周流量' };
+  net_in: '入站', net_out: '出站', pps_in: '入站包速率', pps_out: '出站包速率', softirq: '软中断', period_report: '周期结算', weekly_report: '每周流量' };
 const EVENTS = { firing: '告警', repeat: '仍在告警', recovered: '恢复', level: '流量档位', changed: 'IP 变化', report: '报告' };
 // Rules that notify once per event rather than fire and recover.
 const NOTICE_METRICS = ['traffic', 'expiry', 'ip_change', 'period_report', 'weekly_report'];
@@ -1011,6 +1060,7 @@ function fmtRuleValue(metric, v) {
   if (metric === 'ping_avg') return fmtMs(v);
   if (metric === 'load1') return v.toFixed(2);
   if (metric === 'net_in' || metric === 'net_out') return v.toFixed(1) + ' Mbps';
+  if (metric === 'pps_in' || metric === 'pps_out') return fmtPPS(v);
   return fmtPct(v);
 }
 
@@ -1032,7 +1082,7 @@ function ruleText(r) {
   if (r.metric === 'period_report') return '每个流量周期结束时发送结算';
   if (r.metric === 'weekly_report') return `每周${WEEKDAYS[r.at.slice(0, 3)] || ' ' + r.at.slice(0, 3)} ${r.at.slice(4)} 发送流量汇总`;
   let t = `${METRICS[r.metric] || r.metric} ${r.op} ${fmtRuleValue(r.metric, r.threshold)}`;
-  if (r.ratio) t += `，且不低于${r.metric === 'net_in' ? '出站' : '入站'}的 ${r.ratio} 倍`;
+  if (r.ratio) t += `，且不低于${r.metric === 'net_in' || r.metric === 'pps_in' ? '出站' : '入站'}的 ${r.ratio} 倍`;
   if (r.for !== '0s') t += `，持续 ${r.for}`;
   return t;
 }

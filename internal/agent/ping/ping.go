@@ -423,7 +423,7 @@ func (p *Pinger) receive(f *family) {
 		key := inflightKey{src.Unmap(), uint16(echo.Seq)}
 		p.mu.Lock()
 		if pr := p.inflight[key]; pr != nil {
-			pr.got, pr.rtt = true, now.Sub(pr.sent)
+			p.answer(pr, now)
 			delete(p.inflight, key)
 		}
 		p.mu.Unlock()
@@ -501,10 +501,20 @@ func (p *Pinger) receiveUDP(ps *peerState, c *net.UDPConn) {
 		}
 		p.mu.Lock()
 		if pr := ps.udpWait[seq]; pr != nil {
-			pr.got, pr.rtt = true, now.Sub(pr.sent)
+			p.answer(pr, now)
 			delete(ps.udpWait, seq)
 		}
 		p.mu.Unlock()
+	}
+}
+
+// answer records a reply to pr; p.mu is held. A reply later than the
+// timeout leaves pr unanswered, and Snapshot counts it as lost. Otherwise a
+// probe still pending at one snapshot could be answered any time before the
+// next and logged as a 10-second round trip.
+func (p *Pinger) answer(pr *probe, now time.Time) {
+	if rtt := now.Sub(pr.sent); rtt < p.timeout {
+		pr.got, pr.rtt = true, rtt
 	}
 }
 

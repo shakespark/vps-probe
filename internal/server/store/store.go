@@ -18,7 +18,7 @@ import (
 	_ "modernc.org/sqlite" // pure Go, keeps CGO_ENABLED=0 builds
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 // Rollup buckets, in seconds.
 const (
@@ -145,7 +145,26 @@ func (s *Store) step(version int, stmts []string) error {
 }
 
 // migrations[i] takes the schema from version i to i+1.
-var migrations = [][]string{schemaV1, schemaV2, schemaV3, schemaV4}
+var migrations = [][]string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5}
+
+// Packet rates and softirq time (agent >= 0.1.14), nullable like v4's
+// columns: older agents' rows have none.
+var schemaV5 = slices.Concat([]string{
+	`ALTER TABLE net_raw ADD COLUMN rx_pps REAL`,
+	`ALTER TABLE net_raw ADD COLUMN tx_pps REAL`,
+	`ALTER TABLE metrics_raw ADD COLUMN softirq REAL`,
+}, addColumns("net_5m", "rx_pps REAL", "rx_pps_max REAL", "tx_pps REAL", "tx_pps_max REAL"),
+	addColumns("net_1h", "rx_pps REAL", "rx_pps_max REAL", "tx_pps REAL", "tx_pps_max REAL"),
+	addColumns("metrics_5m", "softirq REAL", "softirq_max REAL"),
+	addColumns("metrics_1h", "softirq REAL", "softirq_max REAL"))
+
+func addColumns(table string, cols ...string) []string {
+	out := make([]string, len(cols))
+	for i, c := range cols {
+		out[i] = `ALTER TABLE ` + table + ` ADD COLUMN ` + c
+	}
+	return out
+}
 
 // Sockets and threads (agent >= 0.1.9) join the metrics rows as nullable
 // columns, so older agents' rows simply have none.

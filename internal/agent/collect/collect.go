@@ -69,18 +69,25 @@ func parseCPU(data []byte) (CPUTimes, error) {
 	return CPUTimes{v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]}, nil
 }
 
-// CPUUsage returns busy and steal percentages between two readings. ok is
-// false when no time elapsed or the counters went backwards.
-func CPUUsage(prev, cur CPUTimes) (usage, steal float64, ok bool) {
+// CPUPct is CPU time between two readings, in percent. SoftIRQ (mostly
+// network packet processing) is part of Usage, not on top of it.
+type CPUPct struct{ Usage, Steal, SoftIRQ float64 }
+
+// CPUUsage returns the percentages between two readings. ok is false when
+// no time elapsed or the counters went backwards.
+func CPUUsage(prev, cur CPUTimes) (p CPUPct, ok bool) {
 	pt, ct := prev.total(), cur.total()
 	if ct <= pt {
-		return 0, 0, false
+		return CPUPct{}, false
 	}
 	dt := float64(ct - pt)
 	idle := sub(cur.Idle+cur.IOWait, prev.Idle+prev.IOWait)
-	usage = clampPct((dt - float64(idle)) / dt * 100)
-	steal = clampPct(float64(sub(cur.Steal, prev.Steal)) / dt * 100)
-	return usage, steal, true
+	share := func(d uint64) float64 { return clampPct(float64(d) / dt * 100) }
+	return CPUPct{
+		Usage:   clampPct((dt - float64(idle)) / dt * 100),
+		Steal:   share(sub(cur.Steal, prev.Steal)),
+		SoftIRQ: share(sub(cur.SoftIRQ, prev.SoftIRQ)),
+	}, true
 }
 
 func sub(a, b uint64) uint64 {
@@ -283,8 +290,8 @@ func parseMem(data []byte) (Mem, error) {
 
 // ---- Network ----
 
-// NetCounter is a pair of cumulative kernel byte counters.
-type NetCounter struct{ RX, TX uint64 }
+// NetCounter holds an interface's cumulative kernel counters.
+type NetCounter struct{ RX, TX, RXPkts, TXPkts uint64 }
 
 // ReadNetDev parses /proc/net/dev.
 func (f FS) ReadNetDev() (map[string]NetCounter, error) {
@@ -309,12 +316,15 @@ func parseNetDev(data []byte) (map[string]NetCounter, error) {
 		if name == "" || len(fields) < 16 {
 			continue // header lines
 		}
-		rx, err1 := strconv.ParseUint(fields[0], 10, 64)
-		tx, err2 := strconv.ParseUint(fields[8], 10, 64)
-		if err1 != nil || err2 != nil {
-			return nil, fmt.Errorf("collect: /proc/net/dev: bad counters for %s", name)
+		var v [4]uint64
+		for i, f := range []int{0, 8, 1, 9} { // rx/tx bytes, rx/tx packets
+			n, err := strconv.ParseUint(fields[f], 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("collect: /proc/net/dev: bad counters for %s", name)
+			}
+			v[i] = n
 		}
-		out[name] = NetCounter{RX: rx, TX: tx}
+		out[name] = NetCounter{RX: v[0], TX: v[1], RXPkts: v[2], TXPkts: v[3]}
 	}
 	return out, sc.Err()
 }

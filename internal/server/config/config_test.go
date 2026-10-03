@@ -146,6 +146,8 @@ func TestBadAlertRules(t *testing.T) {
 		"weekly bad time":   "  - {name: x, metric: weekly_report, at: 'Mon 9am'}",
 		"at on cpu":         "  - {name: x, metric: cpu, op: '>', threshold: 1, at: 'Mon 09:00'}",
 		"period for":        "  - {name: x, metric: period_report, for: 1m}",
+		"ratio on softirq":  "  - {name: x, metric: softirq, op: '>', threshold: 1, ratio: 2}",
+		"pps no threshold":  "  - {name: x, metric: pps_in, op: '>'}",
 		"ratio on cpu":      "  - {name: x, metric: cpu, op: '>', threshold: 1, ratio: 2}",
 		"ratio below 1":     "  - {name: x, metric: net_in, op: '>', threshold: 1, ratio: 0.5}",
 		"ratio with <":      "  - {name: x, metric: net_in, op: '<', threshold: 1, ratio: 2}",

@@ -25,17 +25,19 @@ func (s *Store) Rollup(since time.Time) error {
 			suffix = "_1h"
 		}
 		stmts := []string{
-			`INSERT OR REPLACE INTO metrics` + suffix + ` (node, ts, cpu, cpu_max, steal, steal_max,
+			`INSERT OR REPLACE INTO metrics` + suffix + ` (node, ts, cpu, cpu_max, steal, steal_max, softirq, softirq_max,
 				load1, load1_max, load5, load15, mem_total, mem_used, mem_used_max, swap_total, swap_used, swap_used_max,
 				tcp, tcp_max, udp, udp_max, tcp_tw, threads, threads_max)
-			SELECT node, ts / :step * :step, avg(cpu), max(cpu), avg(steal), max(steal),
+			SELECT node, ts / :step * :step, avg(cpu), max(cpu), avg(steal), max(steal), avg(softirq), max(softirq),
 				avg(load1), max(load1), avg(load5), avg(load15),
 				max(mem_total), avg(mem_used), max(mem_used), max(swap_total), avg(swap_used), max(swap_used),
 				avg(tcp), max(tcp), avg(udp), max(udp), avg(tcp_tw), avg(threads), max(threads)
 			FROM metrics_raw WHERE ts >= :from GROUP BY node, ts / :step`,
 
-			`INSERT OR REPLACE INTO net` + suffix + ` (node, iface, ts, rx, rx_max, tx, tx_max)
-			SELECT node, iface, ts / :step * :step, avg(rx), max(rx), avg(tx), max(tx)
+			`INSERT OR REPLACE INTO net` + suffix + ` (node, iface, ts, rx, rx_max, tx, tx_max,
+				rx_pps, rx_pps_max, tx_pps, tx_pps_max)
+			SELECT node, iface, ts / :step * :step, avg(rx), max(rx), avg(tx), max(tx),
+				avg(rx_pps), max(rx_pps), avg(tx_pps), max(tx_pps)
 			FROM net_raw WHERE ts >= :from GROUP BY node, iface, ts / :step`,
 
 			// avg is weighted by replies received; min/max/avg ignore rows

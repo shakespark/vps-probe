@@ -2,6 +2,7 @@ package alert
 
 import (
 	"context"
+	"database/sql"
 	"io"
 	"log/slog"
 	"strings"
@@ -135,6 +136,12 @@ func (h *harness) traffic(node string, in, out float64) {
 		h.src.net = map[string][]store.NetSum{}
 	}
 	h.src.net[node] = append(h.src.net[node], store.NetSum{TS: h.now.Unix(), RX: in * 1e6 / 8, TX: out * 1e6 / 8})
+}
+
+// packets adds packet rates to node's newest network sample.
+func (h *harness) packets(node string, in, out float64) {
+	n := &h.src.net[node][len(h.src.net[node])-1]
+	n.RXPkts, n.TXPkts = sql.NullFloat64{Float64: in, Valid: true}, sql.NullFloat64{Float64: out, Valid: true}
 }
 
 // step advances the clock, optionally reporting, and runs one round.
@@ -712,5 +719,37 @@ func TestWeeklyReport(t *testing.T) {
 	h.step(time.Hour, nil)
 	if h.msgs() != 1 || len(h.e.Active()) != 0 {
 		t.Fatalf("repeated: %v", h.n.msgs)
+	}
+}
+
+func TestPacketRates(t *testing.T) {
+	h := setup(t, `  - {name: pps_flood, metric: pps_in, op: ">=", threshold: 50000}
+  - {name: si, metric: softirq, op: ">", threshold: 30}
+  - {name: ddos, metric: net_in, op: ">=", threshold: 50, ratio: 4}`)
+	soft := 42.0
+	h.step(0, func() {
+		// a: a SYN flood, 80k packets/s of 60 bytes: only 38 Mbps.
+		h.traffic("a", 38.4, 30)
+		h.packets("a", 80000, 79000)
+		h.src.status["a"].SoftIRQ = &soft
+		// b: an old agent, no packet rates or softirq; a byte flood.
+		h.traffic("b", 400, 10)
+	})
+	m := strings.Join(h.n.msgs, "\n")
+	if !strings.Contains(m, "🔴 告警 pps_flood · 香港（a）\n入站 8.0 万包/秒（平均 60 字节/包），出站 7.9 万包/秒，软中断 42.0%（阈值 >= 5.0 万包/秒）") ||
+		!strings.Contains(m, "🔴 告警 si · 香港（a）\n软中断 42.0%（阈值 > 30.0%）") ||
+		!strings.Contains(m, "🔴 告警 ddos · b\n疑似 DDoS：入站 400.0 Mbps，出站 10.0 Mbps（40.0 倍）") ||
+		strings.Count(m, "🔴") != 3 {
+		t.Fatalf("packets: %q", h.n.msgs)
+	}
+	// A byte flood from a new agent shows its packets as evidence.
+	h2 := setup(t, `  - {name: ddos, metric: net_in, op: ">=", threshold: 50, ratio: 4}`)
+	h2.step(0, func() {
+		h2.traffic("a", 800, 40)
+		h2.packets("a", 100000, 2000)
+		h2.src.status["a"].SoftIRQ = &soft
+	})
+	if h2.msgs() != 1 || !strings.Contains(h2.n.msgs[0], "\n入站 10.0 万包/秒（平均 1000 字节/包），出站 2000 包/秒，软中断 42.0%\n") {
+		t.Fatalf("evidence: %q", h2.n.msgs)
 	}
 }

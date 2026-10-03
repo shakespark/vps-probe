@@ -34,20 +34,20 @@ func TestParseCPU(t *testing.T) {
 }
 
 func TestCPUUsage(t *testing.T) {
-	prev := CPUTimes{User: 1000, System: 300, Idle: 8000, IOWait: 200, Steal: 100}
-	// +100 total: 30 user, 10 system, 50 idle, 5 iowait, 5 steal.
-	cur := CPUTimes{User: 1030, System: 310, Idle: 8050, IOWait: 205, Steal: 105}
-	usage, steal, ok := CPUUsage(prev, cur)
+	prev := CPUTimes{User: 1000, System: 300, Idle: 8000, IOWait: 200, SoftIRQ: 50, Steal: 100}
+	// +100 total: 25 user, 10 system, 50 idle, 5 iowait, 5 softirq, 5 steal.
+	cur := CPUTimes{User: 1025, System: 310, Idle: 8050, IOWait: 205, SoftIRQ: 55, Steal: 105}
+	p, ok := CPUUsage(prev, cur)
 	if !ok {
 		t.Fatal("not ok")
 	}
-	if math.Abs(usage-45) > 1e-9 || math.Abs(steal-5) > 1e-9 {
-		t.Fatalf("usage=%v steal=%v", usage, steal)
+	if math.Abs(p.Usage-45) > 1e-9 || math.Abs(p.Steal-5) > 1e-9 || math.Abs(p.SoftIRQ-5) > 1e-9 {
+		t.Fatalf("got %+v", p)
 	}
-	if _, _, ok := CPUUsage(cur, cur); ok {
+	if _, ok := CPUUsage(cur, cur); ok {
 		t.Fatal("ok with no elapsed time")
 	}
-	if _, _, ok := CPUUsage(cur, prev); ok {
+	if _, ok := CPUUsage(cur, prev); ok {
 		t.Fatal("ok with counters going backwards")
 	}
 }
@@ -90,10 +90,10 @@ func TestParseNetDev(t *testing.T) {
 	if len(m) != 3 {
 		t.Fatalf("got %d ifaces: %v", len(m), m)
 	}
-	if m["eth0"] != (NetCounter{RX: 98765432101, TX: 12345678901}) {
+	if m["eth0"] != (NetCounter{RX: 98765432101, TX: 12345678901, RXPkts: 123456, TXPkts: 65432}) {
 		t.Fatalf("eth0 = %+v", m["eth0"])
 	}
-	if m["lo"] != (NetCounter{RX: 12345, TX: 12345}) {
+	if m["lo"] != (NetCounter{RX: 12345, TX: 12345, RXPkts: 10, TXPkts: 10}) {
 		t.Fatalf("lo = %+v", m["lo"])
 	}
 }

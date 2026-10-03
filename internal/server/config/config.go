@@ -155,6 +155,9 @@ const (
 	MetricIPChange = "ip_change"
 	MetricNetIn    = "net_in"  // Mbps, summed over the reported interfaces
 	MetricNetOut   = "net_out" // Mbps
+	MetricPPSIn    = "pps_in"  // packets/s, summed over the reported interfaces (agent >= 0.1.14)
+	MetricPPSOut   = "pps_out"
+	MetricSoftIRQ  = "softirq" // percent of CPU time (agent >= 0.1.14)
 	MetricPeriod   = "period_report"
 	MetricWeekly   = "weekly_report"
 )
@@ -162,9 +165,17 @@ const (
 var (
 	metrics = []string{MetricCPU, MetricSteal, MetricLoad1, MetricMem, MetricSwap, MetricDisk,
 		MetricOffline, MetricPingLoss, MetricPingAvg, MetricTraffic, MetricExpiry, MetricIPChange,
-		MetricNetIn, MetricNetOut, MetricPeriod, MetricWeekly}
+		MetricNetIn, MetricNetOut, MetricPPSIn, MetricPPSOut, MetricSoftIRQ, MetricPeriod, MetricWeekly}
 	ops = []string{">", ">=", "<", "<="}
 )
+
+// Rate reports whether the rule watches a network rate (bytes or packets).
+func (r *Rule) Rate() bool {
+	return slices.Contains([]string{MetricNetIn, MetricNetOut, MetricPPSIn, MetricPPSOut}, r.Metric)
+}
+
+// Inbound reports whether a rate rule watches the inbound direction.
+func (r *Rule) Inbound() bool { return r.Metric == MetricNetIn || r.Metric == MetricPPSIn }
 
 // Covers reports whether the rule applies to node id.
 func (r *Rule) Covers(id string) bool { return r.Nodes.Has(id) && !slices.Contains(r.Exclude, id) }
@@ -588,8 +599,8 @@ func (c *Config) validate() error {
 		}
 		if r.Ratio != 0 {
 			switch {
-			case r.Metric != MetricNetIn && r.Metric != MetricNetOut:
-				bad("%s: ratio only applies to net_in / net_out", where)
+			case !r.Rate():
+				bad("%s: ratio only applies to net_in / net_out / pps_in / pps_out", where)
 			case r.Ratio < 1:
 				bad("%s: ratio: want >= 1 (this direction at least ratio x the other), or omit it", where)
 			case r.Op != ">" && r.Op != ">=":

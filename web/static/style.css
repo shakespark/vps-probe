@@ -156,6 +156,7 @@ td.self { color: var(--muted); }
 .cell .ms { font-weight: 500; }
 .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; margin-top: 10px; }
 .chart-legend { margin: 0 0 6px; color: var(--muted); }
+.chart-note { font-size: 12px; margin: 0 0 6px; }
 .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
 .legend .l0::before { background: var(--lat0); }
 .legend .l1::before { background: var(--lat1); }

@@ -181,8 +181,40 @@ type obs struct {
 	detail       string // human-readable current value, e.g. "CPU 95.2%"
 }
 
-// rate is a node's network speed in Mbps, summed over its interfaces.
-type rate struct{ in, out float64 }
+// rate is a node's network speed summed over its interfaces: in Mbps, and
+// in packets/s when pkts (agent >= 0.1.14).
+type rate struct {
+	in, out   float64
+	pin, pout float64
+	pkts      bool
+}
+
+// packets describes the packet rates, with the average packet size of
+// the inbound direction: a flood of small packets (SYN, tiny UDP) is the
+// one a byte rate misses. Empty for agents that don't report them.
+func (rt rate) packets() string {
+	if !rt.pkts {
+		return ""
+	}
+	s := "入站 " + fmtPPS(rt.pin)
+	if rt.pin > 0 {
+		s += fmt.Sprintf("（平均 %.0f 字节/包）", rt.in*1e6/8/rt.pin)
+	}
+	return s + "，出站 " + fmtPPS(rt.pout)
+}
+
+// packetEvidence is the packet rates and softirq time, as an extra line
+// of a net_in alert.
+func packetEvidence(rt rate, st *store.Status) string {
+	var parts []string
+	if p := rt.packets(); p != "" {
+		parts = append(parts, p)
+	}
+	if st != nil && st.SoftIRQ != nil {
+		parts = append(parts, fmt.Sprintf("软中断 %.1f%%", *st.SoftIRQ))
+	}
+	return strings.Join(parts, "，")
+}
 
 type snapshot struct {
 	status map[string]*store.Status
@@ -195,7 +227,7 @@ func (e *Evaluator) snapshot(ctx context.Context, now time.Time) (*snapshot, err
 	s := &snapshot{status: map[string]*store.Status{}, net: map[string]rate{}, peak: map[string]rate{}}
 	var needNet, needPeak bool
 	for _, r := range e.cfg.Alerts {
-		needNet = needNet || r.Metric == config.MetricNetIn || r.Metric == config.MetricNetOut
+		needNet = needNet || r.Rate()
 		needPeak = needPeak || r.Metric == config.MetricNetIn && r.Ratio > 0
 	}
 	for _, n := range e.cfg.Nodes {
@@ -233,12 +265,20 @@ func (e *Evaluator) snapshot(ctx context.Context, now time.Time) (*snapshot, err
 }
 
 func average(sums []store.NetSum) rate {
-	var rx, tx float64
+	var rx, tx, prx, ptx float64
+	var withPkts int
 	for _, n := range sums {
 		rx, tx = rx+n.RX, tx+n.TX
+		if n.RXPkts.Valid {
+			prx, ptx, withPkts = prx+n.RXPkts.Float64, ptx+n.TXPkts.Float64, withPkts+1
+		}
 	}
 	k := float64(len(sums))
-	return rate{in: mbps(rx / k), out: mbps(tx / k)}
+	r := rate{in: mbps(rx / k), out: mbps(tx / k)}
+	if withPkts > 0 {
+		r.pin, r.pout, r.pkts = prx/float64(withPkts), ptx/float64(withPkts), true
+	}
+	return r
 }
 
 // busiestIn averages every netWindow of samples ending at a sample and
@@ -423,7 +463,7 @@ func (e *Evaluator) message(title string, r *config.Rule, k key, detail string, 
 		fmt.Fprintf(&b, "（阈值 %s %s", r.Op, fmtValue(r.Metric, *r.Threshold))
 		if r.Ratio > 0 {
 			other := "出站"
-			if r.Metric == config.MetricNetOut {
+			if !r.Inbound() {
 				other = "入站"
 			}
 			fmt.Fprintf(&b, "，且不低于%s的 %g 倍", other, r.Ratio)
@@ -486,6 +526,10 @@ func (e *Evaluator) observe(r *config.Rule, snap *snapshot, now time.Time) []obs
 			if st.Steal != nil {
 				add("", *st.Steal, "Steal")
 			}
+		case config.MetricSoftIRQ:
+			if st.SoftIRQ != nil {
+				add("", *st.SoftIRQ, "软中断")
+			}
 		case config.MetricLoad1:
 			if st.Load1 != nil {
 				add("", *st.Load1, "负载(1m)")
@@ -504,6 +548,21 @@ func (e *Evaluator) observe(r *config.Rule, snap *snapshot, now time.Time) []obs
 					add(d.Mount, 100*float64(d.Used)/float64(d.Total), "磁盘 "+d.Mount)
 				}
 			}
+		case config.MetricPPSIn, config.MetricPPSOut:
+			rt, ok := snap.net[n.ID]
+			if !ok || !rt.pkts {
+				continue // agent before 0.1.14
+			}
+			own, other := rt.pin, rt.pout
+			if !r.Inbound() {
+				own, other = other, own
+			}
+			detail := rt.packets()
+			if st.SoftIRQ != nil {
+				detail += fmt.Sprintf("，软中断 %.1f%%", *st.SoftIRQ)
+			}
+			out = append(out, obs{node: n.ID, value: own, cond: compare(own, r.Op, *r.Threshold) && own >= r.Ratio*other,
+				detail: detail})
 		case config.MetricNetIn, config.MetricNetOut:
 			rt, ok := snap.net[n.ID]
 			if !ok {
@@ -536,6 +595,9 @@ func (e *Evaluator) observe(r *config.Rule, snap *snapshot, now time.Time) []obs
 				if r.Metric == config.MetricNetIn {
 					if lossy, measured := fanIn(n.ID, snap); measured > 0 {
 						detail += fmt.Sprintf("\n%d 个节点中 %d 个到它丢包 ≥ %.0f%%", measured, lossy, fanInLoss)
+					}
+					if ev := packetEvidence(rt, st); ev != "" {
+						detail += "\n" + ev
 					}
 				}
 			}
@@ -990,11 +1052,20 @@ func fmtValue(metric string, v float64) string {
 		return fmt.Sprintf("%.1f ms", v)
 	case config.MetricNetIn, config.MetricNetOut:
 		return fmtMbps(v)
+	case config.MetricPPSIn, config.MetricPPSOut:
+		return fmtPPS(v)
 	}
 	return fmt.Sprintf("%.1f%%", v)
 }
 
 func fmtMbps(v float64) string { return fmt.Sprintf("%.1f Mbps", v) }
+
+func fmtPPS(v float64) string {
+	if v >= 1e4 {
+		return fmt.Sprintf("%.1f 万包/秒", v/1e4)
+	}
+	return fmt.Sprintf("%.0f 包/秒", v)
+}
 
 func fmtDur(d time.Duration) string {
 	d = d.Round(time.Second)

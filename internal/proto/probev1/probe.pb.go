@@ -249,9 +249,12 @@ func (x *SysInfo) GetAgentVersion() string {
 }
 
 type CPU struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Usage         float32                `protobuf:"fixed32,1,opt,name=usage,proto3" json:"usage,omitempty"` // percent, 0-100
-	Steal         float32                `protobuf:"fixed32,2,opt,name=steal,proto3" json:"steal,omitempty"` // percent, 0-100
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Usage float32                `protobuf:"fixed32,1,opt,name=usage,proto3" json:"usage,omitempty"` // percent, 0-100
+	Steal float32                `protobuf:"fixed32,2,opt,name=steal,proto3" json:"steal,omitempty"` // percent, 0-100
+	// Share of time in softirq (mostly network packet processing), percent;
+	// part of usage, not on top of it. Unset before agent 0.1.14.
+	Softirq       *float32 `protobuf:"fixed32,3,opt,name=softirq,proto3,oneof" json:"softirq,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -296,6 +299,13 @@ func (x *CPU) GetUsage() float32 {
 func (x *CPU) GetSteal() float32 {
 	if x != nil {
 		return x.Steal
+	}
+	return 0
+}
+
+func (x *CPU) GetSoftirq() float32 {
+	if x != nil && x.Softirq != nil {
+		return *x.Softirq
 	}
 	return 0
 }
@@ -578,6 +588,8 @@ type NetRate struct {
 	Iface         string                 `protobuf:"bytes,1,opt,name=iface,proto3" json:"iface,omitempty"`
 	RxRate        uint64                 `protobuf:"varint,2,opt,name=rx_rate,json=rxRate,proto3" json:"rx_rate,omitempty"` // bytes per second
 	TxRate        uint64                 `protobuf:"varint,3,opt,name=tx_rate,json=txRate,proto3" json:"tx_rate,omitempty"`
+	RxPps         *uint64                `protobuf:"varint,4,opt,name=rx_pps,json=rxPps,proto3,oneof" json:"rx_pps,omitempty"` // packets per second; unset before agent 0.1.14
+	TxPps         *uint64                `protobuf:"varint,5,opt,name=tx_pps,json=txPps,proto3,oneof" json:"tx_pps,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -629,6 +641,20 @@ func (x *NetRate) GetRxRate() uint64 {
 func (x *NetRate) GetTxRate() uint64 {
 	if x != nil {
 		return x.TxRate
+	}
+	return 0
+}
+
+func (x *NetRate) GetRxPps() uint64 {
+	if x != nil && x.RxPps != nil {
+		return *x.RxPps
+	}
+	return 0
+}
+
+func (x *NetRate) GetTxPps() uint64 {
+	if x != nil && x.TxPps != nil {
+		return *x.TxPps
 	}
 	return 0
 }
@@ -923,10 +949,13 @@ const file_proto_probe_v1_probe_proto_rawDesc = "" +
 	"\x05cores\x18\x05 \x01(\rR\x05cores\x12\x1b\n" +
 	"\tboot_time\x18\x06 \x01(\x03R\bbootTime\x12\x16\n" +
 	"\x06uptime\x18\a \x01(\x04R\x06uptime\x12#\n" +
-	"\ragent_version\x18\b \x01(\tR\fagentVersion\"1\n" +
+	"\ragent_version\x18\b \x01(\tR\fagentVersion\"\\\n" +
 	"\x03CPU\x12\x14\n" +
 	"\x05usage\x18\x01 \x01(\x02R\x05usage\x12\x14\n" +
-	"\x05steal\x18\x02 \x01(\x02R\x05steal\"R\n" +
+	"\x05steal\x18\x02 \x01(\x02R\x05steal\x12\x1d\n" +
+	"\asoftirq\x18\x03 \x01(\x02H\x00R\asoftirq\x88\x01\x01B\n" +
+	"\n" +
+	"\b_softirq\"R\n" +
 	"\x04Load\x12\x0e\n" +
 	"\x02l1\x18\x01 \x01(\x02R\x02l1\x12\x0e\n" +
 	"\x02l5\x18\x02 \x01(\x02R\x02l5\x12\x10\n" +
@@ -947,11 +976,15 @@ const file_proto_probe_v1_probe_proto_rawDesc = "" +
 	"\x05total\x18\x02 \x01(\x04R\x05total\x12\x12\n" +
 	"\x04used\x18\x03 \x01(\x04R\x04used\x12\x14\n" +
 	"\x05avail\x18\x04 \x01(\x04R\x05avail\x12\x1b\n" +
-	"\tinode_pct\x18\x05 \x01(\x02R\binodePct\"Q\n" +
+	"\tinode_pct\x18\x05 \x01(\x02R\binodePct\"\x9f\x01\n" +
 	"\aNetRate\x12\x14\n" +
 	"\x05iface\x18\x01 \x01(\tR\x05iface\x12\x17\n" +
 	"\arx_rate\x18\x02 \x01(\x04R\x06rxRate\x12\x17\n" +
-	"\atx_rate\x18\x03 \x01(\x04R\x06txRate\"n\n" +
+	"\atx_rate\x18\x03 \x01(\x04R\x06txRate\x12\x1a\n" +
+	"\x06rx_pps\x18\x04 \x01(\x04H\x00R\x05rxPps\x88\x01\x01\x12\x1a\n" +
+	"\x06tx_pps\x18\x05 \x01(\x04H\x01R\x05txPps\x88\x01\x01B\t\n" +
+	"\a_rx_ppsB\t\n" +
+	"\a_tx_pps\"n\n" +
 	"\fIfaceTraffic\x12\x14\n" +
 	"\x05iface\x18\x01 \x01(\tR\x05iface\x12\"\n" +
 	"\x03cur\x18\x02 \x01(\v2\x10.probe.v1.PeriodR\x03cur\x12$\n" +
@@ -1023,6 +1056,8 @@ func file_proto_probe_v1_probe_proto_init() {
 	if File_proto_probe_v1_probe_proto != nil {
 		return
 	}
+	file_proto_probe_v1_probe_proto_msgTypes[2].OneofWrappers = []any{}
+	file_proto_probe_v1_probe_proto_msgTypes[7].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

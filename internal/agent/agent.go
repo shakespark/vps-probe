@@ -230,13 +230,18 @@ func (a *Agent) tick(ts time.Time) {
 			for _, name := range a.ifaces {
 				cur, ok1 := netNow[name]
 				prev, ok2 := a.prevNet[name]
-				if !ok1 || !ok2 || secs <= 0 || cur.RX < prev.RX || cur.TX < prev.TX {
+				if !ok1 || !ok2 || secs <= 0 || cur.RX < prev.RX || cur.TX < prev.TX ||
+					cur.RXPkts < prev.RXPkts || cur.TXPkts < prev.TXPkts {
 					continue
 				}
+				per := func(c, p uint64) uint64 { return uint64(float64(c-p) / secs) }
+				rxPPS, txPPS := per(cur.RXPkts, prev.RXPkts), per(cur.TXPkts, prev.TXPkts)
 				rep.Net = append(rep.Net, &pb.NetRate{
 					Iface:  name,
-					RxRate: uint64(float64(cur.RX-prev.RX) / secs),
-					TxRate: uint64(float64(cur.TX-prev.TX) / secs),
+					RxRate: per(cur.RX, prev.RX),
+					TxRate: per(cur.TX, prev.TX),
+					RxPps:  &rxPPS,
+					TxPps:  &txPPS,
 				})
 			}
 		}
@@ -254,8 +259,9 @@ func (a *Agent) tick(ts time.Time) {
 		a.log.Error("read cpu", "err", err)
 	} else {
 		if a.havePrevC {
-			if usage, steal, ok := collect.CPUUsage(a.prevCPU, c); ok {
-				rep.Cpu = &pb.CPU{Usage: float32(usage), Steal: float32(steal)}
+			if p, ok := collect.CPUUsage(a.prevCPU, c); ok {
+				softirq := float32(p.SoftIRQ)
+				rep.Cpu = &pb.CPU{Usage: float32(p.Usage), Steal: float32(p.Steal), Softirq: &softirq}
 			}
 		}
 		a.prevCPU, a.havePrevC = c, true
