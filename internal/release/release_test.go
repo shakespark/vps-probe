@@ -36,7 +36,9 @@ func TestLine(t *testing.T) {
 		t.Fatalf("not one single-quoted line: %s", line)
 	}
 	for _, want := range []string{"V=0.1.17", "B=" + DefaultBase + "/v$V", "-n " + Namespace, "-I shakespark",
-		base64.StdEncoding.EncodeToString([]byte(agentYML)), "install.sh agent --config agent.yml"} {
+		base64.StdEncoding.EncodeToString([]byte(agentYML)), "install.sh agent --config agent.yml",
+		// Downloads must give up: a VPS that cannot reach the release host used to hang.
+		"curl -fsSL --connect-timeout 20 --speed-limit 1024 --speed-time 30 --max-time 600", "wget -q -T 30 -t 2"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("missing %q in: %s", want, line)
 		}
@@ -46,15 +48,16 @@ func TestLine(t *testing.T) {
 	}
 
 	for name, c := range map[string]Command{
-		"dev version":        {Version: "dev", AgentConfig: agentYML},
-		"shell in version":   {Version: "1.0.0; rm -rf /", AgentConfig: agentYML},
-		"quote in base":      {Version: "1.0.0", Base: "https://x/'; id; '", AgentConfig: agentYML},
-		"space in base":      {Version: "1.0.0", Base: "https://x/a b", AgentConfig: agentYML},
-		"not a URL":          {Version: "1.0.0", Base: "$(id)", AgentConfig: agentYML},
-		"no config":          {Version: "1.0.0"},
-		"no key":             {Version: "1.0.0", AgentConfig: agentYML, Signers: "# nothing\n"},
-		"two principals":     {Version: "1.0.0", AgentConfig: agentYML, Signers: "a ssh-ed25519 AAAA\nb ssh-ed25519 BBBB\n"},
-		"shell in principal": {Version: "1.0.0", AgentConfig: agentYML, Signers: "a;id ssh-ed25519 AAAA\n"},
+		"dev version":         {Version: "dev", AgentConfig: agentYML},
+		"shell in version":    {Version: "1.0.0; rm -rf /", AgentConfig: agentYML},
+		"quote in base":       {Version: "1.0.0", Base: "https://x/'; id; '", AgentConfig: agentYML},
+		"space in base":       {Version: "1.0.0", Base: "https://x/a b", AgentConfig: agentYML},
+		"not a URL":           {Version: "1.0.0", Base: "$(id)", AgentConfig: agentYML},
+		"no config":           {Version: "1.0.0"},
+		"upgrade with config": {Version: "1.0.0", Upgrade: true, AgentConfig: agentYML},
+		"no key":              {Version: "1.0.0", AgentConfig: agentYML, Signers: "# nothing\n"},
+		"two principals":      {Version: "1.0.0", AgentConfig: agentYML, Signers: "a ssh-ed25519 AAAA\nb ssh-ed25519 BBBB\n"},
+		"shell in principal":  {Version: "1.0.0", AgentConfig: agentYML, Signers: "a;id ssh-ed25519 AAAA\n"},
 	} {
 		if line, err := c.Line(); err == nil {
 			t.Errorf("%s: accepted: %s", name, line)
@@ -90,7 +93,7 @@ func newFakeRelease(t *testing.T, version string) *fakeRelease {
 	for _, arch := range []string{"amd64", "arm64"} {
 		pkg := fmt.Sprintf("vps-probe-%s-linux-%s", version, arch)
 		os.Mkdir(filepath.Join(dir, pkg), 0o755)
-		stub := "#!/bin/sh\necho \"$*\" > \"$FAKE_OUT.args\"\ncp \"$3\" \"$FAKE_OUT\"\n"
+		stub := "#!/bin/sh\necho \"$*\" > \"$FAKE_OUT.args\"\n[ $# -lt 3 ] || cp \"$3\" \"$FAKE_OUT\"\n"
 		if err := os.WriteFile(filepath.Join(dir, pkg, "install.sh"), []byte(stub), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -141,6 +144,41 @@ func TestInstallEndToEnd(t *testing.T) {
 	}
 	if args, _ := os.ReadFile(f.out + ".args"); strings.TrimSpace(string(args)) != "agent --config agent.yml" {
 		t.Fatalf("install.sh args: %s", args)
+	}
+}
+
+// An upgrade command carries no config: nothing of the node is in it.
+func TestUpgradeLine(t *testing.T) {
+	line, err := Command{Version: "0.1.19", Upgrade: true}.Line()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(line, "install.sh agent --upgrade") || strings.Contains(line, "agent.yml") {
+		t.Fatalf("not an upgrade command: %s", line)
+	}
+	if out, err := exec.Command("sh", "-n", "-c", line).CombinedOutput(); err != nil {
+		t.Fatalf("not valid sh: %v %s", err, out)
+	}
+
+	f := newFakeRelease(t, "9.9.9")
+	out, err := f.install(t, Command{Version: "9.9.9", Signers: f.signers, Upgrade: true})
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if args, _ := os.ReadFile(f.out + ".args"); strings.TrimSpace(string(args)) != "agent --upgrade" {
+		t.Fatalf("install.sh args: %s", args)
+	}
+	if _, err := os.Stat(f.out); err == nil {
+		t.Fatal("install.sh was given a config")
+	}
+}
+
+// A failed download says which file and what to do about it.
+func TestDownloadFailureMessage(t *testing.T) {
+	f := newFakeRelease(t, "9.9.9")
+	out, err := f.install(t, Command{Version: "9.9.8", Signers: f.signers, Upgrade: true})
+	if err == nil || !strings.Contains(out, "could not download "+f.srv.URL+"/v9.9.8/vps-probe-9.9.8-linux-") || !strings.Contains(out, "-base URL") {
+		t.Fatalf("err=%v out=%s", err, out)
 	}
 }
 

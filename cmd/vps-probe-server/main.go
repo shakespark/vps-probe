@@ -56,6 +56,8 @@ func usage() {
                                                      add a node to the config, print its install command
   vps-probe-server install-cmd [-config FILE] -node ID
                                                      print the one-line command that installs a node's agent
+  vps-probe-server install-cmd -upgrade              print a command that only upgrades an agent and keeps its
+                                                     config; no token in it, the same for every node
                             add-node and install-cmd also take -server HOST:PORT (default: server_addr
                             in the config), -version V, -base URL and -signers FILE
   vps-probe-server gen-token                         print a new random node token
@@ -146,7 +148,12 @@ func (f installFlags) line(cfg *config.Config, node string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	c := release.Command{Version: *f.version, Base: *f.base, AgentConfig: text}
+	return f.command(release.Command{AgentConfig: text})
+}
+
+// command fills in the release to install and returns the line.
+func (f installFlags) command(c release.Command) (string, error) {
+	c.Version, c.Base = *f.version, *f.base
 	if c.Version == "" {
 		c.Version = version
 	}
@@ -164,10 +171,26 @@ func installCmd(args []string) error {
 	fs := flag.NewFlagSet("install-cmd", flag.ExitOnError)
 	path := configFlag(fs)
 	node := fs.String("node", "", "node id from server.yml")
+	upgrade := fs.Bool("upgrade", false, "print a command that only upgrades the agent and keeps the config on the VPS")
 	f := addInstallFlags(fs)
 	fs.Parse(args)
+	if *upgrade {
+		// Nothing node-specific: the config file is not even read.
+		if *node != "" || *f.server != "" {
+			return errors.New("install-cmd: -upgrade keeps each VPS's own agent.yml, so it takes no -node or -server; " +
+				"to rewrite a node's config, run install-cmd -node ID without -upgrade")
+		}
+		line, err := f.command(release.Command{Upgrade: true})
+		if err != nil {
+			return err
+		}
+		fmt.Fprint(os.Stderr, "Run this as root on any VPS that already has the agent. It replaces the programs and keeps\n"+
+			"/etc/vps-probe/agent.yml as it is. Or: vps-probe-server install-cmd -upgrade | ssh root@THAT_VPS sh\n\n")
+		fmt.Println(line)
+		return nil
+	}
 	if *node == "" {
-		return errors.New("install-cmd: -node is required")
+		return errors.New("install-cmd: pass -node ID, or -upgrade")
 	}
 	cfg, err := config.Load(*path)
 	if err != nil {

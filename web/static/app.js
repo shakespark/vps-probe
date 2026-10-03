@@ -1236,12 +1236,34 @@ async function refreshFooter() {
 
 // ---------- start ----------
 
-window.addEventListener('hashchange', navigate);
-darkQuery.addEventListener('change', rerender);
-if (typeof echarts === 'undefined') {
-  $app.replaceChildren(h('div', { class: 'error', text: 'ECharts 加载失败' }));
-} else {
-  navigate();
+// Nothing can be drawn until ECharts is there (see loadECharts).
+const ifReady = () => { if (typeof echarts !== 'undefined') navigate(); };
+window.addEventListener('hashchange', ifReady);
+darkQuery.addEventListener('change', ifReady);
+// ECharts is the largest file of the page and the one most likely to be
+// missed (a server restart, a flaky link). Load it again a few times before
+// asking for a reload.
+const echartsRetryDelays = [2000, 5000, 10000];
+function loadECharts(attempt) {
+  if (typeof echarts !== 'undefined') { navigate(); return; }
+  if (attempt >= echartsRetryDelays.length) {
+    const reload = h('button', { class: 'reload', onclick: () => location.reload() }, '刷新页面');
+    $app.replaceChildren(h('div', { class: 'error' }, '图表库（ECharts）加载失败，请刷新页面。 ', reload));
+    return;
+  }
+  $app.replaceChildren(h('div', { class: 'empty',
+    text: `图表库（ECharts）没有加载上，正在重试（${attempt + 1}/${echartsRetryDelays.length}）…` }));
+  setTimeout(() => {
+    const old = document.querySelector('script[src*="echarts"]');
+    const s = document.createElement('script');
+    s.src = old.getAttribute('src');
+    // A reply that is not the script (a login page, say) still fires load:
+    // what counts is whether echarts exists afterwards.
+    s.addEventListener('load', () => loadECharts(attempt + 1));
+    s.addEventListener('error', () => loadECharts(attempt + 1));
+    old.replaceWith(s);
+  }, echartsRetryDelays[attempt]);
 }
+loadECharts(0);
 refreshFooter();
 setInterval(refreshFooter, 30000);

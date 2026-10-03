@@ -360,14 +360,15 @@ backup:
   - 改之前校验：id 不重复；插入后的整份配置必须能通过 `check`，否则原文件不动。
   - 原文件留一份 `server.yml.bak-<时间>`；新文件写到同目录临时文件再 rename，属主和权限照旧（`root:vps-probe-server 0640`）。
   - 不重启服务端（没有热加载，见 §12）：打印要执行的 `systemctl restart vps-probe-server`，以及这台节点的安装命令和"其他节点要 ping 它时需要重装哪些节点"的提示。
-- `vps-probe-server install-cmd -node ID`：打印任意已登记节点的安装命令。新装、升级、对端列表变了以后重新生成配置，都是同一条命令。
+- `vps-probe-server install-cmd -node ID`：打印任意已登记节点的安装命令。新装、对端列表变了以后重新生成配置，都是这条命令；它每次都用服务端生成的 agent.yml **覆盖**那台机器上的配置（旧的留一份 `.bak-<时间>`）。
+- `vps-probe-server install-cmd -upgrade`：打印**只升级**的命令。它不带配置也不带 token，所有节点通用，不读 `server.yml`；只换程序和 systemd unit，`/etc/vps-probe/agent.yml` 原样保留。手工改过 agent.yml 的节点（比如指定了 `interfaces`）用它升级。那台机器上没有 agent.yml 时拒绝执行（`install.sh agent --upgrade`），不会留下一个装了示例配置、不工作的 agent。`--upgrade` 是 0.1.19 加的，所以 `-upgrade` 不能和更早的 `-version` 一起用。
 - 两个命令都要知道 agent 上报用的地址：`-server host:port`，或配置里的 `server_addr`。
 
 **安装命令**是服务端打印的一行 `sh -c '...'`，在 VPS 上以 root 执行，做这些事：
 
-1. 按 `uname -m` 选 amd64 / arm64，从发布地址下载该版本的 tar 包、`.sha256` 和 `.sha256.sig`（curl，没有则 wget）；
+1. 按 `uname -m` 选 amd64 / arm64，从发布地址下载该版本的 tar 包、`.sha256` 和 `.sha256.sig`（curl，没有则 wget）。下载有时限：连接 20 秒，连续 30 秒几乎没有数据就放弃，单个文件最多 10 分钟；失败时说明是哪个文件、从哪里下载，并提示改用 `-base` 镜像或手工拷贝发布包，而不是一直挂着（连不上 GitHub 的机器上遇到过）；
 2. 用命令里带着的发布公钥 `ssh-keygen -Y verify` 验签，再核对 tar 包的 sha256，任何一步不过就停；
-3. 解包，把命令里带着的 agent.yml（base64）写到临时目录，执行包里的 `./install.sh agent --config agent.yml`；
+3. 解包，把命令里带着的 agent.yml（base64）写到临时目录，执行包里的 `./install.sh agent --config agent.yml`（只升级的命令没有 agent.yml，执行 `./install.sh agent --upgrade`）；
 4. 临时目录（含带 token 的 agent.yml）无论成败都删除。
 
 信任关系：
@@ -573,6 +574,7 @@ Webhook（服务端 ≥ 0.1.18）：让任何有 HTTP 接口的推送服务都�
 
 - 原生 JS 单页应用，无构建步骤；hash 路由（`#/`、`#/node/{id}`、`#/ping`、`#/ping/{src}/{dst}`、`#/traffic`、`#/alerts`）。
 - 页面文件与 ECharts（版本号写在文件名里）用 `go:embed` 打进服务端二进制，与 API 同一端口：`GET /` 返回 `index.html`，`GET /static/...` 返回静态文件，其他路径 404。静态文件长缓存 + 启动时预压缩 gzip，`/api/` 不缓存。
+- ECharts 是页面里最大的文件（压缩后约 370 KB），是最容易没取到的一个（服务端重启的那十几秒、网络抖动）。它没加载上时 `app.js` 自己重新加载它，最多 3 次（间隔 2、5、10 秒），期间页面显示正在重试；都不成功才显示「请刷新页面」和一个刷新按钮。重试成功后直接进入页面，不需要人去刷新。
 - 严格 CSP：`default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'`，禁止内联脚本和样式。ECharts 提示框用 `renderMode: 'richText'`（画在 canvas 上），不需要放开内联样式。
 - **agent 上报的字符串（主机名、网卡、挂载点、peer 名）一律按文本插入 DOM**，不拼 HTML；进入 URL 时做 `encodeURIComponent`。被攻破的 agent 也无法借此在页面里执行脚本。
 - 网速用字节/秒显示（KB/s、MB/s）；流量配额的 GB 按 1024³ 字节计算。

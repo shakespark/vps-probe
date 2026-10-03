@@ -85,7 +85,7 @@
 从 [GitHub Releases](https://github.com/shakespark/vps-probe/releases) 下载，连同同一版本的 `.sha256` 和 `.sha256.sig`：
 
 ```sh
-V=0.1.18
+V=0.1.19
 B=https://github.com/shakespark/vps-probe/releases/download/v$V
 curl -fLO $B/vps-probe-$V-linux-amd64.tar.gz -fLO $B/vps-probe-$V.sha256 -fLO $B/vps-probe-$V.sha256.sig
 ```
@@ -240,15 +240,19 @@ systemctl restart vps-probe-server
 - 不想留历史：在服务端（或能同时登录两边的电脑）上直接 `vps-probe-server install-cmd -node hk-1 | ssh root@那台VPS sh`，命令不经过任何终端和历史。
 - 重启服务端后尽快装 agent：从没上报过的新节点约 2 分钟后会触发一次离线告警。
 
-**以后再要这行命令**（重装、升级 agent、对端列表变了）：
+**以后再要这行命令**（重装、对端列表变了）。它每次都用服务端生成的配置覆盖那台 VPS 上的 `agent.yml`（旧的留一份 `.bak-<时间>`）：
 
 ```sh
 vps-probe-server install-cmd -node hk-1
 ```
 
 - 新节点加了 `-addr` 后，想让已有节点也 ping 它：对每个已有节点执行一次 `install-cmd`，把打印的命令在那台 VPS 上运行（`add-node` 的输出里列出了涉及的节点）。
-- 升级全部 agent：服务端升级后，对每个节点执行一次 `install-cmd` 即可，装的是与服务端相同的版本（`-version` 可指定别的版本）。
-- GitHub 访问不了时用 `-base https://你的镜像/路径`，镜像上放 `v<版本>/` 目录和发布页里的三个文件即可；镜像不需要可信，签名照样验证。
+- 升级全部 agent：服务端升级后用 `vps-probe-server install-cmd -upgrade`。它打印的命令**只换程序、不动配置**，里面没有 token，所有节点用同一条；装的是与服务端相同的版本（`-version` 可指定别的版本，须 ≥ 0.1.19）。手工改过 `agent.yml` 的节点（比如指定了 `interfaces`）也用它。那台机器上还没装 agent 时它会拒绝执行。
+
+  ```sh
+  for h in vps1 vps2 vps3; do vps-probe-server install-cmd -upgrade | ssh root@$h sh; done
+  ```
+- 下载有时限（连接 20 秒，连续 30 秒几乎没有数据就放弃），连不上会报错退出而不是一直等。GitHub 访问不了时用 `-base https://你的镜像/路径`，镜像上放 `v<版本>/` 目录和发布页里的三个文件即可；镜像不需要可信，签名照样验证。
 - VPS 上需要 OpenSSH ≥ 8.1（Debian 11、Ubuntu 20.04 起自带）和 curl 或 wget。
 
 <details>
@@ -339,7 +343,7 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
 
 ```sh
 ./install.sh server      # 服务端
-./install.sh agent       # 每台 VPS（用一行命令装的 agent：在服务端 install-cmd -node ID，把打印的命令再跑一次）
+./install.sh agent       # 每台 VPS；或者不拷贝发布包：在服务端 install-cmd -upgrade，把打印的命令在每台 VPS 上运行
 ./install.sh echo        # 装了隧道探测应答端的机器
 ```
 

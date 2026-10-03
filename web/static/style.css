@@ -69,6 +69,10 @@ h2 { font-size: 15px; margin: 0 0 10px; font-weight: 600; }
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .spacer { flex: 1; }
 .error { color: var(--bad); padding: 12px 0; }
+.error .reload {
+  font: inherit; color: var(--fg); background: var(--card); border: 1px solid var(--line);
+  border-radius: 6px; padding: 2px 10px; cursor: pointer;
+}
 .empty { color: var(--muted); padding: 24px 0; text-align: center; }
 
 .panel {

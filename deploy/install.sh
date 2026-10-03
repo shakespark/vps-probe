@@ -5,6 +5,9 @@
 #   ./install.sh server [--config FILE]     install or upgrade the server
 #   ./install.sh echo   [--config FILE]     install or upgrade the tunnel-probe
 #                                           responder (only where a tunnel ends)
+#   ./install.sh agent|server|echo --upgrade
+#                                           upgrade only: fail if it is not
+#                                           installed here yet
 #   ./install.sh uninstall agent|server|echo [--purge]
 #
 # Safe to run again: upgrades replace the binary and unit and restart the
@@ -23,7 +26,7 @@ warn() { printf 'warning: %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-	sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
 	exit 2
 }
 
@@ -165,14 +168,21 @@ start() {
 
 cmd_install() {
 	cfg=""
+	upgrade=no
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--config) [ $# -ge 2 ] || usage; cfg=$2; shift 2 ;;
+		--upgrade) upgrade=yes; shift ;;
 		*) usage ;;
 		esac
 	done
+	[ $upgrade = no ] || [ -z "$cfg" ] || die "--upgrade keeps the existing config; it cannot be combined with --config"
 	[ -z "$cfg" ] || cfg=$(cd "$(dirname "$cfg")" && pwd)/$(basename "$cfg")
 	preflight
+	# Without this an upgrade on the wrong machine would install the example
+	# config and leave a service that reports nowhere.
+	[ $upgrade = no ] || [ -f "$CONF" ] ||
+		die "nothing to upgrade: $CONF does not exist. Install it first (for an agent: vps-probe-server install-cmd -node ID)."
 	ensure_user
 	ensure_etc
 	install_binary

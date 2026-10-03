@@ -30,6 +30,10 @@ type Command struct {
 	Base        string // release base URL; DefaultBase if empty
 	Signers     string // allowed_signers content; the built-in keys if empty
 	AgentConfig string // the node's agent.yml
+	// Upgrade makes a command that replaces the programs and keeps the
+	// agent.yml already on the machine. It carries no config and no token,
+	// so one command serves every node.
+	Upgrade bool
 }
 
 var (
@@ -66,9 +70,12 @@ func signerLines(s string) (lines []string, principal string, err error) {
 // Line returns the command: one line of POSIX sh to run as root on the VPS.
 // It downloads the release for this machine's CPU, verifies its signature
 // and checksum, and runs the release's own install.sh with the embedded
-// agent.yml. Nothing unverified is executed. The line contains the node's
-// token; it starts with a space, which keeps it out of the shell history
-// where HISTCONTROL=ignorespace is set (root on Debian does not set it).
+// agent.yml (an upgrade command embeds none and runs install.sh --upgrade).
+// Nothing unverified is executed. Downloads are bounded, so a machine that
+// cannot reach the release host fails with a message instead of hanging.
+// The line contains the node's token; it starts with a space, which keeps
+// it out of the shell history where HISTCONTROL=ignorespace is set (root on
+// Debian does not set it).
 func (c Command) Line() (string, error) {
 	if !versionRE.MatchString(c.Version) {
 		return "", fmt.Errorf("version %q: want a release like 0.1.17 (pass -version)", c.Version)
@@ -88,10 +95,17 @@ func (c Command) Line() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if c.AgentConfig == "" {
+	if c.Upgrade && c.AgentConfig != "" {
+		return "", errors.New("an upgrade command keeps the installed config and cannot carry one")
+	}
+	if !c.Upgrade && c.AgentConfig == "" {
 		return "", errors.New("empty agent config")
 	}
 	b64 := base64.StdEncoding.EncodeToString
+	install := `echo ` + b64([]byte(c.AgentConfig)) + ` | base64 -d > agent.yml; ./$P/install.sh agent --config agent.yml`
+	if c.Upgrade {
+		install = `./$P/install.sh agent --upgrade`
+	}
 
 	// Inside single quotes: the script itself must not contain one. Data
 	// (keys, config) travels as base64, so its content cannot matter.
@@ -105,15 +119,16 @@ func (c Command) Line() (string, error) {
 		`D=$(mktemp -d)`,
 		`trap "cd /; rm -rf $D" EXIT`,
 		`cd "$D"`,
-		`get() { if command -v curl >/dev/null 2>&1; then curl -fsSL -o "$1" "$B/$1"; else wget -q -O "$1" "$B/$1"; fi; }`,
+		// Give up on a host that does not answer (20s) or a transfer that
+		// stalls (under 1 KB/s for 30s) rather than wait forever.
+		`get() { if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 20 --speed-limit 1024 --speed-time 30 --max-time 600 -o "$1" "$B/$1"; else wget -q -T 30 -t 2 -O "$1" "$B/$1"; fi || { echo "vps-probe: could not download $B/$1. If this machine cannot reach that host, use a mirror (-base URL) or copy the release here and run its install.sh." >&2; exit 1; }; }`,
 		`get $P.tar.gz; get $S; get $S.sig`,
 		`echo ` + b64([]byte(strings.Join(lines, "\n")+"\n")) + ` | base64 -d > signers`,
 		`ssh-keygen -Y verify -f signers -I ` + principal + ` -n ` + Namespace + ` -s $S.sig < $S`,
 		// The checksum line must exist: some sha256sum builds accept empty input.
 		`grep " $P.tar.gz\$" $S > sum; test -s sum; sha256sum -c sum`,
 		`tar xzf $P.tar.gz`,
-		`echo ` + b64([]byte(c.AgentConfig)) + ` | base64 -d > agent.yml`,
-		`./$P/install.sh agent --config agent.yml`,
+		install,
 	}, "; ")
 	if strings.Contains(script, "'") {
 		return "", errors.New("internal error: quote in the install script")
