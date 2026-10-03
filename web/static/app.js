@@ -27,9 +27,19 @@ const $foot = document.getElementById('foot');
 
 // The footer: how the server is doing. Its first answer also tells the
 // timezone the server counts days in.
+//
+// A page left open across a server upgrade would keep running the old
+// scripts against the new API. The footer sees the version change and loads
+// the page again, with the scripts that belong to the new server.
+let loadedVersion = null;
 async function refreshFooter() {
   try {
     const s = await api('/api/stats');
+    if (loadedVersion !== null && s.version !== loadedVersion) {
+      location.reload();
+      return;
+    }
+    loadedVersion = s.version;
     setTimezone(s.timezone);
     const dropped = Object.entries(s.ingest).filter(([k, v]) => v > 0 && !['accepted', 'duplicate'].includes(k));
     $foot.replaceChildren(
