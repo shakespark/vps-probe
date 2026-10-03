@@ -2,6 +2,8 @@
 
 自用 VPS 探针：资源监控、VPS 间 ICMP 时延、按周期统计的网卡流量（重启不丢）、Telegram 告警。
 
+**在线演示**：<https://vps-probe-demo.shakespark.workers.dev>（界面是真的，节点和数据都是虚构的，在浏览器里生成，没有后端）。
+
 设计与安全原则见 [docs/DESIGN.md](docs/DESIGN.md)。核心一条：**agent 只推不收，不接受服务端的任何指令**，服务端被攻破也无法控制 VPS。
 
 - agent：每台 VPS 一个，普通用户运行，不监听任何端口，通过加密 UDP 上报。
