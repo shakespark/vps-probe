@@ -64,6 +64,7 @@ func (a *API) Handler(ui http.Handler) http.Handler {
 		mux.Handle("GET /static/", ui)
 	}
 	mux.HandleFunc("GET /api/nodes", a.nodes)
+	mux.HandleFunc("GET /api/sparks", a.sparks)
 	mux.HandleFunc("GET /api/nodes/{id}/metrics", a.metrics)
 	mux.HandleFunc("GET /api/nodes/{id}/net", a.net)
 	mux.HandleFunc("GET /api/nodes/{id}/disks", a.disks)
@@ -128,6 +129,30 @@ func (a *API) nodes(w http.ResponseWriter, r *http.Request) {
 		out = append(out, v)
 	}
 	writeJSON(w, out)
+}
+
+// Sparklines on the overview: the last hour, a point a minute. The last
+// bucket contains now.
+const (
+	sparkStep = 60
+	sparkN    = 60
+)
+
+func (a *API) sparks(w http.ResponseWriter, r *http.Request) {
+	from := (a.now().Unix()/sparkStep+1)*sparkStep - sparkN*sparkStep
+	all, err := a.store.Sparks(r.Context(), from, sparkStep, sparkN)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	// Only nodes still in the config, like every other endpoint.
+	nodes := map[string]*store.Spark{}
+	for _, n := range a.cfg.Nodes {
+		if sp, ok := all[n.ID]; ok {
+			nodes[n.ID] = sp
+		}
+	}
+	writeJSON(w, map[string]any{"from": from, "step": sparkStep, "n": sparkN, "nodes": nodes})
 }
 
 func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
@@ -327,7 +352,7 @@ func (a *API) alertsView(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"active": a.alerts.Active(), "history": hist,
 		"truncated": len(hist) == maxAlertHistory,
 		"facets":    map[string]any{"nodes": nodes, "rules": rules},
-		"rules":     a.cfg.Alerts, "telegram": a.cfg.Telegram.Enabled()})
+		"rules":     a.cfg.Alerts, "channels": a.cfg.Channels()})
 }
 
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {

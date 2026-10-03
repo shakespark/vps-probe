@@ -2,11 +2,13 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -471,6 +473,45 @@ func TestNetSums(t *testing.T) {
 	}
 	if got, _ := s.NetSums(ctx, "zz", 0, now.Unix()+100); got != nil {
 		t.Fatalf("unknown node: %+v", got)
+	}
+}
+
+func TestSparks(t *testing.T) {
+	s := newStore(t)
+	from := time.Now().Truncate(time.Minute).Unix() - 600
+	// a: minute 0 has two samples on two interfaces, minute 2 one; b: only CPU.
+	rep := func(ts int64, cpu float32, rx0, rx1 uint64) *pb.Report {
+		return &pb.Report{Ts: ts, Cpu: &pb.CPU{Usage: cpu}, Net: []*pb.NetRate{
+			{Iface: "eth0", RxRate: rx0, TxRate: 1}, {Iface: "eth1", RxRate: rx1, TxRate: 2}}}
+	}
+	write(t, s, "a", rep(from, 10, 100, 10), time.Unix(from, 0))
+	write(t, s, "a", rep(from+50, 30, 300, 30), time.Unix(from+50, 0))
+	write(t, s, "a", rep(from+120, 50, 500, 50), time.Unix(from+120, 0))
+	write(t, s, "a", rep(from-10, 99, 9, 9), time.Unix(from-10, 0))   // before the range
+	write(t, s, "a", rep(from+180, 99, 9, 9), time.Unix(from+180, 0)) // after it
+	write(t, s, "b", &pb.Report{Ts: from + 70, Cpu: &pb.CPU{Usage: 7}}, time.Unix(from+70, 0))
+
+	got, err := s.Sparks(ctx, from, 60, 3)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("sparks: %v %v", got, err)
+	}
+	val := func(p []*float64) string {
+		var b strings.Builder
+		for _, v := range p {
+			if v == nil {
+				b.WriteString("- ")
+			} else {
+				fmt.Fprintf(&b, "%g ", *v)
+			}
+		}
+		return strings.TrimSpace(b.String())
+	}
+	a := got["a"]
+	if val(a.CPU) != "20 - 50" || val(a.RX) != "220 - 550" || val(a.TX) != "3 - 3" {
+		t.Fatalf("a: cpu [%s] rx [%s] tx [%s]", val(a.CPU), val(a.RX), val(a.TX))
+	}
+	if b := got["b"]; val(b.CPU) != "- 7 -" || val(b.RX) != "- - -" {
+		t.Fatalf("b: cpu [%s] rx [%s]", val(b.CPU), val(b.RX))
 	}
 }
 

@@ -1,13 +1,79 @@
 # vps-probe
 
-自用 VPS 探针：资源监控、VPS 间 ICMP 时延、按周期统计的网卡流量（重启不丢）、Telegram 告警。
+给自己的一小群 VPS 用的探针：资源监控、节点间时延矩阵、按计费周期统计的流量（重启不丢）、DDoS 识别、到期提醒，Telegram / webhook 告警。
+
+设计上只有一条硬规矩：**agent 只推不收，不接受服务端的任何指令。** 服务端被攻破，攻击者也没法在你的 VPS 上执行任何东西。
 
 **在线演示**：<https://vps-probe-demo.shakespark.workers.dev>（界面是真的，节点和数据都是虚构的，在浏览器里生成，没有后端）。
 
-设计与安全原则见 [docs/DESIGN.md](docs/DESIGN.md)。核心一条：**agent 只推不收，不接受服务端的任何指令**，服务端被攻破也无法控制 VPS。
+| 总览 | 节点详情 |
+|---|---|
+| ![总览](docs/img/overview.png) | ![节点详情](docs/img/node.png) |
+| **时延矩阵与链路可用性** | **告警** |
+| ![时延](docs/img/ping.png) | ![告警](docs/img/alerts.png) |
+
+## 功能
+
+- **资源**：CPU（含 steal、软中断）、负载、内存 / Swap、磁盘、各网卡网速和包速率、TCP / UDP 连接数；10 秒一个点，保留 48 小时原始数据、30 天 5 分钟聚合、400 天 1 小时聚合。
+- **流量**：按每台机器自己的计费周期（重置日、重置时刻）累计，agent 重启、VPS 重启、计数器归零都不丢；配额进度、每日用量、周期结算和每周汇总。
+- **时延**：节点两两互 ping 的矩阵、每条链路的历史曲线（按丢包着色）和 24 小时 / 7 天 / 30 天可用率；还能测经隧道（端口转发、VPN）的时延。
+- **告警**：离线、CPU / 内存 / 磁盘、链路丢包、流量配额档位、到期提醒、上报 IP 变化；**DDoS 识别**（入站远大于出站，附包速率和其他节点到它的丢包作为证据）和被利用对外攻击的识别。Telegram 和任意 webhook（Bark、ntfy、Discord、Server 酱……）。
+- **部署**：服务端一个程序加一个 SQLite 文件，迁移只要两个文件；agent 一个 5 MB 的静态程序，普通用户运行。一条命令加节点，一条命令在 VPS 上装好 agent。
+- 深色 / 浅色自适应，手机可用。只支持 Linux + systemd（amd64 / arm64）。在 KVM 的 VPS 上长期运行过；OpenVZ / LXC 容器有网卡识别的兜底，但还没有在真机上验证。
+
+## 安全模型
+
+写这个探针的起因，是别的探针出过"面板被攻破 → 所有被监控的机器被批量执行命令"的事故。所以这里把"面板能控制机器"这件事从设计上去掉了：
+
+| 如果这个被攻破 | 攻击者能做的 | 做不到的 |
+|---|---|---|
+| **服务端** | 看到、篡改监控数据；用你的通知渠道发消息 | 在任何 VPS 上执行命令、下发配置、推送更新：agent 没有接收这些东西的代码 |
+| **某一台 VPS** | 伪造这一台自己的监控数据（每台的 token 各不相同） | 冒充别的节点；借主机名之类的字符串在网页里执行脚本 |
+| **GitHub 账号或 CI** | 往仓库推代码、替换 Release 里的文件 | 发出能通过验证的发布包：签名密钥离线保存，CI 不持有；构建可复现，任何人都能核对 |
+| 没登录的访客 | 无 | 网页必须先登录（Cloudflare Access 或 Basic 认证），没有匿名可见的页面 |
+
+具体做法：
+
+- agent 以普通用户运行，**不监听任何端口**，只向服务端发加密的 UDP 报文；唯一收的是"已收到"的确认。
+- agent 不执行命令、不下载脚本、不自动更新、不从服务端拉配置；ping 谁也写在它自己的配置文件里。
+- 网页**只读**，只有 GET 接口；所有配置都在服务端的配置文件里，改配置要登录服务器。
+- 通知渠道只发不收，没有"给 bot 发消息来控制探针"这回事。
+- 服务端唯一对公网开放的是一个 UDP 端口，校验不过的包一律不回应，端口扫描看起来和关着一样。
+
+完整的设计和取舍见 [docs/DESIGN.md](docs/DESIGN.md)。
+
+## 和常见探针的区别
+
+以"带远程管理功能的探针"（哪吒这一类）的默认配置为参照：
+
+| | vps-probe | 带远程管理的探针 |
+|---|---|---|
+| 面板向 agent 下发命令 / 网页终端 / 计划任务 | 没有，设计上排除 | 有 |
+| agent 权限 | 普通用户，不监听端口 | 通常是 root |
+| agent 自动更新 | 没有，升级由你在 VPS 上执行 | 通常默认开启 |
+| 配置入口 | 配置文件和命令行 | 网页后台 |
+| 网页 | 只读，必须登录 | 可公开展示，可在网页上管理 |
+| 发布包 | 离线密钥签名，可复现构建 | 各项目不同 |
+
+相应地，**这些它不做**，需要的话请用别的探针：
+
+- 网页上加节点、改配置；网页终端、远程执行命令、文件管理。
+- 公开的状态页（给别人看的那种）。
+- Windows / macOS / 非 systemd 系统的 agent。
+- 对网站或端口的可用性监控（HTTP / TCP 探测）；它只测节点之间的时延。
+- 多用户和权限。
+
+## 快速开始
+
+1. **服务端**：下载发布包并验证签名（第 1 步），`./install.sh server` 安装，放行 UDP 9527（第 2 步）。
+2. **网页**：用 Cloudflare Tunnel + Access，或者 Caddy 加 Basic 认证（第 3 步）。
+3. **每台 VPS**：服务端上 `vps-probe-server add-node -id hk-1 ...`，重启服务端，把它打印的那一行命令粘贴到 VPS 上（第 4 步）。
+4. **告警**：填 Telegram 或 webhook，`vps-probe-server test-notify`（第 5 步）。
+
+组成：
 
 - agent：每台 VPS 一个，普通用户运行，不监听任何端口，通过加密 UDP 上报。
-- 服务端：一台公网 VPS，UDP 9527 收上报；网页只监听本机 8080，登录后才能访问：Cloudflare Tunnel + Access，或者 HTTPS 反向代理 + 内置的 Basic 认证。
+- 服务端：一台公网 VPS，UDP 9527 收上报；网页只监听本机 8080，登录后才能访问。
 - 全部数据在一个 SQLite 文件里；迁移只需 `server.yml` + `probe.db` 两个文件。
 
 下文命令都以 root 执行。
@@ -19,7 +85,7 @@
 从 [GitHub Releases](https://github.com/shakespark/vps-probe/releases) 下载，连同同一版本的 `.sha256` 和 `.sha256.sig`：
 
 ```sh
-V=0.1.15
+V=0.1.18
 B=https://github.com/shakespark/vps-probe/releases/download/v$V
 curl -fLO $B/vps-probe-$V-linux-amd64.tar.gz -fLO $B/vps-probe-$V.sha256 -fLO $B/vps-probe-$V.sha256.sig
 ```
@@ -214,7 +280,7 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
 无论哪种方式，生成的都只是一个本地配置文件：**agent 不会从服务端拉取任何东西**。
 
 - 如果系统的 `net.ipv4.ping_group_range` 不允许普通用户 ping，`install.sh` 会只给 agent 服务加 `CAP_NET_RAW`（`/etc/systemd/system/vps-probe-agent.service.d/icmp.conf`），不改系统设置。
-- 默认自动识别物理网卡（有 `/sys/class/net/<网卡>/device` 的）。识别不到时在 agent.yml 里写 `interfaces: [eth0]`。
+- 默认自动识别物理网卡（有 `/sys/class/net/<网卡>/device` 的）；OpenVZ、LXC 这类没有物理网卡的容器，改为统计默认路由所在的网卡（agent ≥ 0.1.18）。想自己指定就在 agent.yml 里写 `interfaces: [eth0]`。
 - 某些节点之间不想互 ping：在其中一方写 `no_ping: [对方 id, ...]`（双向生效），然后给涉及的节点重新生成 agent.yml 并安装。
 - 测经隧道的时延：在发起探测的节点下写 `extra_peers`，再重新生成它的 agent.yml。
   - VPN 型隧道：`{ name: cf-vpn, addr: 1.1.1.1 }`，到目标的路由要走隧道。
@@ -227,7 +293,7 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
 - 连接数（TCP / UDP / TIME_WAIT）和线程数需 agent ≥ 0.1.9，旧 agent 显示「—」。
 - 可选：在节点下写 `expire_at`（到期日）、`renew_months`（自动续费周期，月）、`price`（显示用），总览会显示剩余天数，默认的 `expiry` 规则在到期前 7 天和 1 天提醒（写法见 `examples/server.example.yml`）。只改服务端配置，重启服务端即可。
 
-## 5. 告警与 Telegram
+## 5. 告警与通知
 
 - 规则写在 `server.yml` 的 `alerts` 里（示例见 `examples/server.example.yml`，完整说明见 `docs/DESIGN.md` §7）。不写则用默认规则：离线 60s、CPU/内存 > 90% 持续 5 分钟、磁盘 > 90% 持续 10 分钟、链路丢包 > 20% 持续 3 分钟、流量配额 80/90/100%、到期前 7/1 天、DDoS（入站）和对外攻击（出站）、流量周期结算和每周流量汇总。已经写了 `alerts` 的，要到期提醒需自己加上 `expiry` 规则。
 - DDoS 识别（服务端 ≥ 0.1.10，不需要升级 agent）：`metric: net_in` / `net_out` 按最近 60s 平均网速（Mbps）告警，加 `ratio` 要求本方向至少是反方向的几倍。中转机正常流量收发对称，被打时入站远大于出站，被利用去打别人时出站远大于入站。默认规则 `ddos`（入站 ≥ 50 Mbps 且 ≥ 4 倍出站，持续 2 分钟）和 `abuse_out`（出站同理，5 分钟）；以下载为主或做种的节点用 `exclude: [节点 id]` 排除（除这些之外的全部节点，以后新加的节点自动包含）。被打后遭商家黑洞时，离线告警会附上停止上报前的入站峰值。已经写了 `alerts` 的要自己加这两条，写法见 `deploy/server.example.yml`。
@@ -237,11 +303,35 @@ rm ../hk-1.yml                               # 服务端上的 /root/hk-1.yml �
 - Telegram：在 @BotFather 用 `/newbot` 建一个**专用** bot，给它发一条消息，再打开 `https://api.telegram.org/bot<TOKEN>/getUpdates` 找 `"chat":{"id":` 后面的数字。填进 `telegram.bot_token` / `telegram.chat_id`，然后：
 
   ```sh
-  runuser -u vps-probe-server -- vps-probe-server test-telegram -config /etc/vps-probe/server.yml
+  runuser -u vps-probe-server -- vps-probe-server test-notify -config /etc/vps-probe/server.yml
   systemctl restart vps-probe-server
   ```
 
-- 未配置 Telegram 时告警照常评估，记录在网页「告警」页，消息内容写入 `journalctl -u vps-probe-server`。
+- Webhook（服务端 ≥ 0.1.18）：其他推送服务都用 `webhooks` 接，可以配多个，和 Telegram 同时发。每条告警对每个 webhook 发一个 HTTP 请求；`{{title}}` 是消息第一行，`{{message}}` 是全文。写在 `url` 里会自动做 URL 编码；写在 JSON `body` 里会自动变成带引号的 JSON 字符串，所以**模板里不要再给它加引号**。
+
+  ```yaml
+  webhooks:
+    - name: bark                       # 渠道名，出现在日志和告警页
+      url: "https://api.day.app/你的KEY/{{title}}/{{message}}"
+      method: GET
+    - name: ntfy
+      url: "https://ntfy.sh/你的主题"
+      headers: { Content-Type: text/plain }
+      body: "{{message}}"
+    - name: discord                    # Slack 同理，把 content 换成 text
+      url: "https://discord.com/api/webhooks/ID/TOKEN"
+      body: '{"content": {{message}}}'
+    - name: serverchan                 # Server 酱
+      url: "https://sctapi.ftqq.com/你的KEY.send"
+      headers: { Content-Type: application/x-www-form-urlencoded }
+      body: "title={{title}}&desp={{message}}"
+    - name: wecom                      # 企业微信群机器人
+      url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=你的KEY"
+      body: '{"msgtype": "text", "text": {"content": {{message}}}}'
+  ```
+
+  `method` 默认 POST；不写 `body` 时发 `{"title": ..., "message": ...}`；`Content-Type` 默认 `application/json`。返回 2xx 算成功，5xx 和网络错误会重试，其他 4xx 不重试（看 `journalctl -u vps-probe-server`，日志里只有渠道名，不会出现带密钥的 URL）。改完 `test-notify` 再重启服务端。
+- 一个渠道都没配时告警照常评估，记录在网页「告警」页，消息内容写入 `journalctl -u vps-probe-server`。
 
 ## 6. 升级
 
@@ -303,7 +393,7 @@ agent 停止前会把流量最后读一次并保存，升级不会丢月流量�
 | 网页 403 | 开了 `cf_access`：只能经 Cloudflare Access 访问；服务端日志 `cf_access: request rejected` 会写明原因 |
 | 网页 401 / 429 | 开了 `basic_auth`：401 是用户名或密码不对，429 是同一来源输错太多次，等一分钟；服务端日志 `basic_auth: wrong user name or password` 带来源地址 |
 | 时延矩阵里对不上 | agent 的 `ping.peers[].name` 要写对端的节点 id；用 `agent-config` 生成的配置自动满足 |
-| agent 起不来：`no physical network interface detected` | 在 agent.yml 写 `interfaces: [网卡名]` |
+| agent 起不来：`no physical network interface and no default route detected` | 在 agent.yml 写 `interfaces: [网卡名]` |
 | ping 全部丢包、日志 `ping disabled` | `install.sh` 会自动处理 ICMP 权限；手动安装时见第 4 步说明 |
 | 改了 `reset_day` / `reset_time` 后流量页显示的周期不对 | 旧起始日期的周期记录还在服务端。停服务端后删掉它：`DELETE FROM traffic_period WHERE node=(SELECT id FROM nodes WHERE name='节点id') AND start='旧日期'`，`traffic_daily` 同理，再启动 |
 
@@ -322,7 +412,7 @@ agent 停止前会把流量最后读一次并保存，升级不会丢月流量�
 - 目录结构和各模块说明见 `docs/DESIGN.md` §9。
 - 演示站（`docs/DESIGN.md` §14）：`make demo` 生成 `dist/demo/`，是同一份界面加上在浏览器里生成假数据的 `web/demo/demo.js`，没有后端，整个目录放到静态托管的站点根路径即可（如 Cloudflare Pages：`npx wrangler pages deploy dist/demo`）。改了接口的返回字段后，`go test ./internal/server/api -update-shape` 更新 `web/demo/api-shape.json`，再改 `demo.js` 直到 `make demo-check`（需要 node）通过。
 - 发布新版本（`docs/DESIGN.md` §13）：
-  1. 改 `VERSION` 并提交，`git push origin main`，再 `git tag v<版本> && git push origin v<版本>`（tag 单独推送，和提交一起推可能不触发 CI）；
+  1. 改 `VERSION` 和本文件第 1 步里的 `V=`（CI 会检查两者一致）并提交，`git push origin main`，再 `git tag v<版本> && git push origin v<版本>`（tag 单独推送，和提交一起推可能不触发 CI）；
   2. GitHub Actions 测试、构建，建一个草稿 Release（Actions 页面看进度）；
   3. 在自己的终端执行 `make release-sign`：核对草稿里的包与本地重建逐字节一致，签名，上传签名并正式发布。只核对不签名用 `make release-verify`。签名密钥默认 `~/.ssh/vps-probe-release`，可用 `SIGNING_KEY=` 指定。
 - 升级或增减 Go 依赖、更换 `web/static/vendor/` 里的前端库后执行 `make licenses`，提交更新后的 `THIRD_PARTY_LICENSES`（`make dist` 也会重新生成）。

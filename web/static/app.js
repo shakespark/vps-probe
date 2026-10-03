@@ -44,6 +44,34 @@ function bar(pct) {
   return h('div', { class: 'bar' + (p >= 90 ? ' bad' : p >= 80 ? ' warn' : '') }, fill);
 }
 
+// A sparkline: an SVG line per series over the same x range, each scaled to
+// max. A gap in the data breaks the line. series: [values, class] pairs.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function sparkline(series, max, title) {
+  const W = 120, H = 30;
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', 'spark');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  const tip = document.createElementNS(SVG_NS, 'title');
+  tip.textContent = title;
+  svg.append(tip);
+  for (const [vals, cls] of series) {
+    let d = '', pen = false;
+    vals.forEach((v, i) => {
+      if (v == null) { pen = false; return; }
+      const x = i * W / (vals.length - 1), y = H - 1.5 - Math.min(1, v / (max || 1)) * (H - 3);
+      d += (pen ? 'L' : 'M') + x.toFixed(1) + ' ' + y.toFixed(1);
+      pen = true;
+    });
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', d);
+    path.setAttribute('class', cls);
+    svg.append(path);
+  }
+  return svg;
+}
+
 // A <select> over [value, label] pairs. fill() only rebuilds the options when
 // they change, so the periodic refresh doesn't close an open menu.
 function picker(onPick) {
@@ -391,7 +419,8 @@ function overviewPage() {
         seg([['cards', '卡片'], ['table', '表格']], ovPrefs.view, v => setOvPref('view', v)), sortSel),
       tabs, h('div', { class: 'section' }, stats), h('div', { class: 'section' }, body)),
     async refresh() {
-      const all = await api('/api/nodes');
+      const cards = ovPrefs.view !== 'table';
+      const [all, sparks] = await Promise.all([api('/api/nodes'), cards ? api('/api/sparks') : null]);
       // Group tabs in the order groups first appear in the config.
       const groups = [...new Set(all.map(n => n.group || NO_GROUP))];
       let group = ovPrefs.group;
@@ -413,7 +442,7 @@ function overviewPage() {
         body.replaceChildren(nodeTable(nodes, newest));
       } else {
         body.className = 'cards';
-        body.replaceChildren(...nodes.map(n => nodeCard(n, newest)));
+        body.replaceChildren(...nodes.map(n => nodeCard(n, newest, sparks.nodes[n.id])));
       }
     },
   };
@@ -504,7 +533,20 @@ function rootDisk(disks) {
   return (disks || []).find(d => d.mount === '/') || (disks || [])[0];
 }
 
-function nodeCard(n, newest) {
+// The last hour on a card: CPU against 100%, and both directions of the
+// network against the hour's own peak.
+function cardSparks(sp) {
+  const peak = Math.max(1, ...sp.rx.map(v => v || 0), ...sp.tx.map(v => v || 0));
+  const top = Math.max(0, ...sp.cpu.map(v => v || 0));
+  const swatch = cls => h('i', { class: 'swatch ' + cls });
+  return h('div', { class: 'sparks' },
+    h('div', null, h('div', { class: 'spark-label', text: 'CPU · 近 1 小时' }),
+      sparkline([[sp.cpu, 's1']], 100, `近 1 小时 CPU，最高 ${fmtPct(top)}（纵轴 0–100%）`)),
+    h('div', null, h('div', { class: 'spark-label' }, '网速 ', swatch('s1'), '↓ ', swatch('s2'), '↑'),
+      sparkline([[sp.rx, 's1'], [sp.tx, 's2']], peak, `近 1 小时网速，峰值 ${fmtRate(peak)}`)));
+}
+
+function nodeCard(n, newest, sp) {
   const s = n.status;
   const ver = agentStale(n, newest);
   const head = h('div', { class: 'card-head' },
@@ -533,6 +575,7 @@ function nodeCard(n, newest) {
     ? [sys.os, sys.arch, sys.cores ? sys.cores + ' 核' : null, '运行 ' + fmtDur(nowSec() - sys.boot_time)]
       .filter(Boolean).join(' · ')
     : '—' }));
+  if (sp) card.append(cardSparks(sp));
 
   const metric = (label, pct, val) => h('div', { class: 'metric' },
     h('span', { class: 'label', text: label }), bar(pct), h('span', { class: 'val', text: val }));
@@ -1132,8 +1175,9 @@ function alertsPage() {
       const names = new Map(nodes.map(n => [n.id, n.name]));
       const nodeText = id => names.get(id) || id;
       const metricOf = new Map(d.rules.map(r => [r.name, r.metric]));
-      tg.textContent = d.telegram ? 'Telegram 已配置' : 'Telegram 未配置：告警只记录不发送';
-      tg.className = 'badge' + (d.telegram ? '' : ' warn');
+      tg.textContent = d.channels.length ? '通知：' + d.channels.map(c => c === 'telegram' ? 'Telegram' : c).join('、')
+        : '未配置通知渠道：告警只记录不发送';
+      tg.className = 'badge' + (d.channels.length ? '' : ' warn');
 
       active.replaceChildren(d.active.length
         ? table(['状态', '规则', '节点', '对象', '当前值', '开始于'], d.active.map(a => h('tr', null,

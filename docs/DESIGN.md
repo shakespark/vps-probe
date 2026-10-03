@@ -23,7 +23,7 @@
 4. **互测目标由 agent 本地配置**：不由服务端下发，防止服务端被利用去探测任意地址。
 5. **Web 必须先鉴权才能访问**：Web 默认只监听 `127.0.0.1`，前面必须有一层登录，三选一：Cloudflare Tunnel + Access（推荐，服务端再校验 Access 令牌，§6.1 cf_access）；内置 HTTP Basic 认证（§6.1 basic_auth，放在 HTTPS 反向代理之后）；或者由自带鉴权的反向代理负责。没有匿名可见的页面。服务端唯一直接面向公网的端口是 UDP ingest（agent 上报），**校验不通过的包一律静默丢弃、不做任何回应**，端口扫描器无法把它与被防火墙过滤的端口区分开（见 §6.2）。
 6. **Web 只读**：Web 没有任何写接口，所有配置通过服务端配置文件修改。
-7. **Telegram Bot 只发不收**：不设置 webhook、不调用 getUpdates，不存在通过 TG 下达指令的通道。
+7. **通知渠道只发不收**：Telegram Bot 不设置 webhook、不调用 getUpdates；webhook 通知（§7）只发请求、不使用响应内容。不存在通过通知渠道下达指令的通道。
 8. **每台 agent 独立 token**：token 派生出该节点的加密密钥（§5.3），一台的 token 泄露只影响该节点的数据。服务端需要用 token 解密，因此服务端配置文件中保存 token 明文，文件权限 0600。
 
 9. **隧道探测应答端与 agent 分离**：需要被探测的隧道终点另装 `vps-probe-echo`（§5.2），它是独立的程序和系统用户，只回应用共享密钥签名的请求，其他包静默丢弃；agent 本身仍不监听任何端口。
@@ -78,6 +78,7 @@
 ### 4.1 网卡选择
 
 - 默认自动识别：`/sys/class/net/<if>/device` 存在的网卡视为物理网卡（KVM 下 virtio 网卡也有 device 链接），排除 `lo`、`docker*`、`veth*`、`br-*`、`wg*`、`tun*`、`tailscale*` 等。
+- 一块物理网卡都识别不到时（OpenVZ 的 `venet0`、LXC 里由 veth 充当的 `eth0` 都没有 device 链接），退而统计默认路由所在的网卡：读 `/proc/net/route` 和 `/proc/net/ipv6_route` 里已启用的默认路由，`lo` 除外。仍然找不到才报错。有物理网卡的机器不看路由表，行为不变（agent ≥ 0.1.18）。
 - 可在配置中显式指定 `interfaces: [eth0]`，指定后以配置为准；不写或写空列表即自动识别。
 - 多块物理网卡时分别统计，并提供合计值。
 
@@ -310,9 +311,13 @@ nodes:
     price: "$10/年"            # 可选：只用于显示，最多 64 字符
     region: HK                 # 可选：地区代码，显示为卡片上的角标（字母、数字、-，最多 8 个，自动转大写）
     group: 亚洲                # 可选：总览按分组切换；页面上的默认顺序就是配置文件里的顺序
-telegram:                  # 可选；不配置则只记录不发送
+telegram:                  # 可选；telegram 和 webhooks 都不配置则只记录不发送
   bot_token: "<token>"
   chat_id: "<chat id>"
+webhooks:                  # 可选：更多通知渠道，见 §7
+  - name: bark
+    url: "https://api.day.app/<key>/{{title}}/{{message}}"
+    method: GET
 alerts: [...]              # 见 §7；不写则用默认规则
 offline_after: 30s         # 超过多久没有新报文算离线，约 agent interval 的 3 倍
 retention:
@@ -430,6 +435,7 @@ backup:
 | 路径 | 内容 |
 |---|---|
 | `GET /api/nodes` | 节点列表 + 最新状态（含来源 IP、连接数、线程数）+ 到期日（已按续费周期顺延）、剩余天数、价格、地区、分组 |
+| `GET /api/sparks` | 总览卡片上的迷你趋势线：每个节点最近 1 小时、每分钟一个点的 CPU 和全部网卡合计的收发速率，没有数据的分钟为 null |
 | `GET /api/nodes/{id}/metrics?from&to` | 自动按时间跨度选择 raw/1m/5m |
 | `GET /api/nodes/{id}/disks?from&to` | 磁盘用量 |
 | `GET /api/nodes/{id}/net?from&to` | 各网卡速率 |
@@ -438,7 +444,7 @@ backup:
 | `GET /api/ping/{src}/{dst}?from&to` | 单条链路的历史 |
 | `GET /api/traffic?periods=N` | 各节点最近 N 个周期的总量（默认 24，含各网卡明细） |
 | `GET /api/traffic/{id}/daily?period=...` | 某节点周期内每日流量 |
-| `GET /api/alerts?from&to&node&rule&event` | 当前告警、告警历史（默认最近 7 天，最多 500 条，可按节点 / 规则 / 事件筛选，`event` 逗号分隔）、该时间段内出现过的节点和规则（供筛选菜单）、生效的规则 |
+| `GET /api/alerts?from&to&node&rule&event` | 当前告警、告警历史（默认最近 7 天，最多 500 条，可按节点 / 规则 / 事件筛选，`event` 逗号分隔）、该时间段内出现过的节点和规则（供筛选菜单）、生效的规则、已配置的通知渠道名 |
 
 - 按时间跨度自动选表：≤ 6h 用 raw，≤ 7d 用 5m，更长用 1h；再在 SQL 里按 `ts / step` 分组，每条曲线最多约 1000 个点。
 - ping 矩阵的列是各 peer 的 `name`；与节点 id 不一致的 name 也会显示为单独一列。
@@ -535,12 +541,22 @@ Telegram：
 - 同一评估轮次的消息合并成一条，超过 4096 字符拆分；发送失败按指数退避重试，队列有上限。
 - 请求失败的错误信息里会带 URL（含 bot token），记录日志前脱敏。
 - 未配置 telegram 时，告警照常评估和记录，消息内容写入服务端日志。
-- `vps-probe-server test-telegram` 发送一条测试消息，用于检查配置。
 - 消息里的时间按配置的 `timezone` 显示。
+
+Webhook（服务端 ≥ 0.1.18）：让任何有 HTTP 接口的推送服务都能当通知渠道（Bark、ntfy、Discord、Slack、Server 酱、企业微信、自建服务……），不为每家各写一个客户端。
+
+- `webhooks` 是一个列表，每项：`name`（日志和告警页里显示的渠道名）、`url`、`method`（POST 默认 / GET / PUT）、`headers`、`body`。每条告警消息对每个 webhook 发一个请求，与 Telegram 并行，各有各的队列和重试。
+- 模板变量：`{{title}}` 是消息第一行，`{{message}}` 是全文。在 `url` 里做百分号编码（`/`、`?`、`&` 都会被编码，注入不了路径和参数）；在 `body` 里按 `Content-Type` 编码：JSON 时替换成带引号的 JSON 字符串字面量，表单时百分号编码，其他类型原样。所以 JSON 模板里变量**不要再加引号**：`{"content": {{message}}}`。
+- 不写 `body` 的 POST / PUT 发 `{"title": {{title}}, "message": {{message}}}`，`Content-Type` 默认 `application/json`。
+- 只发不收：2xx 算成功，429 和 5xx、网络错误按指数退避重试，其他 4xx 不重试并记日志；响应内容读完即弃，不解析、不执行。
+- URL 里通常带密钥：日志和错误信息只写渠道名和状态码，不写 URL。
+- 消息不拆分（各家长度限制不同；一轮评估合并的长消息可能被对方截断）。
+
+`vps-probe-server test-notify` 向 Telegram 和每个 webhook 各发一条测试消息并逐个报告结果（`test-telegram` 是它的旧名字，仍然可用）。
 
 ## 8. 前端页面
 
-1. **总览**：可切换卡片 / 表格（仿 ServerStatus 的一行一台，点行进入详情，窄屏横向滚动），可按名称、地区、CPU、内存、磁盘、网速、本周期流量、配额使用率、TCP 连接、到期排序（按实时数值排序时离线和从未上报的节点排最后），配置了 `group` 时按分组切换（顺序为分组在配置文件里首次出现的顺序，另有「未分组」），汇总条跟随所选分组。这三个选择存在浏览器 localStorage（只是本机偏好，存不了时用默认值）。卡片和表格都显示 `region` 角标，卡片多一行「连接」（TCP、UDP、线程）。顶部汇总条：在线数、在线节点实时网速之和、各节点本周期流量之和（各自按自己的周期起始日）、最近到期的节点。每个节点一张卡片，显示在线状态、CPU/内存/磁盘进度条、实时网速、本周期流量/配额进度、运行时长、到期日/剩余天数/价格（7 天内到期或已过期时标题旁加角标）。agent 版本低于其他节点中最新的 agent 版本时显示「agent 可升级」：与 agent 互相比较而不是与服务端比较，因为只改服务端的版本不需要升级 agent；`dev` 等无法解析的版本不比较。节点详情另显示上报来源 IP。
+1. **总览**：可切换卡片 / 表格（仿 ServerStatus 的一行一台，点行进入详情，窄屏横向滚动），可按名称、地区、CPU、内存、磁盘、网速、本周期流量、配额使用率、TCP 连接、到期排序（按实时数值排序时离线和从未上报的节点排最后），配置了 `group` 时按分组切换（顺序为分组在配置文件里首次出现的顺序，另有「未分组」），汇总条跟随所选分组。这三个选择存在浏览器 localStorage（只是本机偏好，存不了时用默认值）。卡片和表格都显示 `region` 角标，卡片多一行「连接」（TCP、UDP、线程）。卡片顶部有两条最近 1 小时的迷你趋势线：CPU（纵轴固定 0–100%，各节点之间可以直接比高低）和网速（收、发两条线，纵轴按这台自己这一小时的峰值，只看形状；峰值在悬停提示里）。趋势线是手写的 SVG 折线，不为每张卡片建一个 ECharts 实例；数据断档处折线断开。顶部汇总条：在线数、在线节点实时网速之和、各节点本周期流量之和（各自按自己的周期起始日）、最近到期的节点。每个节点一张卡片，显示在线状态、CPU/内存/磁盘进度条、实时网速、本周期流量/配额进度、运行时长、到期日/剩余天数/价格（7 天内到期或已过期时标题旁加角标）。agent 版本低于其他节点中最新的 agent 版本时显示「agent 可升级」：与 agent 互相比较而不是与服务端比较，因为只改服务端的版本不需要升级 agent；`dev` 等无法解析的版本不比较。节点详情另显示上报来源 IP。
 2. **节点详情**：时间范围可选 1h / 6h / 24h / 7d / 30d / 自定义；图表包括 CPU（含 steal、软中断）、负载、内存/Swap、磁盘、各网卡速率、各网卡包速率（agent < 0.1.14 时隐藏）、连接与线程（TCP / UDP / TIME_WAIT，线程用右轴；agent < 0.1.9 时隐藏），以及该节点到各 peer 的时延。鼠标停在任一张图上，其他图的竖线跟到同一时刻（按时间值对齐，不用 `echarts.connect`：它按数据下标同步，采样间隔不同的图——磁盘 60s 一点——或有断档的图会对错时刻），方便看 CPU 尖峰和时延尖峰是否同时发生；只有鼠标所在的图显示数值框，其他图只显示竖线，免得数值框挡住要对比的曲线。手机上点按同样生效。
 3. **时延**：
    - **网络质量**：统计窗口内丢包最多、抖动最大的 3 条链路，以及可用率条所选范围内可用率最低的 3 条（只算窗口内仍有数据的链路，被 `no_ping` 去掉的链路留下的旧数据不参与），点击进入链路历史。
@@ -567,7 +583,7 @@ Telegram：
 ```
 cmd/
   vps-probe-agent/      main.go（含 -dry-run）
-  vps-probe-server/     main.go（serve / check / backup / test-telegram / agent-config / add-node / install-cmd / gen-token / hash-password）
+  vps-probe-server/     main.go（serve / check / backup / test-notify / agent-config / add-node / install-cmd / gen-token / hash-password）
   vps-probe-echo/       main.go：隧道探测应答端（可选，只装在隧道终点）
 proto/probe/v1/         probe.proto
 internal/
@@ -588,7 +604,7 @@ internal/
     ingest/             UDP 接收、校验、去重、ACK
     api/                只读 HTTP API
     alert/              告警规则评估、状态机
-    notify/             Telegram 发送（只发不收）
+    notify/             Telegram、webhook 发送（只发不收）
     cfaccess/           Cloudflare Access JWT 校验
     basicauth/          HTTP Basic 认证、失败限速
 web/                    web.go（go:embed）+ static/（index.html、app.js、style.css、vendor/echarts 及其 LICENSE、NOTICE）
@@ -635,7 +651,6 @@ docs/
 ## 12. 暂不做
 
 - TCP 时延（后续可做 TCP connect 到对端已有端口）；经端口转发隧道的时延已由 DNS 探测和隧道回显覆盖
-- 容器型 VPS（OpenVZ/LXC 的 venet 网卡识别）
 - 多用户 / 权限体系（依赖 CF Access；`basic_auth` 只有一个账号）
 - 匿名可见的公开状态页（需要单独的监听端口和字段白名单；有需求再做）。演示用途由静态演示站承担（§14）
 - agent 自动更新（安全原则 2）

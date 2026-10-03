@@ -183,6 +183,49 @@ func TestCFAccess(t *testing.T) {
 	}
 }
 
+func TestWebhooks(t *testing.T) {
+	base := "nodes:\n  - {id: a, token: " + tokA + "}\n"
+	c, err := Parse([]byte(base + `webhooks:
+  - name: bark
+    url: "https://api.day.app/KEY/{{title}}/{{message}}"
+    method: get
+  - name: discord
+    url: https://discord.com/api/webhooks/1/abc
+    headers: {Content-Type: application/json}
+    body: '{"content": {{message}}}'
+telegram: {bot_token: "1:a", chat_id: 5}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(c.Channels(), ","); got != "telegram,bark,discord" {
+		t.Fatalf("channels = %s", got)
+	}
+	if c.Webhooks[0].Method != "GET" || c.Webhooks[1].Method != "POST" {
+		t.Fatalf("methods: %+v", c.Webhooks)
+	}
+	if c, _ := Parse([]byte(base)); len(c.Channels()) != 0 || c.Channels() == nil {
+		t.Fatalf("no channels: %#v", c.Channels())
+	}
+	for name, bad := range map[string]string{
+		"no name":        "webhooks: [{url: \"https://x.example/a\"}]",
+		"bad name":       "webhooks: [{name: \"a b\", url: \"https://x.example/a\"}]",
+		"duplicate name": "webhooks: [{name: a, url: \"https://x.example/a\"}, {name: a, url: \"https://x.example/b\"}]",
+		"named telegram": "webhooks: [{name: telegram, url: \"https://x.example/a\"}]",
+		"no url":         "webhooks: [{name: a}]",
+		"not http":       "webhooks: [{name: a, url: \"file:///etc/passwd\"}]",
+		"no host":        "webhooks: [{name: a, url: \"https:///x\"}]",
+		"bad method":     "webhooks: [{name: a, url: \"https://x.example/a\", method: DELETE}]",
+		"GET with body":  "webhooks: [{name: a, url: \"https://x.example/a\", method: GET, body: x}]",
+		"header newline": "webhooks: [{name: a, url: \"https://x.example/a\", headers: {X: \"a\\nb\"}}]",
+		"unknown key":    "webhooks: [{name: a, url: \"https://x.example/a\", exec: id}]",
+	} {
+		if _, err := Parse([]byte(base + bad + "\n")); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
 func TestServerAddr(t *testing.T) {
 	base := "nodes:\n  - {id: a, token: " + tokA + "}\n"
 	for _, ok := range []string{"probe.example.com:9527", "203.0.113.1:9527", "[2001:db8::1]:9527"} {

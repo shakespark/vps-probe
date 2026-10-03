@@ -49,7 +49,7 @@ func usage() {
   vps-probe-server [serve] [-config FILE] [-debug]   run the server
   vps-probe-server check [-config FILE]              validate the config and exit
   vps-probe-server backup [-config FILE] -o FILE     write a consistent copy of the database
-  vps-probe-server test-telegram [-config FILE]      send a test message with the configured bot
+  vps-probe-server test-notify [-config FILE]        send a test message to Telegram and every webhook
   vps-probe-server agent-config [-config FILE] -node ID -server HOST:PORT -o FILE
                                                      write agent.yml for a node (mode 0600)
   vps-probe-server add-node [-config FILE] -id ID [-name NAME] [-addr HOST] [-region R] [-group G]
@@ -77,8 +77,8 @@ func main() {
 		err = check(args)
 	case "backup":
 		err = backup(args)
-	case "test-telegram":
-		err = testTelegram(args)
+	case "test-notify", "test-telegram":
+		err = testNotify(args)
 	case "agent-config":
 		err = agentConfig(args)
 	case "add-node":
@@ -353,26 +353,41 @@ func check(args []string) error {
 	return nil
 }
 
-func testTelegram(args []string) error {
-	fs := flag.NewFlagSet("test-telegram", flag.ExitOnError)
+// testNotify sends one message to every configured channel and reports
+// each result; a failure here is not retried.
+func testNotify(args []string) error {
+	fs := flag.NewFlagSet("test-notify", flag.ExitOnError)
 	path := configFlag(fs)
 	fs.Parse(args)
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
-	if !cfg.Telegram.Enabled() {
-		return errors.New("telegram is not configured (set telegram.bot_token and telegram.chat_id)")
+	if len(cfg.Channels()) == 0 {
+		return errors.New("no channel is configured (set telegram.bot_token and telegram.chat_id, or add a webhook)")
 	}
-	tg := notify.NewTelegram(cfg.Telegram.BotToken, cfg.Telegram.ChatID, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	msg := fmt.Sprintf("✅ vps-probe 测试消息\n%d 个节点，%d 条告警规则\n%s", len(cfg.Nodes), len(cfg.Alerts),
 		time.Now().In(cfg.Location).Format("2006-01-02 15:04:05"))
-	if err := tg.Send(ctx, msg); err != nil {
-		return err
+	failed := 0
+	report := func(name string, err error) {
+		if err != nil {
+			failed++
+			fmt.Printf("%s: FAILED: %v\n", name, err)
+		} else {
+			fmt.Printf("%s: sent\n", name)
+		}
 	}
-	fmt.Println("sent")
+	if cfg.Telegram.Enabled() {
+		report("telegram", notify.NewTelegram(cfg.Telegram.BotToken, cfg.Telegram.ChatID, slog.Default()).Send(ctx, msg))
+	}
+	for _, w := range cfg.Webhooks {
+		report(w.Name, notify.NewWebhook(w.Name, w.Method, w.URL, w.Headers, w.Body, slog.Default()).Send(ctx, msg))
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d channel(s) failed", failed)
+	}
 	return nil
 }
 
@@ -493,13 +508,22 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("ingest: %w", err)
 	}
-	var notifier notify.Notifier = notify.Log{Log: log}
-	var tg *notify.Telegram
+	// Channels: Telegram and any webhooks; with none, alerts are only
+	// recorded and logged. Each has its own queue and sender goroutine.
+	var channels notify.Multi
+	var senders []func(context.Context)
 	if cfg.Telegram.Enabled() {
-		tg = notify.NewTelegram(cfg.Telegram.BotToken, cfg.Telegram.ChatID, log)
-		notifier = tg
-	} else {
-		log.Warn("telegram not configured: alerts are recorded and logged but not sent")
+		tg := notify.NewTelegram(cfg.Telegram.BotToken, cfg.Telegram.ChatID, log)
+		channels, senders = append(channels, tg), append(senders, tg.Run)
+	}
+	for _, w := range cfg.Webhooks {
+		wh := notify.NewWebhook(w.Name, w.Method, w.URL, w.Headers, w.Body, log)
+		channels, senders = append(channels, wh), append(senders, wh.Run)
+	}
+	var notifier notify.Notifier = channels
+	if len(channels) == 0 {
+		notifier = notify.Log{Log: log}
+		log.Warn("no telegram or webhook configured: alerts are recorded and logged but not sent")
 	}
 	ev := alert.New(cfg, st, notifier, log)
 	if err := ev.Load(); err != nil {
@@ -548,8 +572,8 @@ func serve(args []string) error {
 	var wg sync.WaitGroup
 	wg.Add(4)
 	go func() { defer wg.Done(); ev.Run(ctx) }()
-	if tg != nil {
-		go tg.Run(ctx) // not waited for: an in-flight HTTP request must not delay shutdown
+	for _, run := range senders {
+		go run(ctx) // not waited for: an in-flight HTTP request must not delay shutdown
 	}
 	if access != nil {
 		go access.Run(ctx)
@@ -564,7 +588,7 @@ func serve(args []string) error {
 		}
 	}()
 	log.Info("server started", "version", version, "ingest", in.Addr(), "web", ln.Addr(),
-		"nodes", len(cfg.Nodes), "db", cfg.DB, "alert_rules", len(cfg.Alerts), "telegram", cfg.Telegram.Enabled(), "cf_access", cfg.CFAccess.Enabled(), "basic_auth", cfg.BasicAuth.Enabled())
+		"nodes", len(cfg.Nodes), "db", cfg.DB, "alert_rules", len(cfg.Alerts), "notify", strings.Join(cfg.Channels(), ","), "cf_access", cfg.CFAccess.Enabled(), "basic_auth", cfg.BasicAuth.Enabled())
 
 	<-ctx.Done()
 	log.Info("shutting down")

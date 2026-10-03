@@ -32,6 +32,11 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match VERSION $(cat VERSION)" >&2
             exit 1
           fi
+          # The download example in the README names the release.
+          if ! grep -qx "V=$(cat VERSION)" README.md; then
+            echo "README.md still tells people to download another version" >&2
+            exit 1
+          fi
 
       - run: make test
 

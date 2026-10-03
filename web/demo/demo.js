@@ -195,6 +195,25 @@
     });
   }
 
+  // The overview's sparklines: the last hour in minutes; the last bucket
+  // contains now.
+  function sparks() {
+    const step = 60, n = 60, from = (Math.floor(now() / step) + 1) * step - n * step;
+    const nodes = {};
+    for (const node of NODES) {
+      const sp = { cpu: [], rx: [], tx: [] };
+      for (let t = from; t < from + n * step; t += step) {
+        const has = t >= since(node) && t <= lastTick(node);
+        const s = has ? samples(t, Math.min(step, lastTick(node) + 10 - t), 10).map(x => inst(node, x)) : null;
+        sp.cpu.push(s ? r3(mean(s.map(v => v.cpu))) : null);
+        sp.rx.push(s ? Math.round(mean(s.map(v => v.rx))) : null);
+        sp.tx.push(s ? Math.round(mean(s.map(v => v.tx))) : null);
+      }
+      nodes[node.id] = sp;
+    }
+    return { from, step, n, nodes };
+  }
+
   const iface = n => n.cores > 2 ? 'ens3' : 'eth0';
 
   function net(n, from, to) {
@@ -552,7 +571,7 @@
       ],
       history: history.slice(0, 500), truncated: history.length > 500,
       facets: { nodes: uniq(e => e.node), rules: uniq(e => e.rule) },
-      rules: RULES, telegram: true,
+      rules: RULES, channels: ['telegram', 'bark'],
     };
   }
 
@@ -602,6 +621,7 @@
         }
         if (node && seg[3] === 'daily') return [200, daily(node, q.get('period'))];
         break;
+      case 'sparks': return [200, sparks()];
       case 'stats': return [200, stats()];
       case 'alerts': return [200, alerts(q)];
     }

@@ -71,6 +71,7 @@ func TestReadOnlyRoutes(t *testing.T) {
 	}
 	for path, want := range map[string]int{
 		"/api/nodes":                                         200,
+		"/api/sparks":                                        200,
 		"/api/nodes/hk-1/metrics":                            200,
 		"/api/nodes/nope/metrics":                            404,
 		"/api/nodes/hk-1/metrics?from=x":                     400,

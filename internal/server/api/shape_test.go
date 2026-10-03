@@ -41,6 +41,7 @@ var shapeEndpoints = []struct {
 	Shape   any      `json:"shape"`
 }{
 	{Name: "nodes", Path: "/api/nodes"},
+	{Name: "sparks", Path: "/api/sparks", Dynamic: []string{"nodes"}},
 	{Name: "metrics", Path: "/api/nodes/hk-1/metrics"},
 	{Name: "net", Path: "/api/nodes/hk-1/net", Dynamic: []string{""}},
 	{Name: "disks", Path: "/api/nodes/hk-1/disks", Dynamic: []string{""}},
@@ -171,6 +172,8 @@ nodes:
   - {id: hk-1, name: 香港, token: abcdefghijklmnopqrstuvwxyz0123456789, traffic_quota_gb: 1000,
      expire_at: 2099-01-01, renew_months: 12, price: "$10/年", region: hk, group: 亚洲, addr: 192.0.2.1}
   - {id: tyo-1, token: bcdefghijklmnopqrstuvwxyz0123456789a, addr: 192.0.2.2}
+webhooks:
+  - {name: hook, url: "https://example.com/hook"}
 alerts:
   - {name: cpu_high, metric: cpu, op: ">", threshold: 90, for: 5m, nodes: [hk-1]}
   - {name: quota, metric: traffic, levels: [80, 100]}

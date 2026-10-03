@@ -11,6 +11,7 @@
   --bar: #e8ebf0;
   --lat0: #d1fae5; --lat1: #ecfccb; --lat2: #fef3c7; --lat3: #fed7aa; --lat4: #fecaca;
   --a-up: #22c55e; --a-lossy: #eab308; --a-part: #f97316; --a-down: #dc2626;
+  --s1: #5470c6; --s2: #91cc75; /* the first two series colors of the charts */
   --shadow: 0 1px 2px rgba(0,0,0,.06);
   color-scheme: light;
 }
@@ -88,6 +89,15 @@ h2 { font-size: 15px; margin: 0 0 10px; font-weight: 600; }
 .dot.on { background: var(--ok); }
 .dot.off { background: var(--bad); }
 
+.sparks { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 0 0 10px; }
+.spark-label { font-size: 11px; color: var(--muted); margin-bottom: 2px; white-space: nowrap; }
+svg.spark { display: block; width: 100%; height: 30px; border-bottom: 1px solid var(--line); }
+svg.spark path { fill: none; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+svg.spark .s1 { stroke: var(--s1); }
+svg.spark .s2 { stroke: var(--s2); }
+.swatch { display: inline-block; width: 9px; height: 2px; vertical-align: middle; margin-right: 2px; border-radius: 1px; }
+.swatch.s1 { background: var(--s1); }
+.swatch.s2 { background: var(--s2); }
 .metric { display: grid; grid-template-columns: 44px minmax(40px, 1fr) 136px; align-items: center; gap: 8px; margin: 5px 0; font-size: 13px; }
 .metric .label { color: var(--muted); }
 .metric .val { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }

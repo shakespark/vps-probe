@@ -1,6 +1,6 @@
 // Package notify delivers alert messages. The Telegram client only ever
 // calls sendMessage: it never reads updates, so the bot cannot be used to
-// send anything to the server.
+// send anything to the server. Webhooks likewise only send.
 package notify
 
 import (
@@ -22,11 +22,11 @@ type Notifier interface {
 	Notify(text string)
 }
 
-// Log writes messages to the log; used when Telegram isn't configured.
+// Log writes messages to the log; used when no channel is configured.
 type Log struct{ Log *slog.Logger }
 
 func (l Log) Notify(text string) {
-	l.Log.Info("alert (telegram not configured, not sent)", "message", text)
+	l.Log.Info("alert (no telegram or webhook configured, not sent)", "message", text)
 }
 
 const (
@@ -84,15 +84,21 @@ func (t *Telegram) Run(ctx context.Context) {
 }
 
 func (t *Telegram) deliver(ctx context.Context, msg string) {
+	deliver(ctx, t.log, "telegram", t.Send, msg)
+}
+
+// deliver sends one message over a channel, retrying with exponential
+// backoff until it is sent or rejected outright.
+func deliver(ctx context.Context, log *slog.Logger, channel string, send func(context.Context, string) error, msg string) {
 	backoff := minBackoff
 	for {
-		err := t.Send(ctx, msg)
+		err := send(ctx, msg)
 		if err == nil {
 			return
 		}
 		var perm *permanentError
 		if errors.As(err, &perm) {
-			t.log.Error("telegram: message rejected, not retrying (check bot_token / chat_id)", "err", err)
+			log.Error(channel+": message rejected, not retrying (check its settings in the config)", "err", err)
 			return
 		}
 		wait := backoff
@@ -100,7 +106,7 @@ func (t *Telegram) deliver(ctx context.Context, msg string) {
 		if errors.As(err, &rl) {
 			wait = rl.after
 		}
-		t.log.Warn("telegram: send failed, retrying", "err", err, "in", wait)
+		log.Warn(channel+": send failed, retrying", "err", err, "in", wait)
 		select {
 		case <-ctx.Done():
 			return

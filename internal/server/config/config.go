@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -38,6 +39,7 @@ type Config struct {
 	// Keep it at about 3x the agents' interval.
 	OfflineAfter Duration  `yaml:"offline_after"`
 	Telegram     Telegram  `yaml:"telegram"`
+	Webhooks     []Webhook `yaml:"webhooks"`
 	CFAccess     CFAccess  `yaml:"cf_access"`
 	BasicAuth    BasicAuth `yaml:"basic_auth"`
 	// nil (key absent) means DefaultRules; an empty list disables alerts.
@@ -131,6 +133,29 @@ type Telegram struct {
 }
 
 func (t Telegram) Enabled() bool { return t.BotToken != "" }
+
+// Webhook is one more channel for alert messages: an HTTP request built
+// from a template (see notify.Webhook). Send-only, like Telegram.
+type Webhook struct {
+	Name    string            `yaml:"name"`
+	URL     string            `yaml:"url"`
+	Method  string            `yaml:"method"` // POST (default), GET or PUT
+	Headers map[string]string `yaml:"headers"`
+	Body    string            `yaml:"body"` // default: {"title": {{title}}, "message": {{message}}}
+}
+
+// Channels names where alerts are sent, for display: "telegram" and the
+// webhooks' names. Empty means alerts are only recorded.
+func (c *Config) Channels() []string {
+	out := []string{}
+	if c.Telegram.Enabled() {
+		out = append(out, "telegram")
+	}
+	for _, w := range c.Webhooks {
+		out = append(out, w.Name)
+	}
+	return out
+}
 
 // Rule is one alert rule; see DESIGN.md §7.
 type Rule struct {
@@ -518,6 +543,37 @@ func (c *Config) validate() error {
 	}
 	if (c.Telegram.BotToken == "") != (c.Telegram.ChatID == "") {
 		bad("telegram: set both bot_token and chat_id, or neither")
+	}
+	hooks := map[string]bool{"telegram": true}
+	for i := range c.Webhooks {
+		w := &c.Webhooks[i]
+		where := fmt.Sprintf("webhooks[%d]", i)
+		if !wire.ValidNode(w.Name) {
+			bad("%s.name %q: want letters, digits, '.', '_', '-' (it names the channel in logs and on the alerts page)", where, w.Name)
+		} else if hooks[w.Name] {
+			bad("%s.name %q: used twice (\"telegram\" is taken too)", where, w.Name)
+		}
+		hooks[w.Name] = true
+		w.Method = strings.ToUpper(w.Method)
+		if w.Method == "" {
+			w.Method = "POST"
+		}
+		if !slices.Contains([]string{"GET", "POST", "PUT"}, w.Method) {
+			bad("%s.method %q: want GET, POST or PUT", where, w.Method)
+		}
+		if w.Method == "GET" && w.Body != "" {
+			bad("%s: a GET request has no body; put {{title}} / {{message}} in the url", where)
+		}
+		// The placeholders stand for encoded text, which cannot break a URL.
+		u, err := url.Parse(strings.NewReplacer("{{title}}", "t", "{{message}}", "m").Replace(w.URL))
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			bad("%s.url: want an http(s) URL", where)
+		}
+		for k, v := range w.Headers {
+			if k == "" || strings.ContainsAny(k, " :\r\n") || strings.ContainsAny(v, "\r\n") {
+				bad("%s.headers: bad header %q", where, k)
+			}
+		}
 	}
 	if a := c.CFAccess; a.TeamDomain != "" || a.AUD != "" {
 		team, ok := strings.CutSuffix(a.TeamDomain, ".cloudflareaccess.com")

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -176,10 +177,74 @@ func TestFixtureReads(t *testing.T) {
 }
 
 func TestDetectInterfacesNone(t *testing.T) {
-	fs := FS{Sys: t.TempDir()}
+	fs := FS{Sys: t.TempDir(), Proc: t.TempDir()}
 	os.MkdirAll(filepath.Join(fs.Sys, "class", "net", "lo"), 0o755)
 	if _, err := fs.DetectInterfaces(); err == nil {
 		t.Fatal("expected error with no physical NIC")
+	}
+}
+
+// Containers have no device behind their NIC: the default route's interface
+// is counted instead.
+func TestDetectInterfacesContainer(t *testing.T) {
+	const hdr = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+	for name, c := range map[string]struct {
+		route, route6 string
+		want          string
+	}{
+		"OpenVZ venet0": {
+			route: hdr + "venet0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\n",
+			want:  "venet0",
+		},
+		"LXC eth0, with a LAN route": {
+			route: hdr + "eth0\t0000A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n" +
+				"eth0\t00000000\t0100A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n",
+			want: "eth0",
+		},
+		"IPv6 only": {
+			route: hdr,
+			route6: "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003     eth1\n" +
+				"00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n" +
+				"fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth2\n",
+			want: "eth1",
+		},
+		"both families, two interfaces": {
+			route:  hdr + "venet0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\n",
+			route6: "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 00000400 00000001 00000000 00000001     eth0\n",
+			want:   "eth0,venet0",
+		},
+		"default route that is down": {
+			route: hdr + "eth0\t00000000\t0100A8C0\t0002\t0\t0\t0\t00000000\t0\t0\t0\n",
+			want:  "",
+		},
+		"no default route": {route: hdr, want: ""},
+	} {
+		fs := FS{Sys: t.TempDir(), Proc: t.TempDir()}
+		for _, n := range []string{"lo", "venet0", "eth0", "eth1"} { // none has a device link
+			os.MkdirAll(filepath.Join(fs.Sys, "class", "net", n), 0o755)
+		}
+		os.MkdirAll(filepath.Join(fs.Proc, "net"), 0o755)
+		os.WriteFile(filepath.Join(fs.Proc, "net", "route"), []byte(c.route), 0o644)
+		if c.route6 != "" {
+			os.WriteFile(filepath.Join(fs.Proc, "net", "ipv6_route"), []byte(c.route6), 0o644)
+		}
+		got, err := fs.DetectInterfaces()
+		if strings.Join(got, ",") != c.want || (err == nil) != (c.want != "") {
+			t.Errorf("%s: got %v, %v; want %q", name, got, err, c.want)
+		}
+	}
+}
+
+// A machine with a real NIC never consults the routes.
+func TestDetectInterfacesPrefersPhysical(t *testing.T) {
+	fs := FS{Sys: t.TempDir(), Proc: t.TempDir()}
+	os.MkdirAll(filepath.Join(fs.Sys, "class", "net", "ens3", "device"), 0o755)
+	os.MkdirAll(filepath.Join(fs.Sys, "class", "net", "tun0"), 0o755)
+	os.MkdirAll(filepath.Join(fs.Proc, "net"), 0o755)
+	os.WriteFile(filepath.Join(fs.Proc, "net", "route"), []byte("tun0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\n"), 0o644)
+	got, err := fs.DetectInterfaces()
+	if err != nil || strings.Join(got, ",") != "ens3" {
+		t.Fatalf("got %v, %v", got, err)
 	}
 }
 

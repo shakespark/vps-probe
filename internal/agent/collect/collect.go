@@ -329,6 +329,43 @@ func parseNetDev(data []byte) (map[string]NetCounter, error) {
 	return out, sc.Err()
 }
 
+// defaultRouteInterfaces lists the interfaces carrying an IPv4 or IPv6
+// default route, from /proc/net/route and /proc/net/ipv6_route.
+func (f FS) defaultRouteInterfaces() []string {
+	var out []string
+	add := func(name string) {
+		if name != "" && name != "lo" && !slices.Contains(out, name) {
+			out = append(out, name)
+		}
+	}
+	// Iface Destination Gateway Flags RefCnt Use Metric Mask ...; hex, and
+	// flag 0x1 is RTF_UP.
+	if b, err := os.ReadFile(filepath.Join(f.Proc, "net", "route")); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			p := strings.Fields(line)
+			if len(p) < 8 || p[1] != "00000000" || p[7] != "00000000" {
+				continue
+			}
+			if flags, err := strconv.ParseUint(p[3], 16, 32); err == nil && flags&1 != 0 {
+				add(p[0])
+			}
+		}
+	}
+	// dest prefixlen src srclen nexthop metric refcnt use flags iface
+	if b, err := os.ReadFile(filepath.Join(f.Proc, "net", "ipv6_route")); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			p := strings.Fields(line)
+			if len(p) < 10 || p[1] != "00" || strings.Trim(p[0], "0") != "" {
+				continue
+			}
+			if flags, err := strconv.ParseUint(p[8], 16, 32); err == nil && flags&1 != 0 {
+				add(p[9])
+			}
+		}
+	}
+	return out
+}
+
 var virtualPrefixes = []string{
 	"lo", "docker", "veth", "br-", "virbr", "vnet", "wg", "tun", "tap",
 	"tailscale", "zt", "cni", "flannel", "cali", "kube", "dummy", "ifb", "bond", "team",
@@ -336,6 +373,7 @@ var virtualPrefixes = []string{
 
 // DetectInterfaces returns physical NICs: entries in /sys/class/net with a
 // "device" link (virtio NICs have one too), minus well-known virtual names.
+// Without any, it falls back to the interfaces of the default route.
 func (f FS) DetectInterfaces() ([]string, error) {
 	dir := filepath.Join(f.Sys, "class", "net")
 	entries, err := os.ReadDir(dir)
@@ -353,9 +391,14 @@ func (f FS) DetectInterfaces() ([]string, error) {
 		}
 		out = append(out, name)
 	}
+	if len(out) == 0 {
+		// Containers (OpenVZ's venet0, LXC's veth-backed eth0) have no
+		// device behind their NIC: count the one the default route uses.
+		out = f.defaultRouteInterfaces()
+	}
 	slices.Sort(out)
 	if len(out) == 0 {
-		return nil, errors.New("collect: no physical network interface detected; set interfaces in config")
+		return nil, errors.New("collect: no physical network interface and no default route detected; set interfaces in config")
 	}
 	return out, nil
 }

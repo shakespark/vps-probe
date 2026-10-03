@@ -529,6 +529,66 @@ func (s *Store) NetSums(ctx context.Context, node string, from, to int64) ([]Net
 	return out, err
 }
 
+// Spark is a node's recent history in equal buckets, for the overview's
+// sparklines: CPU percent and the rates of all its interfaces together
+// (bytes/s). A bucket without data is null.
+type Spark struct {
+	CPU []*float64 `json:"cpu"`
+	RX  []*float64 `json:"rx"`
+	TX  []*float64 `json:"tx"`
+}
+
+// Sparks returns n buckets of step seconds starting at from for every node
+// that reported in that time, from the raw tables (so the range must be
+// inside the raw retention).
+func (s *Store) Sparks(ctx context.Context, from, step int64, n int) (map[string]*Spark, error) {
+	out := map[string]*Spark{}
+	at := func(rid, bucket int64) (*Spark, int) {
+		name, ok := s.nodeName(rid)
+		i := int(bucket - from/step)
+		if !ok || i < 0 || i >= n {
+			return nil, 0
+		}
+		sp := out[name]
+		if sp == nil {
+			sp = &Spark{CPU: make([]*float64, n), RX: make([]*float64, n), TX: make([]*float64, n)}
+			out[name] = sp
+		}
+		return sp, i
+	}
+	to := from + step*int64(n)
+	err := s.each(ctx, `SELECT node, ts / ?, avg(cpu) FROM metrics_raw WHERE ts >= ? AND ts < ? GROUP BY node, ts / ?`,
+		[]any{step, from, to, step}, func(r *sql.Rows) error {
+			var rid, b int64
+			var cpu sql.NullFloat64
+			if err := r.Scan(&rid, &b, &cpu); err != nil {
+				return err
+			}
+			if sp, i := at(rid, b); sp != nil && cpu.Valid {
+				sp.CPU[i] = &cpu.Float64
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	// Interfaces are summed per sample first, then samples averaged.
+	err = s.each(ctx, `SELECT node, ts / ?, avg(rx), avg(tx) FROM
+		(SELECT node, ts, sum(rx) AS rx, sum(tx) AS tx FROM net_raw WHERE ts >= ? AND ts < ? GROUP BY node, ts)
+		GROUP BY node, ts / ?`, []any{step, from, to, step}, func(r *sql.Rows) error {
+		var rid, b int64
+		var rx, tx float64
+		if err := r.Scan(&rid, &b, &rx, &tx); err != nil {
+			return err
+		}
+		if sp, i := at(rid, b); sp != nil {
+			sp.RX[i], sp.TX[i] = &rx, &tx
+		}
+		return nil
+	})
+	return out, err
+}
+
 func (s *Store) each(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error {
 	rows, err := s.r.QueryContext(ctx, q, args...)
 	if err != nil {

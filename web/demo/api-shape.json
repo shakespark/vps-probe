@@ -93,6 +93,35 @@
   }
  },
  {
+  "name": "sparks",
+  "path": "/api/sparks",
+  "dynamic": [
+   "nodes"
+  ],
+  "shape": {
+   "{}": {
+    "from": "number",
+    "n": "number",
+    "nodes": {
+     "{*}": {
+      "{}": {
+       "cpu": {
+        "[]": "number"
+       },
+       "rx": {
+        "[]": "number"
+       },
+       "tx": {
+        "[]": "number"
+       }
+      }
+     }
+    },
+    "step": "number"
+   }
+  }
+ },
+ {
   "name": "metrics",
   "path": "/api/nodes/hk-1/metrics",
   "shape": {
@@ -458,6 +487,9 @@
       }
      }
     },
+    "channels": {
+     "[]": "string"
+    },
     "facets": {
      "{}": {
       "nodes": {
@@ -503,7 +535,6 @@
       }
      }
     },
-    "telegram": "bool",
     "truncated": "bool"
    }
   }

@@ -52,12 +52,28 @@ nodes:
 # 离线告警由下面的 offline 规则决定（默认 60s），所以页面先变红、稍后才发告警，这是正常的。
 offline_after: 30s
 
-# 可选。不配置时告警照常评估并记录在页面上，只是不发送。
-# 配置后用 `vps-probe-server test-telegram` 发一条测试消息检查。
+# 可选。telegram 和 webhooks 都不配置时，告警照常评估并记录在页面上，只是不发送。
+# 配置后用 `vps-probe-server test-notify` 发一条测试消息检查。
 # bot 只用来发消息，服务端不接收任何 Telegram 消息。
 # telegram:
 #   bot_token: "123456789:AA..."
 #   chat_id: 123456789          # 个人 chat id 或群组 id（负数），不用加引号
+
+# 可选：更多通知渠道。每条告警消息对每个 webhook 发一个 HTTP 请求，和 Telegram 并行。
+# {{title}} 是消息第一行，{{message}} 是全文：在 url 里自动做 URL 编码；在 JSON body 里
+# 自动变成带引号的 JSON 字符串（所以模板里不要再加引号）。只发不收，响应内容不使用。
+# 配好后用 `vps-probe-server test-notify` 检查。更多写法见 README 第 5 步。
+# webhooks:
+#   - name: bark                    # 渠道名：出现在日志和告警页
+#     url: "https://api.day.app/你的KEY/{{title}}/{{message}}"
+#     method: GET
+#   - name: discord
+#     url: "https://discord.com/api/webhooks/ID/TOKEN"
+#     body: '{"content": {{message}}}'
+#   - name: ntfy
+#     url: "https://ntfy.sh/你的主题"
+#     headers: { Title: "vps-probe", Content-Type: text/plain }
+#     body: "{{message}}"
 
 # 可选，但接入 Cloudflare Access 后强烈建议打开：每个网页请求都必须带有效的
 # Access 令牌，否则 403。先确认经 Access 能正常登录访问，再加这段并重启（见 README 第 3 步）。
