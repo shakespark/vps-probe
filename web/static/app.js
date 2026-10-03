@@ -141,20 +141,86 @@ async function api(path) {
 const darkQuery = matchMedia('(prefers-color-scheme: dark)');
 
 class Chart {
-  constructor(title) {
+  constructor(title, group) {
     this.box = h('div', { class: 'chart' });
     this.el = h('div', { class: 'panel' }, h('h2', { text: title }), this.box);
     this.c = null;
+    this.group = group;
+    this.tip = true; // show the tooltip box, not only the crosshair
     this.ro = new ResizeObserver(() => this.c && this.c.resize());
     this.ro.observe(this.box);
   }
   set(option) {
-    if (!this.c) this.c = echarts.init(this.box, darkQuery.matches ? 'dark' : null);
+    if (!this.c) {
+      this.c = echarts.init(this.box, darkQuery.matches ? 'dark' : null);
+      if (this.group) this.group.add(this);
+    }
+    if (option.tooltip) option.tooltip.showContent = this.tip;
     this.c.setOption(option, { notMerge: true, lazyUpdate: true });
   }
   dispose() {
     this.ro.disconnect();
     if (this.c) this.c.dispose();
+    this.c = null; // a ChartGroup frame may still be queued
+  }
+}
+
+// Charts sharing a time axis: hovering one moves the crosshair on all of
+// them to the same moment, so a CPU spike can be lined up with a latency
+// one. Not echarts.connect: that syncs by data index, which lands on the
+// wrong time (or nowhere) in charts sampled differently, like disks every
+// 60s, or with gaps. Only the chart under the pointer shows its tooltip;
+// the others' would cover the very lines being compared.
+// hideTip alone leaves a crosshair placed by showTip; ECharts' own mouse-out
+// sends this leave trigger too.
+function hideTip(c) {
+  c.c.dispatchAction({ type: 'hideTip' });
+  c.c.dispatchAction({ type: 'updateAxisPointer', currTrigger: 'leave' });
+}
+
+class ChartGroup {
+  constructor() {
+    this.charts = [];
+    this.active = null;
+    this.frame = 0;
+  }
+  add(chart) {
+    this.charts.push(chart);
+    const zr = chart.c.getZr();
+    zr.on('mousemove', e => {
+      this.focus(chart);
+      cancelAnimationFrame(this.frame);
+      this.frame = requestAnimationFrame(() => this.follow(chart, e.offsetX, e.offsetY));
+    });
+    zr.on('globalout', () => {
+      cancelAnimationFrame(this.frame);
+      this.others(chart, hideTip);
+    });
+  }
+  others(chart, fn) {
+    for (const c of this.charts) if (c !== chart && c.c && !c.el.hidden) fn(c);
+  }
+  focus(chart) {
+    if (this.active === chart) return;
+    this.active = chart;
+    for (const c of this.charts) {
+      c.tip = c === chart;
+      if (c.c) c.c.setOption({ tooltip: { showContent: c.tip } });
+    }
+  }
+  // follow puts the other charts' crosshairs at the time under (x, y).
+  follow(chart, x, y) {
+    if (!chart.c) return; // page left
+    if (!chart.c.containPixel('grid', [x, y])) {
+      this.others(chart, hideTip);
+      return;
+    }
+    const t = chart.c.convertFromPixel({ xAxisIndex: 0 }, x);
+    this.others(chart, c => {
+      // Just above the x axis: inside the plot whatever the y range.
+      c.c.dispatchAction({ type: 'showTip', x: c.c.convertToPixel({ xAxisIndex: 0 }, t),
+        y: c.c.convertToPixel({ yAxisIndex: 0 }, 0) - 2 });
+    });
   }
 }
 
@@ -502,10 +568,11 @@ function nodePage(id) {
   const dot = h('span', { class: 'dot' });
   const sub = h('div', { class: 'muted' });
   const summary = h('div', { class: 'summary' });
+  const group = new ChartGroup();
   const charts = {
-    cpu: new Chart('CPU'), load: new Chart('负载'), mem: new Chart('内存 / Swap'),
-    net: new Chart('网络'), disk: new Chart('磁盘使用率'), conns: new Chart('连接与线程'),
-    ping: new Chart('时延（到各 peer）'),
+    cpu: new Chart('CPU', group), load: new Chart('负载', group), mem: new Chart('内存 / Swap', group),
+    net: new Chart('网络', group), disk: new Chart('磁盘使用率', group), conns: new Chart('连接与线程', group),
+    ping: new Chart('时延（到各 peer）', group),
   };
   const el = h('div', null,
     h('div', { class: 'row' }, h('a', { href: '#/', text: '← 总览' })),
