@@ -1,6 +1,6 @@
 #!/bin/sh
 # Checks the GitHub release CI built for tag v<VERSION> against a local
-# rebuild of the same tag (docs/DESIGN.md §13.1).
+# rebuild of the same tag (docs/DESIGN.md §10).
 #
 #   scripts/release.sh verify   download, rebuild, compare
 #   scripts/release.sh sign     the same, then sign the checksum file with the

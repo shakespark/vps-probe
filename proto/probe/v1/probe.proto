@@ -2,103 +2,105 @@ syntax = "proto3";
 
 package probe.v1;
 
-option go_package = "vpsprobe/internal/proto/probev1";
+option go_package = "github.com/shakespark/vps-probe/internal/proto/probev1";
 
-// Report is one sample from an agent. A single (node, ts) sample may be split
-// across several Reports (e.g. pings in a separate packet); the server merges
-// them field by field.
+// Report is one sample from an agent. A sample that does not fit one packet
+// is split across several Reports sharing ts; the server merges them field
+// by field. A field the agent could not read is left out.
 message Report {
-  int64 ts = 1;   // sample time, unix seconds, aligned to the agent interval
+  int64 ts = 1;   // sample time, unix seconds, a multiple of the report interval
   uint64 id = 2;  // random, echoed back in Ack
 
-  SysInfo sys = 3;              // on start and hourly
+  SysInfo sys = 3;  // on start and hourly
   CPU cpu = 4;
   Load load = 5;
   Mem mem = 6;
-  repeated Disk disks = 7;      // every 60s
-  repeated NetRate net = 8;
-  repeated IfaceTraffic traffic = 9;
-  repeated Ping pings = 10;
-  Sockets sockets = 11;          // since 0.1.9
+  Sockets sockets = 7;
+  repeated Disk disks = 8;  // every 60s
+  repeated NetRate net = 9;
+  repeated IfaceTraffic traffic = 10;
+  repeated Ping pings = 11;
 }
 
 message SysInfo {
   string hostname = 1;
-  string os = 2;       // PRETTY_NAME from /etc/os-release
+  string os = 2;        // PRETTY_NAME from /etc/os-release
   string kernel = 3;
   string arch = 4;
   uint32 cores = 5;
-  int64 boot_time = 6; // unix seconds
-  uint64 uptime = 7;   // seconds
-  string agent_version = 8;
+  int64 boot_time = 6;  // unix seconds; 0 = unknown
+  string agent_version = 7;
 }
 
 message CPU {
-  float usage = 1; // percent, 0-100
-  float steal = 2; // percent, 0-100
-  // Share of time in softirq (mostly network packet processing), percent;
-  // part of usage, not on top of it. Unset before agent 0.1.14.
-  optional float softirq = 3;
+  float usage = 1;    // percent, 0-100
+  float steal = 2;    // percent, 0-100
+  float softirq = 3;  // percent, part of usage: mostly network packet processing
 }
 
 message Load {
   float l1 = 1;
   float l5 = 2;
   float l15 = 3;
-  uint32 threads = 4; // all threads on the host, 4th field of /proc/loadavg (since 0.1.9)
-}
-
-// Sockets in use from /proc/net/sockstat and sockstat6, IPv4 + IPv6.
-message Sockets {
-  uint32 tcp = 1;    // TCP sockets other than TIME_WAIT (listening ones included)
-  uint32 udp = 2;
-  uint32 tcp_tw = 3; // TIME_WAIT
+  uint32 threads = 4;  // all threads on the host, from /proc/loadavg
 }
 
 message Mem {
-  uint64 total = 1; // bytes
-  uint64 used = 2;  // total - MemAvailable
+  uint64 total = 1;  // bytes
+  uint64 used = 2;   // total - MemAvailable
   uint64 swap_total = 3;
   uint64 swap_used = 4;
 }
 
+// Sockets in use, IPv4 + IPv6, from /proc/net/sockstat and sockstat6.
+message Sockets {
+  uint32 tcp = 1;     // other than TIME_WAIT, listening ones included
+  uint32 udp = 2;
+  uint32 tcp_tw = 3;  // TIME_WAIT
+}
+
 message Disk {
   string mount = 1;
-  uint64 total = 2; // bytes
+  uint64 total = 2;  // bytes
   uint64 used = 3;
-  uint64 avail = 4; // available to unprivileged users, as df reports
+  uint64 avail = 4;  // available to unprivileged users, as df reports
   float inode_pct = 5;
 }
 
 message NetRate {
   string iface = 1;
-  uint64 rx_rate = 2; // bytes per second
+  uint64 rx_rate = 2;  // bytes per second
   uint64 tx_rate = 3;
-  optional uint64 rx_pps = 4; // packets per second; unset before agent 0.1.14
-  optional uint64 tx_pps = 5;
+  uint64 rx_pps = 4;   // packets per second
+  uint64 tx_pps = 5;
 }
 
+// IfaceTraffic is what one interface carried in the current billing period
+// and in the one before it.
 message IfaceTraffic {
   string iface = 1;
   Period cur = 2;
   Period prev = 3;
 }
 
+// Period is a billing period [start, end) and the bytes counted in it. The
+// agent alone decides when periods begin; the server never computes one.
 message Period {
-  string start = 1; // period start date, YYYY-MM-DD in the agent's timezone
-  uint64 rx = 2;    // bytes accumulated in this period
-  uint64 tx = 3;
+  int64 start = 1;  // unix seconds
+  int64 end = 2;
+  uint64 rx = 3;
+  uint64 tx = 4;
 }
 
 message Ping {
-  string target = 1; // peer name from agent config
-  string addr = 2;   // resolved IP, empty if resolution failed
+  string target = 1;  // peer name from the agent config
+  string addr = 2;    // resolved address, empty if resolution failed
   uint32 sent = 3;
   uint32 lost = 4;
-  float min = 5;     // milliseconds, over replies only
+  float min = 5;      // milliseconds, over replies only
   float avg = 6;
   float max = 7;
-  float jitter = 8;  // mean absolute difference of consecutive RTTs
+  float jitter = 8;   // mean absolute difference of consecutive round trips
 }
 
 message Ack {

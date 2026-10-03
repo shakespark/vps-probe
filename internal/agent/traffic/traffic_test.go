@@ -48,16 +48,15 @@ func sample(ts, boot string, bootTime string, rx, tx uint64) Sample {
 	}
 }
 
+func day(t time.Time) string { return t.In(sh).Format(dateLayout) }
+
 func cur(t *testing.T, a *Accountant, now string) Totals {
 	t.Helper()
-	return a.Snapshot(at(now), []string{"eth0"})[0].Cur
+	return a.Snapshot(at(now), []string{"eth0"})[0].Cur.Totals
 }
 
 func mustUpdate(t *testing.T, a *Accountant, s Sample) {
-	t.Helper()
-	if err := a.Update(s); err != nil {
-		t.Fatal(err)
-	}
+	a.Update(s)
 }
 
 func TestSameBootAccumulates(t *testing.T) {
@@ -142,13 +141,13 @@ func TestMonthRollover(t *testing.T) {
 	mustUpdate(t, a, sample("2026-09-01 00:00:10", "b1", "2026-08-01 00:00:00", 1700, 160))
 
 	snap := a.Snapshot(at("2026-09-01 00:00:10"), []string{"eth0"})[0]
-	if snap.CurStart != "2026-09-01" || snap.PrevStart != "2026-08-01" {
+	if day(snap.Cur.Start) != "2026-09-01" || day(snap.Prev.Start) != "2026-08-01" {
 		t.Fatalf("keys: %+v", snap)
 	}
-	if snap.Prev != (Totals{RX: 1000, TX: 100}) {
+	if snap.Prev.Totals != (Totals{RX: 1000, TX: 100}) {
 		t.Fatalf("prev = %+v", snap.Prev)
 	}
-	if snap.Cur != (Totals{RX: 700, TX: 60}) {
+	if snap.Cur.Totals != (Totals{RX: 700, TX: 60}) {
 		t.Fatalf("cur = %+v", snap.Cur)
 	}
 }
@@ -158,10 +157,10 @@ func TestResetDay(t *testing.T) {
 	mustUpdate(t, a, sample("2026-09-14 23:59:50", "b1", "2026-09-01 00:00:00", 1000, 0))
 	mustUpdate(t, a, sample("2026-09-15 00:00:00", "b1", "2026-09-01 00:00:00", 1200, 0))
 	snap := a.Snapshot(at("2026-09-15 00:00:00"), []string{"eth0"})[0]
-	if snap.CurStart != "2026-09-15" || snap.Cur.RX != 200 {
+	if day(snap.Cur.Start) != "2026-09-15" || snap.Cur.RX != 200 {
 		t.Fatalf("cur: %+v", snap)
 	}
-	if snap.PrevStart != "2026-08-15" || snap.Prev.RX != 1000 {
+	if day(snap.Prev.Start) != "2026-08-15" || snap.Prev.RX != 1000 {
 		t.Fatalf("prev: %+v", snap)
 	}
 }
@@ -171,10 +170,10 @@ func TestResetTime(t *testing.T) {
 	mustUpdate(t, a, sample("2026-10-21 18:20:50", "b1", "2026-10-01 00:00:00", 1000, 0))
 	mustUpdate(t, a, sample("2026-10-21 18:21:00", "b1", "2026-10-01 00:00:00", 1200, 0))
 	snap := a.Snapshot(at("2026-10-21 18:21:00"), []string{"eth0"})[0]
-	if snap.CurStart != "2026-10-21" || snap.Cur.RX != 200 {
+	if day(snap.Cur.Start) != "2026-10-21" || snap.Cur.RX != 200 {
 		t.Fatalf("cur: %+v", snap)
 	}
-	if snap.PrevStart != "2026-09-21" || snap.Prev.RX != 1000 {
+	if day(snap.Prev.Start) != "2026-09-21" || snap.Prev.RX != 1000 {
 		t.Fatalf("prev: %+v", snap)
 	}
 }
@@ -197,7 +196,7 @@ func TestMultipleInterfacesAndNewInterface(t *testing.T) {
 		if i > 0 && snap[i-1].Iface >= s.Iface {
 			t.Errorf("not sorted: %v", snap)
 		}
-		if s.Cur != want[s.Iface] {
+		if s.Cur.Totals != want[s.Iface] {
 			t.Errorf("%s = %+v, want %+v", s.Iface, s.Cur, want[s.Iface])
 		}
 	}
@@ -216,7 +215,7 @@ func TestSnapshotKeepsRenamedInterface(t *testing.T) {
 	if len(snap) != 2 || snap[0].Iface != "ens3" || snap[1].Iface != "eth0" {
 		t.Fatalf("got %+v", snap)
 	}
-	if snap[1].Cur != (Totals{1000, 100}) {
+	if snap[1].Cur.Totals != (Totals{1000, 100}) {
 		t.Fatalf("eth0 = %+v", snap[1].Cur)
 	}
 	// Two periods later eth0 no longer has recent data and drops out.
@@ -233,7 +232,7 @@ func TestOpenToleratesNilEntries(t *testing.T) {
 	}
 	a := open(t, path, 1)
 	snap := a.Snapshot(at("2026-09-10 00:00:00"), nil)
-	if len(snap) != 1 || snap[0].Iface != "eth1" || snap[0].Prev != (Totals{5, 6}) {
+	if len(snap) != 1 || snap[0].Iface != "eth1" || snap[0].Prev.Totals != (Totals{5, 6}) {
 		t.Fatalf("got %+v", snap)
 	}
 	mustUpdate(t, a, sample("2026-09-10 00:00:00", "b1", "2026-09-01 00:00:00", 10, 10))
@@ -255,13 +254,6 @@ func TestInterfaceMissingThenBackAfterReboot(t *testing.T) {
 	snap := a.Snapshot(at("2026-09-11 00:02:00"), []string{"eth0", "eth1"})
 	if snap[0].Cur.RX != 1020 || snap[1].Cur.RX != 5300 {
 		t.Fatalf("got %+v", snap)
-	}
-}
-
-func TestEmptyBootIDRejected(t *testing.T) {
-	a := open(t, filepath.Join(t.TempDir(), "s.json"), 1)
-	if err := a.Update(Sample{Time: at("2026-09-10 00:00:00")}); err == nil {
-		t.Fatal("accepted empty boot id")
 	}
 }
 
@@ -423,19 +415,6 @@ func TestConcurrentUpdateAndSave(t *testing.T) {
 	b := open(t, path, 1)
 	if got := cur(t, b, "2026-09-10 00:10:00"); got.RX != 500 {
 		t.Fatalf("got %+v", got)
-	}
-}
-
-func TestOpenRejectsBadResetDay(t *testing.T) {
-	for _, d := range []int{0, 32, -1} {
-		if _, err := Open(filepath.Join(t.TempDir(), "s.json"), sh, Reset{Day: d}, discard); err == nil {
-			t.Errorf("reset_day %d accepted", d)
-		}
-	}
-	for _, r := range []Reset{{Day: 1, Hour: 24}, {Day: 1, Minute: 60}, {Day: 1, Hour: -1}} {
-		if _, err := Open(filepath.Join(t.TempDir(), "s.json"), sh, r, discard); err == nil {
-			t.Errorf("reset %+v accepted", r)
-		}
 	}
 }
 

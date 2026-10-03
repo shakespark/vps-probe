@@ -1,5 +1,6 @@
-// Package agent wires collectors, traffic accounting, ping and reporting
-// together into the sampling loop.
+// Package agent is the sampling loop: every interval it gathers what the
+// collectors, the traffic accountant and the pinger have, and hands one
+// report to the sink.
 package agent
 
 import (
@@ -9,169 +10,110 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
 	"syscall"
 	"time"
 
-	"vpsprobe/internal/agent/collect"
-	"vpsprobe/internal/agent/config"
-	"vpsprobe/internal/agent/ping"
-	"vpsprobe/internal/agent/traffic"
-	pb "vpsprobe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/agent/collect"
+	"github.com/shakespark/vps-probe/internal/agent/config"
+	"github.com/shakespark/vps-probe/internal/agent/ping"
+	"github.com/shakespark/vps-probe/internal/agent/traffic"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/wire"
 )
 
 const (
+	// StateDir holds the traffic totals. It is the unit's StateDirectory,
+	// the only place the service may write.
+	StateDir = "/var/lib/vps-probe-agent"
+
 	diskEvery   = time.Minute
 	sysEvery    = time.Hour
-	ifaceEvery  = time.Minute
 	stateFile   = "traffic.json"
 	shutdownMax = 5 * time.Second
 )
 
-// Sink receives finished reports: the UDP sender, or stdout in dry-run mode.
+// Sink receives finished reports: the UDP sender, or stdout in a dry run.
 type Sink interface {
 	Enqueue(*pb.Report)
+}
+
+// Options are what a caller may vary; the zero value is the installed agent.
+type Options struct {
+	Version string
+	// DryRun loads the traffic state read-only and never saves it, so a dry
+	// run can't disturb the installed agent.
+	DryRun bool
+	// StateDir and FS default to StateDir and the real filesystem.
+	StateDir string
+	FS       collect.FS
 }
 
 type Agent struct {
 	cfg     *config.Config
 	log     *slog.Logger
-	fs      collect.FS
 	sink    Sink
-	acct    *traffic.Accountant
-	pinger  *ping.Pinger
 	version string
-	lock    *os.File // held for the process lifetime; nil in dry-run
+
+	fs      collect.FS
+	sampler *collect.Sampler
+	ifaces  *collect.Selector
+	acct    *traffic.Accountant
+	pinger  *ping.Pinger // nil without peers
+	lock    *os.File     // held for the process lifetime; nil in a dry run
+	sources sources
 
 	bootID   string
-	bootTime time.Time
+	bootTime time.Time // zero when unknown
 
-	prevCPU   collect.CPUTimes
-	havePrevC bool
-	prevNet   map[string]collect.NetCounter
-	prevNetAt time.Time
-
-	ifaces   []string
-	ifacesAt time.Time
 	lastDisk time.Time
 	lastSys  time.Time
-
-	failing map[string]bool // collectors whose last read failed
 }
 
-// New prepares an agent. In dryRun mode the traffic state is loaded
-// read-only and never saved, so a dry run can't disturb the installed agent.
-func New(cfg *config.Config, sink Sink, version string, dryRun bool, log *slog.Logger) (*Agent, error) {
-	a := &Agent{cfg: cfg, log: log, fs: collect.Host, sink: sink, version: version}
+func New(cfg *config.Config, sink Sink, opt Options, log *slog.Logger) (*Agent, error) {
+	if opt.StateDir == "" {
+		opt.StateDir = StateDir
+	}
+	if opt.FS == (collect.FS{}) {
+		opt.FS = collect.Host
+	}
+	a := &Agent{cfg: cfg, log: log, sink: sink, version: opt.Version, fs: opt.FS, sources: sources{log: log}}
 
-	if err := a.readBoot(); err != nil {
+	// The boot id is required: without it a reboot cannot be told from a
+	// counter that kept running. The boot time is not. Where it cannot be
+	// read (a container whose lxcfs has died) it stays zero, which traffic
+	// accounting takes as unknown.
+	var err error
+	if a.bootID, err = a.fs.BootID(); err != nil {
 		return nil, err
 	}
-	var err error
-	statePath := filepath.Join(cfg.StateDir, stateFile)
-	reset := traffic.Reset{Day: cfg.Traffic.ResetDay, Hour: cfg.Traffic.ResetHour, Minute: cfg.Traffic.ResetMinute}
-	if dryRun {
-		a.acct, err = traffic.OpenReadOnly(statePath, cfg.Traffic.Location, reset, log)
+	if a.bootTime, err = a.fs.SystemStart(time.Now()); err != nil {
+		a.bootTime = time.Time{}
+		log.Warn("boot time unknown: starting without it", "err", err)
+	}
+
+	statePath := filepath.Join(opt.StateDir, stateFile)
+	if opt.DryRun {
+		a.acct, err = traffic.OpenReadOnly(statePath, cfg.Traffic.Location, cfg.Traffic.Reset, log)
 	} else {
 		// Two writers would overwrite each other's increments.
 		if a.lock, err = lockFile(statePath + ".lock"); err != nil {
 			return nil, err
 		}
-		a.acct, err = traffic.Open(statePath, cfg.Traffic.Location, reset, log)
+		a.acct, err = traffic.Open(statePath, cfg.Traffic.Location, cfg.Traffic.Reset, log)
 	}
 	if err != nil {
 		return nil, err
 	}
-	if len(cfg.Ping.Peers) > 0 {
-		peers := make([]ping.Peer, len(cfg.Ping.Peers))
-		for i, p := range cfg.Ping.Peers {
-			typ := p.Type
-			if typ == "icmp" {
-				typ = ping.TypeICMP
-			}
-			peers[i] = ping.Peer{Name: p.Name, Addr: p.Addr, Type: typ, Key: p.Key}
-		}
+	if len(cfg.Peers) > 0 {
 		// Latency is one feature among several; run without it rather than
 		// not at all.
-		if a.pinger, err = ping.New(peers, cfg.Ping.Interval, cfg.Ping.Timeout, log); err != nil {
+		if a.pinger, err = ping.New(cfg.Peers, ping.Interval, ping.Timeout, log); err != nil {
 			log.Error("ping disabled", "err", err)
 		}
 	}
-	if err := a.refreshIfaces(time.Now()); err != nil {
-		return nil, err
-	}
+	a.ifaces = collect.NewSelector(a.fs, cfg.Interfaces, log)
+	a.sampler = collect.NewSampler(a.fs)
 	return a, nil
-}
-
-// readBoot identifies the current boot. The boot id is required: traffic
-// accounting cannot tell a reboot without it. The boot time is not. In a
-// container whose lxcfs has died neither /proc/uptime nor /proc/stat can be
-// read; the time stays
-// zero, which traffic accounting takes as "unknown" (a new interface is then
-// not counted since boot), and everything that can still be read is reported.
-func (a *Agent) readBoot() error {
-	var err error
-	if a.bootID, err = a.fs.BootID(); err != nil {
-		return err
-	}
-	if a.bootTime, err = a.fs.SystemStart(time.Now()); err != nil {
-		a.bootTime = time.Time{}
-		a.log.Warn("boot time unknown: starting without it", "err", err)
-	}
-	return nil
-}
-
-// collected logs a collector's failure once, and its recovery: a source that
-// stays unreadable (the files lxcfs provides, once lxcfs has died) would
-// otherwise log at every sample. It reports whether the read succeeded.
-func (a *Agent) collected(what string, err error) bool {
-	if err != nil {
-		if !a.failing[what] {
-			if a.failing == nil {
-				a.failing = map[string]bool{}
-			}
-			a.failing[what] = true
-			a.log.Error("read "+what+": not reported until it can be read again", "err", err)
-		}
-		return false
-	}
-	if a.failing[what] {
-		delete(a.failing, what)
-		a.log.Info("read " + what + ": readable again")
-	}
-	return true
-}
-
-// Run samples on interval boundaries until ctx is done, then records final
-// traffic counters and saves state, so a clean shutdown loses nothing.
-func (a *Agent) Run(ctx context.Context) error {
-	if a.pinger != nil {
-		go a.pinger.Run(ctx)
-	}
-	// Baselines so the first report has CPU usage and rates.
-	if c, err := a.fs.ReadCPU(); err == nil {
-		a.prevCPU, a.havePrevC = c, true
-	}
-	if n, err := a.fs.ReadNetDev(); err == nil {
-		a.prevNet, a.prevNetAt = n, time.Now()
-	}
-	a.log.Info("agent started", "node", a.cfg.Node, "server", a.cfg.Server.Addr,
-		"interval", a.cfg.Interval, "interfaces", a.ifaces, "peers", len(a.cfg.Ping.Peers),
-		"period_reset_day", a.cfg.Traffic.ResetDay,
-		"period_reset_time", fmt.Sprintf("%02d:%02d", a.cfg.Traffic.ResetHour, a.cfg.Traffic.ResetMinute), "timezone", a.cfg.Traffic.Location)
-
-	for {
-		now := time.Now()
-		next := now.Truncate(a.cfg.Interval).Add(a.cfg.Interval)
-		timer := time.NewTimer(next.Sub(now))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return a.shutdown()
-		case <-timer.C:
-		}
-		a.tick(next)
-	}
 }
 
 func lockFile(path string) (*os.File, error) {
@@ -189,12 +131,34 @@ func lockFile(path string) (*os.File, error) {
 	return f, nil
 }
 
+// Run samples on interval boundaries until ctx is done, then records final
+// traffic counters and saves state, so a clean shutdown loses nothing.
+func (a *Agent) Run(ctx context.Context) error {
+	if a.pinger != nil {
+		go a.pinger.Run(ctx)
+	}
+	r := a.cfg.Traffic.Reset
+	a.log.Info("agent started", "version", a.version, "node", a.cfg.Node, "server", a.cfg.Server,
+		"peers", len(a.cfg.Peers), "period_reset", fmt.Sprintf("day %d %02d:%02d %s", r.Day, r.Hour, r.Minute, a.cfg.Traffic.Location))
+	for {
+		now := time.Now()
+		next := now.Truncate(wire.Interval).Add(wire.Interval)
+		timer := time.NewTimer(next.Sub(now))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return a.shutdown()
+		case <-timer.C:
+		}
+		a.sink.Enqueue(a.sample(next, time.Now()))
+	}
+}
+
 func (a *Agent) shutdown() error {
 	done := make(chan error, 1)
 	go func() {
-		if n, err := a.fs.ReadNetDev(); err == nil {
-			a.updateTraffic(time.Now(), n)
-		}
+		now := time.Now()
+		a.network(now, a.ifaces.Interfaces(now), &pb.Report{})
 		done <- a.acct.Save()
 	}()
 	select {
@@ -215,145 +179,48 @@ func (a *Agent) shutdown() error {
 	}
 }
 
-func (a *Agent) refreshIfaces(now time.Time) error {
-	if len(a.cfg.Interfaces) > 0 {
-		a.ifaces = a.cfg.Interfaces
-		return nil
-	}
-	if !a.ifacesAt.IsZero() && now.Sub(a.ifacesAt) < ifaceEvery {
-		return nil
-	}
-	a.ifacesAt = now
-	found, err := a.fs.DetectInterfaces()
-	if errors.Is(err, collect.ErrNoDefaultRoute) {
-		// Typically the network is not up yet, or a lease is being renewed.
-		// Keep the previous choice. Counting every NIC meanwhile would put
-		// a private NIC's whole counter into the period (a new interface
-		// is counted since boot), so with no previous choice count none
-		// and look again at the next sample.
-		if len(a.ifaces) == 0 {
-			if a.ifaces == nil {
-				a.log.Warn("several physical interfaces and no default route yet: traffic is not counted until there is one", "hint", "set interfaces in the config to choose")
-				a.ifaces = []string{}
-			}
-			a.ifacesAt = time.Time{}
-		}
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if a.ifaces != nil && len(a.ifaces) == 0 {
-		a.log.Info("default route found: counting traffic", "interfaces", found)
-	}
-	if len(a.ifaces) > 0 && !slices.Equal(found, a.ifaces) {
-		a.log.Warn("physical interfaces changed", "from", a.ifaces, "to", found)
-	}
-	a.ifaces = found
-	return nil
-}
-
-func (a *Agent) updateTraffic(now time.Time, all map[string]collect.NetCounter) {
-	counters := make(map[string]traffic.Counter, len(a.ifaces))
-	for _, name := range a.ifaces {
-		if c, ok := all[name]; ok {
-			counters[name] = traffic.Counter{RX: c.RX, TX: c.TX}
-		}
-	}
-	err := a.acct.Update(traffic.Sample{Time: now, BootID: a.bootID, BootTime: a.bootTime, Counters: counters})
-	if err != nil {
-		a.log.Error("traffic update", "err", err)
-	}
-}
-
-func (a *Agent) tick(ts time.Time) {
-	now := time.Now()
+// sample builds the report for the interval ending at ts. A source that
+// cannot be read is left out of the report; the rest is sent.
+func (a *Agent) sample(ts, now time.Time) *pb.Report {
 	rep := &pb.Report{Ts: ts.Unix()}
-
-	if err := a.refreshIfaces(now); err != nil {
-		a.log.Warn("interface detection", "err", err) // keep the previous list
+	ifaces := a.ifaces.Interfaces(now)
+	a.network(now, ifaces, rep)
+	for _, t := range a.acct.Snapshot(now, ifaces) {
+		rep.Traffic = append(rep.Traffic, &pb.IfaceTraffic{Iface: t.Iface, Cur: period(t.Cur), Prev: period(t.Prev)})
 	}
 
-	if netNow, err := a.fs.ReadNetDev(); err != nil {
-		a.log.Error("read /proc/net/dev", "err", err)
-	} else {
-		a.updateTraffic(now, netNow)
-		if err := a.acct.MaybeSave(now); err != nil {
-			a.log.Error("traffic save", "err", err)
-		}
-		if a.prevNet != nil {
-			secs := now.Sub(a.prevNetAt).Seconds()
-			for _, name := range a.ifaces {
-				cur, ok1 := netNow[name]
-				prev, ok2 := a.prevNet[name]
-				if !ok1 || !ok2 || secs <= 0 || cur.RX < prev.RX || cur.TX < prev.TX ||
-					cur.RXPkts < prev.RXPkts || cur.TXPkts < prev.TXPkts {
-					continue
-				}
-				per := func(c, p uint64) uint64 { return uint64(float64(c-p) / secs) }
-				rxPPS, txPPS := per(cur.RXPkts, prev.RXPkts), per(cur.TXPkts, prev.TXPkts)
-				rep.Net = append(rep.Net, &pb.NetRate{
-					Iface:  name,
-					RxRate: per(cur.RX, prev.RX),
-					TxRate: per(cur.TX, prev.TX),
-					RxPps:  &rxPPS,
-					TxPps:  &txPPS,
-				})
-			}
-		}
-		a.prevNet, a.prevNetAt = netNow, now
+	if c, ok, err := a.sampler.CPU(); a.sources.ok("cpu", err) && ok {
+		rep.Cpu = &pb.CPU{Usage: float32(c.Usage), Steal: float32(c.Steal), Softirq: float32(c.SoftIRQ)}
 	}
-	for _, t := range a.acct.Snapshot(now, a.ifaces) {
-		rep.Traffic = append(rep.Traffic, &pb.IfaceTraffic{
-			Iface: t.Iface,
-			Cur:   &pb.Period{Start: t.CurStart, Rx: t.Cur.RX, Tx: t.Cur.TX},
-			Prev:  &pb.Period{Start: t.PrevStart, Rx: t.Prev.RX, Tx: t.Prev.TX},
-		})
-	}
-
-	if c, err := a.fs.ReadCPU(); a.collected("cpu", err) {
-		if a.havePrevC {
-			if p, ok := collect.CPUUsage(a.prevCPU, c); ok {
-				softirq := float32(p.SoftIRQ)
-				rep.Cpu = &pb.CPU{Usage: float32(p.Usage), Steal: float32(p.Steal), Softirq: &softirq}
-			}
-		}
-		a.prevCPU, a.havePrevC = c, true
-	}
-	if l, err := a.fs.ReadLoad(); a.collected("load", err) {
+	if l, err := a.fs.Load(); a.sources.ok("load", err) {
 		rep.Load = &pb.Load{L1: float32(l.L1), L5: float32(l.L5), L15: float32(l.L15), Threads: l.Threads}
 	}
-	if m, err := a.fs.ReadMem(); a.collected("memory", err) {
+	if m, err := a.fs.Mem(); a.sources.ok("memory", err) {
 		rep.Mem = &pb.Mem{Total: m.Total, Used: m.Used, SwapTotal: m.SwapTotal, SwapUsed: m.SwapUsed}
 	}
-	if k, err := a.fs.ReadSockets(); a.collected("sockets", err) {
+	if k, err := a.fs.Sockets(); a.sources.ok("sockets", err) {
 		rep.Sockets = &pb.Sockets{Tcp: k.TCP, Udp: k.UDP, TcpTw: k.TCPTimeWait}
 	}
 
-	if a.lastDisk.IsZero() || now.Sub(a.lastDisk) >= diskEvery {
+	if now.Sub(a.lastDisk) >= diskEvery {
 		a.lastDisk = now
 		for _, mnt := range a.cfg.Disks {
-			d, err := collect.DiskUsage(mnt)
-			if err != nil {
-				a.log.Warn("disk usage", "mount", mnt, "err", err)
-				continue
+			if d, err := a.fs.Disk(mnt); a.sources.ok("disk "+mnt, err) {
+				rep.Disks = append(rep.Disks, &pb.Disk{Mount: d.Mount, Total: d.Total, Used: d.Used,
+					Avail: d.Avail, InodePct: float32(d.InodePct)})
 			}
-			rep.Disks = append(rep.Disks, &pb.Disk{Mount: d.Mount, Total: d.Total, Used: d.Used,
-				Avail: d.Avail, InodePct: float32(d.InodePct)})
 		}
 	}
-
-	if a.lastSys.IsZero() || now.Sub(a.lastSys) >= sysEvery {
+	if now.Sub(a.lastSys) >= sysEvery {
 		a.lastSys = now
-		s := a.fs.ReadSysInfo()
+		s := a.fs.SysInfo()
 		var boot int64 // 0 = unknown; the zero time's Unix() is not 0
 		if !s.BootTime.IsZero() {
 			boot = s.BootTime.Unix()
 		}
 		rep.Sys = &pb.SysInfo{Hostname: s.Hostname, Os: s.OS, Kernel: s.Kernel, Arch: s.Arch,
-			Cores: uint32(s.Cores), BootTime: boot, Uptime: s.Uptime, AgentVersion: a.version}
+			Cores: uint32(s.Cores), BootTime: boot, AgentVersion: a.version}
 	}
-
 	if a.pinger != nil {
 		for _, s := range a.pinger.Snapshot(now) {
 			rep.Pings = append(rep.Pings, &pb.Ping{Target: s.Target, Addr: s.Addr,
@@ -361,6 +228,56 @@ func (a *Agent) tick(ts time.Time) {
 				Min: float32(s.Min), Avg: float32(s.Avg), Max: float32(s.Max), Jitter: float32(s.Jitter)})
 		}
 	}
+	return rep
+}
 
-	a.sink.Enqueue(rep)
+// network reads the interface counters once, for both of their uses: the
+// counted interfaces' bytes go into the traffic totals, and their speeds
+// into rep.
+func (a *Agent) network(now time.Time, ifaces []string, rep *pb.Report) {
+	counters, rates, err := a.sampler.Net(now)
+	if !a.sources.ok("network counters", err) {
+		return
+	}
+	counted := make(map[string]traffic.Counter, len(ifaces))
+	for _, name := range ifaces {
+		if c, ok := counters[name]; ok {
+			counted[name] = traffic.Counter{RX: c.RX, TX: c.TX}
+		}
+		if r, ok := rates[name]; ok {
+			rep.Net = append(rep.Net, &pb.NetRate{Iface: name, RxRate: r.RX, TxRate: r.TX, RxPps: r.RXPkts, TxPps: r.TXPkts})
+		}
+	}
+	a.acct.Update(traffic.Sample{Time: now, BootID: a.bootID, BootTime: a.bootTime, Counters: counted})
+	if err := a.acct.MaybeSave(now); err != nil {
+		a.log.Error("traffic save", "err", err)
+	}
+}
+
+func period(p traffic.Period) *pb.Period {
+	return &pb.Period{Start: p.Start.Unix(), End: p.End.Unix(), Rx: p.RX, Tx: p.TX}
+}
+
+// sources remembers which sources could not be read, so that one that stays
+// unreadable (the files lxcfs provides, once lxcfs has died) is logged when
+// it fails and when it comes back, not at every sample.
+type sources struct {
+	log     *slog.Logger
+	failing map[string]bool
+}
+
+// ok reports whether err is nil, logging a change in either direction.
+func (s *sources) ok(what string, err error) bool {
+	switch {
+	case err != nil && !s.failing[what]:
+		if s.failing == nil {
+			s.failing = map[string]bool{}
+		}
+		s.failing[what] = true
+		s.log.Error("cannot read "+what+": not reported until it can be read again", "err", err)
+	case err == nil && s.failing[what]:
+		delete(s.failing, what)
+		s.log.Info(what + " can be read again")
+	}
+	return err == nil
 }

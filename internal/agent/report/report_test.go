@@ -13,8 +13,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	pb "vpsprobe/internal/proto/probev1"
-	"vpsprobe/internal/wire"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/wire"
 )
 
 const (
@@ -59,11 +59,11 @@ func typical() *pb.Report {
 		Sockets: &pb.Sockets{Tcp: 42, Udp: 7, TcpTw: 12},
 		Net:     []*pb.NetRate{{Iface: "eth0", RxRate: 123456, TxRate: 654321}},
 		Traffic: []*pb.IfaceTraffic{{Iface: "eth0",
-			Cur:  &pb.Period{Start: "2026-09-01", Rx: 51234567890, Tx: 40123456789},
-			Prev: &pb.Period{Start: "2026-08-01", Rx: 61234567890, Tx: 50123456789}}},
+			Cur:  &pb.Period{Start: 1788192000, End: 1790784000, Rx: 51234567890, Tx: 40123456789},
+			Prev: &pb.Period{Start: 1785513600, End: 1788192000, Rx: 61234567890, Tx: 50123456789}}},
 		Disks: []*pb.Disk{{Mount: "/", Total: 40 << 30, Used: 12 << 30, Avail: 26 << 30, InodePct: 8}},
 		Sys: &pb.SysInfo{Hostname: "hk-1.example.com", Os: "Debian GNU/Linux 12 (bookworm)",
-			Kernel: "6.1.0-25-amd64", Arch: "amd64", Cores: 2, BootTime: 1789000000, Uptime: 1000000, AgentVersion: "v0.1.0"},
+			Kernel: "6.1.0-25-amd64", Arch: "amd64", Cores: 2, BootTime: 1789000000, AgentVersion: "v0.1.0"},
 	}
 	for i := range 10 {
 		r.Pings = append(r.Pings, &pb.Ping{Target: fmt.Sprintf("peer-%d", i), Addr: fmt.Sprintf("203.0.113.%d", i),
@@ -328,7 +328,7 @@ func TestSenderQueueBounds(t *testing.T) {
 	if s.queue[0].TS != now.Unix()-int64(queueCap) {
 		t.Fatalf("oldest kept ts = %d; oldest entries should be dropped first", s.queue[0].TS)
 	}
-	now = now.Add(maxAge + time.Hour)
+	now = now.Add(wire.MaxAge + time.Hour)
 	s.pump()
 	if q, _ := s.Stats(); q != 0 {
 		t.Fatalf("expired entries kept: %d", q)

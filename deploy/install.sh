@@ -25,38 +25,46 @@ say() { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# The usage text is this file's leading comment.
 usage() {
-	sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,/^set -eu/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 	exit 2
 }
 
-# role -> names
+# Each role is a program vps-probe-<role>, run by a system user of the same
+# name, with its config in $ETC/<role>.yml and its data in /var/lib/<name>.
 set_role() {
 	case "$1" in
-	agent) NAME=vps-probe-agent USER_=vps-probe STATE=/var/lib/vps-probe CONF=$ETC/agent.yml CHECK="-check -config" VER=-version ;;
-	server) NAME=vps-probe-server USER_=vps-probe-server STATE=/var/lib/vps-probe-server CONF=$ETC/server.yml CHECK="check -config" VER=version ;;
-	echo) NAME=vps-probe-echo USER_=vps-probe-echo STATE=/var/lib/vps-probe-echo CONF=$ETC/echo.yml CHECK="-check -config" VER=-version ;;
+	agent | server | echo) ;;
 	*) usage ;;
 	esac
+	ROLE=$1
+	NAME=vps-probe-$ROLE
+	CONF=$ETC/$ROLE.yml
+	STATE=/var/lib/$NAME
 }
 
 preflight() {
 	[ "$(id -u)" = 0 ] || die "run as root"
 	command -v systemctl >/dev/null 2>&1 || die "systemd is required"
-	[ -x "$HERE/bin/$NAME" ] || die "$HERE/bin/$NAME not found; run this from the unpacked release directory"
-	"$HERE/bin/$NAME" $VER >/dev/null 2>&1 ||
+	[ -f "$HERE/bin/$NAME" ] || die "$HERE/bin/$NAME not found; run this from the unpacked release directory"
+	if ! "$HERE/bin/$NAME" version >/dev/null 2>&1; then
+		if command -v findmnt >/dev/null 2>&1 && findmnt -no OPTIONS -T "$HERE" | grep -qw noexec; then
+			die "$HERE is on a filesystem mounted noexec, so the programs in it cannot be run. Unpack the release somewhere else (for the one-line install command: put TMPDIR=/root in front of it)."
+		fi
 		die "$HERE/bin/$NAME does not run here: this package is for another CPU architecture? (this machine: $(uname -m))"
-}
-
-ensure_user() {
-	if ! id -u "$USER_" >/dev/null 2>&1; then
-		say "creating system user $USER_"
-		useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$USER_"
 	fi
 }
 
-# /etc/vps-probe is shared by agent and server: both service users must be
-# able to enter it. The files themselves are 0640 root:<service group>.
+ensure_user() {
+	if ! id -u "$NAME" >/dev/null 2>&1; then
+		say "creating system user $NAME"
+		useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$NAME"
+	fi
+}
+
+# /etc/vps-probe is shared by the roles: every service user must be able to
+# enter it. The files themselves are 0640 root:<service group>.
 ensure_etc() {
 	install -d -m 0755 -o root -g root "$ETC"
 	chown root:root "$ETC"
@@ -64,28 +72,28 @@ ensure_etc() {
 }
 
 # Validate as the service user, so permission problems show up now.
-# $CHECK is two words (e.g. "-check -config") and must be split.
-# shellcheck disable=SC2086
 validate() {
 	if command -v runuser >/dev/null 2>&1; then
-		runuser -u "$USER_" -- "$BIN/$NAME" $CHECK "$1"
+		runuser -u "$NAME" -- "$BIN/$NAME" check -config "$1"
 	else
-		"$BIN/$NAME" $CHECK "$1"
+		"$BIN/$NAME" check -config "$1"
 	fi
 }
 
 install_binary() {
-	say "installing $BIN/$NAME $("$HERE/bin/$NAME" $VER)"
+	say "installing $BIN/$NAME $("$HERE/bin/$NAME" version)"
 	install -m 0755 -o root -g root "$HERE/bin/$NAME" "$BIN/$NAME.new"
 	mv -f "$BIN/$NAME.new" "$BIN/$NAME"
 }
 
-# Returns 1 when there is no usable config yet (an example was installed).
+# Returns 1 when there is no usable config yet: the example was installed
+# and needs to be filled in. (The server's example is usable as it is: a
+# server without nodes.)
 install_config() {
 	src=$1
 	if [ -n "$src" ]; then
 		[ -f "$src" ] || die "config $src not found"
-		install -m 0640 -o root -g "$USER_" "$src" "$CONF.new"
+		install -m 0640 -o root -g "$NAME" "$src" "$CONF.new"
 		if ! validate "$CONF.new"; then
 			rm -f "$CONF.new"
 			die "$src is not valid; nothing was changed"
@@ -100,14 +108,17 @@ install_config() {
 		return 0
 	fi
 	if [ -f "$CONF" ]; then
-		chown root:"$USER_" "$CONF"
+		chown root:"$NAME" "$CONF"
 		chmod 0640 "$CONF"
 		validate "$CONF" || die "existing $CONF is not valid; fix it and run this again"
 		say "keeping existing config $CONF"
 		return 0
 	fi
-	example="$HERE/examples/$(basename "$CONF" .yml).example.yml"
-	install -m 0640 -o root -g "$USER_" "$example" "$CONF"
+	install -m 0640 -o root -g "$NAME" "$HERE/examples/$ROLE.example.yml" "$CONF"
+	if validate "$CONF" >/dev/null 2>&1; then
+		say "no config given: installed the example as $CONF"
+		return 0
+	fi
 	warn "no config given: installed the example as $CONF"
 	return 1
 }
@@ -120,7 +131,7 @@ install_unit() {
 # otherwise grant CAP_NET_RAW to the agent service only (the host sysctl is
 # left alone).
 agent_icmp() {
-	gid=$(id -g "$USER_")
+	gid=$(id -g "$NAME")
 	range=$(cat /proc/sys/net/ipv4/ping_group_range 2>/dev/null || echo "1 0")
 	lo=${range%%[[:space:]]*}
 	hi=${range##*[[:space:]]}
@@ -176,7 +187,7 @@ start() {
 		journalctl -u "$NAME" --since "$since" --no-pager -o cat | tail -n 20
 		die "$NAME failed to start (log above)"
 	fi
-	if [ "$NAME" = vps-probe-agent ]; then
+	if [ "$ROLE" = agent ]; then
 		i=0
 		while [ $i -lt 20 ]; do
 			if journalctl -u "$NAME" --since "$since" --no-pager -o cat | grep -q 'server acknowledged'; then
@@ -212,33 +223,40 @@ cmd_install() {
 	ensure_etc
 	install_binary
 	install_unit
-	[ "$NAME" != vps-probe-agent ] || agent_icmp
-	[ "$NAME" != vps-probe-agent ] || agent_lxcfs
+	if [ "$ROLE" = agent ]; then
+		agent_icmp
+		agent_lxcfs
+	fi
 	if ! install_config "$cfg"; then
 		systemctl daemon-reload
 		say "edit $CONF, then run: $0 $ROLE"
 		exit 0
 	fi
 	start
-	if [ "$NAME" = vps-probe-server ]; then
+	case $ROLE in
+	server)
 		cat <<-EOF
 
 			Next steps (see README):
 			  - allow UDP 9527 to this machine (cloud security group / firewall)
-			  - per node: vps-probe-server add-node -id ID -server THIS_HOST:9527, restart
-			    this service, then paste the command it prints on that VPS
-			  - web UI: publish http://localhost:8080 through cloudflared + Access
+			  - set public_addr in $CONF: how agents reach this machine, HOST:9527
+			  - per node: vps-probe-server add-node -id ID, restart this service, then
+			    paste the command it prints on that VPS
+			  - web UI: publish http://localhost:8080 through cloudflared + Access,
+			    or an HTTPS reverse proxy with basic_auth
 		EOF
-	fi
-	if [ "$NAME" = vps-probe-echo ]; then
+		;;
+	echo)
 		cat <<-EOF
 
-			Next steps (see README):
+			Next steps (see docs/tunnels.md):
 			  - allow the UDP port in $CONF to this machine (cloud security group / firewall)
 			  - point the tunnel's far end at this port, and add an echo peer with the
-			    same key to the probing node (server.yml extra_peers, then agent-config)
+			    same key to the probing node (its ping.extra in server.yml), then
+			    reinstall that node's config
 		EOF
-	fi
+		;;
+	esac
 }
 
 cmd_uninstall() {
@@ -254,7 +272,7 @@ cmd_uninstall() {
 		say "purging $CONF and $STATE"
 		rm -f "$CONF" "$CONF".bak-* "$CONF.new"
 		rm -rf "$STATE"
-		userdel "$USER_" 2>/dev/null || true
+		userdel "$NAME" 2>/dev/null || true
 		rmdir "$ETC" 2>/dev/null || true # only if the other role isn't installed
 	else
 		say "kept $CONF and $STATE (use --purge to delete them)"
@@ -264,15 +282,13 @@ cmd_uninstall() {
 [ $# -ge 1 ] || usage
 case "$1" in
 agent | server | echo)
-	ROLE=$1
-	set_role "$ROLE"
+	set_role "$1"
 	shift
 	cmd_install "$@"
 	;;
 uninstall)
 	[ $# -ge 2 ] || usage
-	ROLE=$2
-	set_role "$ROLE"
+	set_role "$2"
 	shift 2
 	cmd_uninstall "$@"
 	;;

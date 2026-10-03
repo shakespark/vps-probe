@@ -17,17 +17,12 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	pb "vpsprobe/internal/proto/probev1"
-	"vpsprobe/internal/server/config"
-	"vpsprobe/internal/wire"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/server/config"
+	"github.com/shakespark/vps-probe/internal/wire"
 )
 
 const (
-	// MaxSkew bounds |server time - report ts|. The agent gives up on
-	// reports older than 2h, so anything beyond that is a replay or a
-	// badly wrong clock.
-	MaxSkew = 2*time.Hour + 5*time.Minute
-
 	seenPruneEvery = time.Minute
 	logEvery       = time.Minute
 	readBuffer     = 2048 // > wire.MaxPacket, so oversized packets are seen as such
@@ -169,7 +164,7 @@ func (s *Server) handle(pkt []byte, from netip.AddrPort) {
 		s.rateLog("decode:"+h.Node, "ingest: undecodable report; agent/server version mismatch?", "node", h.Node, "err", err)
 		return
 	}
-	if skew := now.Sub(time.Unix(rep.Ts, 0)); skew > MaxSkew || skew < -MaxSkew {
+	if skew := now.Sub(time.Unix(rep.Ts, 0)); skew > wire.MaxSkew || skew < -wire.MaxSkew {
 		s.count(TSOutOfRange)
 		s.rateLog("ts:"+h.Node, "ingest: report timestamp too far from server time; check clocks (NTP)",
 			"node", h.Node, "skew", skew.Round(time.Second))
@@ -222,7 +217,7 @@ func (s *Server) pruneSeen(now time.Time) {
 		return
 	}
 	s.lastPrune = now
-	cut := now.Add(-MaxSkew - time.Minute).Unix()
+	cut := now.Add(-wire.MaxSkew - time.Minute).Unix()
 	for node, m := range s.seen {
 		for id, ts := range m {
 			if ts < cut {
@@ -236,7 +231,7 @@ func (s *Server) pruneSeen(now time.Time) {
 }
 
 // rateLog logs at most once per key per logEvery, so a flood of bad packets
-// can't flood the journal. Node names in keys passed wire.ValidNode.
+// can't flood the journal. Node names in keys passed wire.ValidID.
 func (s *Server) rateLog(key, msg string, args ...any) {
 	s.logMu.Lock()
 	now := s.now()

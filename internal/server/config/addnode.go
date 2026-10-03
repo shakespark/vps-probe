@@ -12,12 +12,31 @@ import (
 // NewNode is what add-node writes; everything else about a node is edited
 // by hand.
 type NewNode struct {
-	ID     string `yaml:"id"`
-	Name   string `yaml:"name,omitempty"`
-	Token  string `yaml:"token"`
-	Addr   string `yaml:"addr,omitempty"`
-	Region string `yaml:"region,omitempty"`
-	Group  string `yaml:"group,omitempty"`
+	ID, Name, Token, Region, Group string
+	PingAddr                       string // where other nodes ping it; none = they don't
+}
+
+// yaml returns the node as a list item's content, block style.
+func (n NewNode) yaml() ([]byte, error) {
+	type ping struct {
+		Addr string `yaml:"addr"`
+	}
+	item := struct {
+		ID     string `yaml:"id"`
+		Name   string `yaml:"name,omitempty"`
+		Token  string `yaml:"token"`
+		Region string `yaml:"region,omitempty"`
+		Group  string `yaml:"group,omitempty"`
+		Ping   *ping  `yaml:"ping,omitempty"`
+	}{ID: n.ID, Name: n.Name, Token: n.Token, Region: n.Region, Group: n.Group}
+	if n.PingAddr != "" {
+		item.Ping = &ping{n.PingAddr}
+	}
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	err := enc.Encode(item)
+	return buf.Bytes(), err
 }
 
 // AddNode returns data with n appended to the nodes list. The file is hand
@@ -42,27 +61,53 @@ func AddNode(data []byte, n NewNode) ([]byte, error) {
 		return nil, errors.New("config: not a YAML mapping")
 	}
 	root := doc.Content[0]
-	var seq *yaml.Node
+	var key, seq *yaml.Node
 	nextKeyLine := 0 // line of the top-level key after nodes; 0 = nodes is last
 	for i := 0; i+1 < len(root.Content); i += 2 {
 		if root.Content[i].Value == "nodes" {
-			seq = root.Content[i+1]
+			key, seq = root.Content[i], root.Content[i+1]
 			if i+2 < len(root.Content) {
 				nextKeyLine = root.Content[i+2].Line
 			}
 			break
 		}
 	}
-	if seq == nil || seq.Kind != yaml.SequenceNode || len(seq.Content) == 0 || seq.Style&yaml.FlowStyle != 0 {
-		return nil, errors.New("config: add-node needs a block-style nodes list with at least one node (\"nodes:\" followed by \"- ...\" lines); add this node by hand")
+	lines := strings.SplitAfter(string(data), "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
 	}
-	// An item's column is where its content starts, after "- ".
-	indent := seq.Content[0].Column - 3
-	if indent < 0 {
-		return nil, errors.New("config: cannot tell how the nodes list is indented; add this node by hand")
+	indent := 2
+	switch {
+	case seq == nil:
+		return nil, errors.New("config: no nodes key; add \"nodes: []\" and run add-node again")
+	case len(old.Nodes) == 0:
+		// The first node: "nodes: []" (or an empty "nodes:") on a line of
+		// its own becomes the head of a block list. A comment on that line
+		// is kept.
+		head := lines[key.Line-1]
+		rest, ok := strings.CutPrefix(strings.TrimRight(head, "\r\n"), "nodes:")
+		value, comment, commented := strings.Cut(rest, "#")
+		if v := strings.TrimSpace(value); !ok || v != "" && v != "[]" {
+			return nil, errors.New("config: cannot add the first node to this nodes list; write \"nodes: []\" on a line of its own")
+		}
+		lines[key.Line-1] = "nodes:\n"
+		if commented {
+			lines[key.Line-1] = "nodes:   #" + comment + "\n"
+		}
+		nextKeyLine = key.Line + 1 // the item goes right below the key
+		if nextKeyLine > len(lines) {
+			nextKeyLine = 0
+		}
+	case seq.Kind != yaml.SequenceNode || seq.Style&yaml.FlowStyle != 0:
+		return nil, errors.New("config: add-node needs a block-style nodes list (\"nodes:\" followed by \"- ...\" lines); add this node by hand")
+	default:
+		// An item's column is where its content starts, after "- ".
+		if indent = seq.Content[0].Column - 3; indent < 0 {
+			return nil, errors.New("config: cannot tell how the nodes list is indented; add this node by hand")
+		}
 	}
 
-	item, err := yaml.Marshal(n)
+	item, err := n.yaml()
 	if err != nil {
 		return nil, err
 	}
@@ -76,16 +121,12 @@ func AddNode(data []byte, n NewNode) ([]byte, error) {
 		block.WriteString(pad + lead + l + "\n")
 	}
 
-	lines := strings.SplitAfter(string(data), "\n")
-	if lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
 	at := len(lines) // index to insert before
 	if nextKeyLine > 0 {
 		at = nextKeyLine - 1
 	}
 	// Blank lines and top-level comments above the next key belong to it.
-	for at > 0 {
+	for at > 0 && len(old.Nodes) > 0 {
 		l := lines[at-1]
 		if strings.TrimSpace(l) != "" && !strings.HasPrefix(l, "#") {
 			break
@@ -114,7 +155,7 @@ func AddNode(data []byte, n NewNode) ([]byte, error) {
 		return nil, errors.New("config: could not find where the nodes list ends; add this node by hand")
 	}
 	last := c.Nodes[len(c.Nodes)-1]
-	if last.ID != n.ID || last.Token != n.Token || last.Addr != n.Addr {
+	if last.ID != n.ID || last.Token != n.Token || last.Ping.Addr != n.PingAddr {
 		return nil, errors.New("config: could not find where the nodes list ends; add this node by hand")
 	}
 	for i := range old.Nodes {

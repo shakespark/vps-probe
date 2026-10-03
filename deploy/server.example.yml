@@ -1,142 +1,133 @@
-# vps-probe-server 配置。含全部节点的 token：
-#   chown root:vps-probe-server server.yml && chmod 640 server.yml
-# 其他用户可读或组可写时服务端拒绝启动。
+# vps-probe-server 的配置，安装为 /etc/vps-probe/server.yml。
+# 里面有全部节点的 token：root:vps-probe-server，权限 0640（install.sh 会设好）。
+# 其他用户可读或组可写时服务端拒绝启动。改完执行 `vps-probe-server check`，再重启服务。
 
 listen:
-  web: 127.0.0.1:8080       # 只给本机的 cloudflared 用，不要改成 0.0.0.0
-  ingest: ":9527"           # UDP，agent 上报，同时监听 IPv4/IPv6；防火墙只对各 VPS 的 IP 放行
+  web: 127.0.0.1:8080       # 网页，只给本机的反向代理或 cloudflared 用，不要改成 0.0.0.0
+  ingest: ":9527"           # UDP，agent 上报用，IPv4 和 IPv6 都监听；防火墙要放行
 
-# 全部数据都在这一个文件里（停机后只剩它一个文件）。
+# agent 用哪个地址上报到这里（本机的域名或公网 IP 加上面的端口）。
+# 服务端自己不用它，只写进它生成的 agent 配置里。
+# public_addr: probe.example.com:9527
+
+# 全部数据都在这一个文件里。
 db: /var/lib/vps-probe-server/probe.db
 
-# 按日流量的日期划分，须与各 agent 的 traffic.timezone 一致。
+# 每日流量按哪个时区分日，到期日和通知里的时间也按它算。
 timezone: Asia/Shanghai
 
-# 可选：agent 上报用的地址（本机的域名或公网 IP + ingest 端口）。写了以后
-# add-node / install-cmd / agent-config 不用再带 -server。服务端自己不使用它。
-# server_addr: probe.example.com:9527
+# 节点。页面上的顺序就是这里的顺序。
+# 加节点用 `vps-probe-server add-node -id ...`：它生成 token、把节点追加到这个列表
+# 末尾，并打印在那台 VPS 上安装 agent 的一行命令。下面注释里是一个节点能写的全部设置。
+nodes: []
+  # - id: hk-1                    # 字母、数字和 . _ -；agent 配置里的 node 要和它一样
+  #   name: 香港 1                # 可选：页面上显示的名字
+  #   token: "<每台一个，gen-token 生成>"
+  #   region: HK                  # 可选：地区代码，卡片上的角标
+  #   group: 亚洲                 # 可选：总览页按分组切换
+  #   traffic:                    # 可选：流量配额和计费周期
+  #     quota_gb: 1000            # GB 按 1024³ 字节计；不写或 0 表示不限
+  #     quota_mode: sum           # 配额算哪部分：sum 收+发（默认）| max 取大 | tx 只算发 | rx 只算收
+  #     reset_day: 1              # 周期在每月几号开始，默认 1；当月没有这一天时用月末
+  #     reset_time: "00:00"       # 周期在当天几点开始，默认 00:00，按 timezone
+  #   plan:                       # 可选：套餐，显示在卡片上，到期前提醒
+  #     expire_at: 2027-03-15     # 到期日
+  #     renew_months: 12          # 自动续费周期（月）：过了到期日自动顺延；不写则显示「已过期」
+  #     price: "$10/年"           # 只用于显示
+  #   ping:                       # 可选：时延互测
+  #     addr: 203.0.113.5         # 其他节点 ping 它用的地址；不写就没有节点 ping 它
+  #     exclude: [jp-1]           # 和这些节点互不 ping（双向，写在任意一方即可）
+  #     extra:                    # 这个节点额外 ping 的目标（不是节点），常用来测隧道，见 docs/tunnels.md
+  #       - { name: cf-vpn, addr: 1.1.1.1 }                          # VPN 型隧道：路由要走隧道
+  #       - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }   # 本地端口转发到 1.1.1.1:53
+  #       - { name: hk1-via-sgp, addr: "127.0.0.1:39527", type: echo, key: "<对端 echo.yml 的 key>" }
+# traffic 里的周期设置和 ping 这一段只用来生成各节点的 agent 配置：改了以后要在那台
+# 节点上重新安装配置（`vps-probe-server install-cmd -node ID`）才生效。
 
-nodes:
-  # id 与 agent 配置里的 node 一致；各 agent 的 ping.peers[].name 也写这个 id。
-  # 加节点最省事的办法是 `vps-probe-server add-node -id ...`（README 第 4 步），它会生成 token
-  # 并把节点追加到这个列表末尾；也可以手写，token 用 `vps-probe-server gen-token` 生成，每台一个。
-  # addr：其他节点 ping 它用的地址；reset_day：流量周期起始日（默认 1）；
-  # reset_time：周期在当天几点开始（"HH:MM"，默认 00:00，按 timezone 计）；
-  # no_ping：与哪些节点互不 ping（双向，写在任意一方即可）；
-  # extra_peers：该节点额外 ping 的非节点目标（name 不能与节点 id 重名），
-  #   type: dns / echo 时 addr 写 host:port，测 UDP DNS 查询或隧道回显往返
-  #   （用于端口转发隧道，需 agent ≥ 0.1.4；echo 还要写应答端的 key）。
-  # 这几项只用于 `vps-probe-server agent-config` 生成 agent.yml。
-  - id: hk-1
-    name: 香港 1
-    token: "REPLACE-WITH-gen-token-OUTPUT-000000000"
-    traffic_quota_gb: 1000      # 可选，GB 按 1024³ 字节计；0 或不写表示不限
-    traffic_quota_mode: sum     # sum(收+发) | max(取大) | tx | rx
-    addr: 203.0.113.5
-    # 可选：套餐信息，显示在总览卡片上，到期前按 expiry 规则提醒。
-    expire_at: 2027-03-15       # 到期日，按 timezone 计
-    renew_months: 12            # 可选：自动续费周期（月），过了到期日自动顺延；不写则过期后显示「已过期」
-    price: "$10/年"             # 可选：只用于显示
-    region: HK                  # 可选：地区代码，卡片上的角标
-    group: 亚洲                 # 可选：总览按分组切换（页面默认顺序 = 本文件里的顺序）
-  - id: jp-1
-    name: 日本 1
-    token: "REPLACE-WITH-ANOTHER-gen-token-OUTPUT-01"
-    # no_ping: [hk-1]          # 可选：hk-1 和 jp-1 互不 ping
-    # extra_peers:              # 可选：经隧道到 1.1.1.1 的时延
-    #   - { name: cf-vpn, addr: 1.1.1.1 }                          # VPN 型隧道，路由要走隧道
-    #   - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }   # 本地端口经转发到 1.1.1.1:53
-    #   - { name: hk1-via-sgp, addr: "127.0.0.1:39527", type: echo, key: "<hk-1 上 echo.yml 的 key>" }
-
-# 超过这么久没有新报文，页面上就显示离线，约为 agent interval 的 3 倍。
-# 离线告警由下面的 offline 规则决定（默认 60s），所以页面先变红、稍后才发告警，这是正常的。
-offline_after: 30s
-
-# 可选。telegram 和 webhooks 都不配置时，告警照常评估并记录在页面上，只是不发送。
-# 配置后用 `vps-probe-server test-notify` 发一条测试消息检查。
-# bot 只用来发消息，服务端不接收任何 Telegram 消息。
-# telegram:
-#   bot_token: "123456789:AA..."
-#   chat_id: 123456789          # 个人 chat id 或群组 id（负数），不用加引号
-
-# 可选：更多通知渠道。每条告警消息对每个 webhook 发一个 HTTP 请求，和 Telegram 并行。
-# {{title}} 是消息第一行，{{message}} 是全文：在 url 里自动做 URL 编码；在 JSON body 里
-# 自动变成带引号的 JSON 字符串（所以模板里不要再加引号）。只发不收，响应内容不使用。
-# 配好后用 `vps-probe-server test-notify` 检查。更多写法见 README 第 5 步。
-# webhooks:
-#   - name: bark                    # 渠道名：出现在日志和告警页
+# 通知渠道，可以有多个；一个都不配时，告警照常评估并记录在页面上，只是不发送。
+# 只发不收：服务端不读取任何渠道发来的消息。配好后用 `vps-probe-server test-notify` 检查。
+# notify:
+#   - type: telegram
+#     bot_token: "123456789:AA..."
+#     chat_id: 123456789        # 个人或群组的 chat id（群组是负数），不用加引号
+#   # webhook：每条消息发一个 HTTP 请求。{{title}} 是消息第一行，{{message}} 是全文：
+#   # 在 url 里自动做 URL 编码；在 JSON body 里自动变成带引号的 JSON 字符串
+#   # （所以模板里不要再加引号）。更多写法见 docs/alerts.md。
+#   - type: webhook
+#     name: bark                # 渠道名，出现在日志和告警页
 #     url: "https://api.day.app/你的KEY/{{title}}/{{message}}"
 #     method: GET
-#   - name: discord
+#   - type: webhook
+#     name: discord
 #     url: "https://discord.com/api/webhooks/ID/TOKEN"
 #     body: '{"content": {{message}}}'
-#   - name: ntfy
+#   - type: webhook
+#     name: ntfy
 #     url: "https://ntfy.sh/你的主题"
 #     headers: { Title: "vps-probe", Content-Type: text/plain }
 #     body: "{{message}}"
 
-# 可选，但接入 Cloudflare Access 后强烈建议打开：每个网页请求都必须带有效的
-# Access 令牌，否则 403。先确认经 Access 能正常登录访问，再加这段并重启（见 README 第 3 步）。
+# 网页的登录保护，两种方式二选一，见 README 第 3 步。
+# cf_access：经 Cloudflare Access 访问时，要求每个请求都带有效的 Access 令牌。
 # cf_access:
 #   team_domain: myteam.cloudflareaccess.com
-#   aud: "0123...（64 位十六进制 AUD tag）"
-
-# 可选，不用 Cloudflare Access 时用：网页要求用户名和密码（HTTP Basic）。和 cf_access 二选一。
-# 密码随每个请求发送，必须放在 HTTPS 反向代理后面，listen.web 保持 127.0.0.1（见 README 第 3 步 B）。
+#   aud: "0123...（64 位十六进制的 AUD tag）"
+# basic_auth：用户名和密码（HTTP Basic），必须放在 HTTPS 反向代理后面。
 # password_hash 用 `vps-probe-server hash-password` 生成。
 # basic_auth:
 #   user: admin
 #   password_hash: "$2a$12$..."
 
-# 告警规则，见 docs/DESIGN.md §7。整段不写 = 使用下面这组默认规则；写 `alerts: []` = 不告警。
-# metric: cpu | steal | load1 | mem | swap | disk | offline | ping_loss | ping_avg | net_in | net_out | pps_in | pps_out | softirq | traffic | expiry | ip_change | period_report | weekly_report
+# 告警规则：某个指标满足条件并持续一段时间后告警，不再满足后恢复。
+# 整段不写 = 使用下面这一组；写 `alerts: []` = 不要告警。
+# metric：offline | cpu | steal | softirq | load1 | mem | swap | disk | ping_loss | ping_avg |
+#         net_in | net_out | pps_in | pps_out（各指标的含义和单位见 docs/alerts.md）
 alerts:
   - name: offline
     metric: offline
-    for: 60s                  # 超过 60s 没有新报文
+    for: 60s                  # 超过这么久没有新报文（页面在 30 秒后就显示离线）
   - name: cpu_high
     metric: cpu
     op: ">"
     threshold: 90
     for: 5m                   # 持续多久才告警
-    # nodes: [hk-1]           # 默认 all
-    # exclude: [hk-2]         # 配合 nodes: all，除这些节点外全部（新加的节点自动包含）
-    # repeat: 1h              # 仍未恢复时每隔多久提醒一次，默认不提醒
-    # notify_recovery: false  # 默认恢复时也发消息
+    # nodes: [hk-1]           # 只对这些节点；默认全部
+    # exclude: [jp-1]         # 全部节点中排除这些（新加的节点自动包含）
+    # repeat: 1h              # 仍未恢复时每隔多久提醒一次；默认不提醒
+    # notify_recovery: false  # 恢复时不发消息；默认发
   - name: mem_high
     metric: mem
     op: ">"
     threshold: 90
     for: 5m
   - name: disk_full
-    metric: disk              # 每个挂载点分别评估
+    metric: disk              # 每个挂载点分别判断
     op: ">"
     threshold: 90
     for: 10m
   - name: link_loss
-    metric: ping_loss         # 每条 (发起, 目标) 链路按最近 60s 汇总
-                              # 目标节点离线时不报（离线告警已覆盖）
-    op: ">"
+    metric: ping_loss         # 每条链路（发起 → 目标）分别判断，按最近 60 秒汇总；
+    op: ">"                   # 目标节点离线时不报，离线告警已经说明了
     threshold: 20
     for: 3m
   - name: ddos
-    metric: net_in            # 入站 Mbps，最近 60s 平均，各网卡相加
+    metric: net_in            # 入站 Mbps，最近 60 秒平均，各网卡相加
     op: ">="
     threshold: 50
-    ratio: 4                  # 且入站 >= 4 倍出站：中转的对称大流量不报
+    ratio: 4                  # 并且入站不低于出站的 4 倍：中转的对称大流量不报
     for: 2m
     # exclude: [home-1]       # 以下载为主的节点
   - name: abuse_out
-    metric: net_out           # 出站远大于入站：机器可能被利用去打别人
+    metric: net_out           # 出站远大于入站：机器可能被利用去攻击别人
     op: ">="
     threshold: 50
     ratio: 4
     for: 5m
     # exclude: [seedbox-1]    # 做种的节点
-  # 不在默认规则里（需 agent >= 0.1.14）：入站包数过多，如 SYN flood（字节速率不高、包很小）。
-  # 阈值先看几天节点详情的「包速率」图再定。
+  # 不在默认规则里：包数过多的攻击（SYN flood 之类，字节速率不高、包很小）。
+  # 阈值先看几天节点详情页的「包速率」图再定。
   # - name: pps_flood
-  #   metric: pps_in          # 包/秒，最近 60s 平均，各网卡相加
+  #   metric: pps_in          # 包/秒，最近 60 秒平均，各网卡相加
   #   op: ">="
   #   threshold: 50000
   #   for: 1m
@@ -145,28 +136,27 @@ alerts:
   #   op: ">"
   #   threshold: 30
   #   for: 2m
-  - name: traffic_quota
-    metric: traffic           # 只对设置了 traffic_quota_gb 的节点生效
-    levels: [80, 90, 100]     # 每个周期每档只提醒一次
-  - name: expiry
-    metric: expiry            # 只对写了 expire_at 的节点生效
-    levels: [7, 1]            # 到期前几天提醒（0 = 当天），每个到期日每档一次
-  - name: period_report
-    metric: period_report     # 每个节点的流量周期结束时发一份结算
-  - name: weekly_report
-    metric: weekly_report     # 每周一份所有节点的流量汇总
-    at: "Mon 09:00"           # 星期（Mon…Sun）+ 时刻，按 timezone
-  # 不在默认规则里：上报来源 IP 变了就通知一次（第一次看到的 IP 只记录）。
-  # 动态 IP 的节点会经常触发，可用 nodes 只选固定 IP 的节点。
-  # - name: ip_change
-  #   metric: ip_change
+
+# 报告：发生一次就通知一次的事，没有「恢复」。每种最多写一条，都可以带 nodes / exclude。
+# 整段不写 = 使用下面这一组；写 `reports: []` = 都不要。
+reports:
+  - type: traffic_quota       # 流量用到配额的这些百分比时提醒；每个周期每档一次
+    levels: [80, 90, 100]
+  - type: expiry              # 到期前这些天提醒（0 = 当天）；每个到期日每档一次
+    days: [7, 1]
+  - type: period              # 每个节点的流量周期结束时发一份结算
+  - type: weekly              # 每周一份全部节点的流量汇总
+    at: "Mon 09:00"           # 星期（Mon…Sun）和时刻，按 timezone
+  # 不在默认里：上报来源 IP 变了就通知（第一次见到的 IP 只记录）。
+  # 动态 IP 的节点会经常触发，可以用 nodes 只选固定 IP 的。
+  # - type: ip_change
   #   nodes: [hk-1]
 
 retention:
-  raw: 48h                  # 10s 原始数据
+  raw: 48h                  # 10 秒一个点的原始数据
   m5: 30d                   # 5 分钟聚合
   h1: 400d                  # 1 小时聚合
 
 backup:
   dir: /var/lib/vps-probe-server/backups
-  keep: 7                   # 每天 04:00 后备份一份；0 表示关闭
+  keep: 7                   # 每天 04:00 后备份一份，保留这么多份；0 表示不备份

@@ -1,0 +1,43 @@
+# Tests every push and pull request. The release workflow runs the same
+# checks again before it builds a tag.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Any recent Go will do: the Makefile pins the exact toolchain from
+      # go.mod's toolchain line.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - run: make test
+
+      - name: Race detector
+        run: go test -race ./...
+
+      # The demo site's data must still match the API (node is preinstalled).
+      - run: make demo-check
+
+      - name: Shell scripts parse
+        run: for f in deploy/install.sh scripts/*.sh; do sh -n "$f" || exit 1; done
+
+      - run: make build

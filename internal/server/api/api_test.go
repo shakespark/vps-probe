@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	pb "vpsprobe/internal/proto/probev1"
-	"vpsprobe/internal/server/alert"
-	"vpsprobe/internal/server/config"
-	"vpsprobe/internal/server/store"
-	"vpsprobe/web"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/server/alert"
+	"github.com/shakespark/vps-probe/internal/server/config"
+	"github.com/shakespark/vps-probe/internal/server/store"
+	"github.com/shakespark/vps-probe/web"
 )
 
 type noStats struct{}
@@ -25,14 +26,23 @@ func (noStats) Stats() map[string]uint64 { return map[string]uint64{"accepted": 
 
 type noAlerts struct{}
 
-func (noAlerts) Active() []alert.Active { return []alert.Active{} }
+func (noAlerts) Active() []alert.Active  { return []alert.Active{} }
+func (noAlerts) Rules() []alert.RuleView { return []alert.RuleView{} }
+
+// The current billing period of the test reports: this month.
+func thisPeriod() *pb.Period {
+	y, m, _ := time.Now().Date()
+	start := time.Date(y, m, 1, 0, 0, 0, 0, time.UTC)
+	return &pb.Period{Start: start.Unix(), End: start.AddDate(0, 1, 0).Unix()}
+}
 
 func setup(t *testing.T) (http.Handler, *store.Store) {
 	t.Helper()
 	cfg, err := config.Parse([]byte(`
 nodes:
-  - {id: hk-1, name: 香港, token: abcdefghijklmnopqrstuvwxyz0123456789, traffic_quota_gb: 1000,
-     expire_at: 2099-01-01, renew_months: 12, price: "$10/年", region: hk, group: 亚洲}
+  - {id: hk-1, name: 香港, token: abcdefghijklmnopqrstuvwxyz0123456789, region: hk, group: 亚洲,
+     traffic: {quota_gb: 1000, quota_mode: max},
+     plan: {expire_at: 2099-01-01, renew_months: 12, price: "$10/年"}}
   - {id: jp-1, token: bcdefghijklmnopqrstuvwxyz0123456789a}
 `))
 	if err != nil {
@@ -82,10 +92,14 @@ func TestReadOnlyRoutes(t *testing.T) {
 		"/api/ping/availability":                             200,
 		"/api/ping/availability?range=7d":                    200,
 		"/api/ping/availability?range=1y":                    400,
-		"/api/ping/hk-1/jp-1":                                200,
-		"/api/ping/nope/jp-1":                                404,
+		"/api/nodes/hk-1/ping":                               200,
+		"/api/nodes/hk-1/ping/jp-1":                          200,
+		"/api/nodes/nope/ping/jp-1":                          404,
 		"/api/traffic":                                       200,
-		"/api/traffic/hk-1/daily?period=bad":                 400,
+		"/api/traffic?periods=99":                            400,
+		"/api/nodes/hk-1/traffic/daily":                      200,
+		"/api/nodes/hk-1/traffic/daily?period=bad":           400,
+		"/api/nodes/nope/traffic/daily":                      404,
 		"/api/stats":                                         200,
 		"/api/alerts":                                        200,
 		"/api/alerts?from=x":                                 400,
@@ -106,50 +120,85 @@ func TestReadOnlyRoutes(t *testing.T) {
 func TestNodesView(t *testing.T) {
 	h, st := setup(t)
 	now := time.Now()
+	cur := thisPeriod()
+	cur.Rx, cur.Tx = 10, 20
 	st.Write("hk-1", &pb.Report{Ts: now.Unix(), Cpu: &pb.CPU{Usage: 50},
-		Traffic: []*pb.IfaceTraffic{{Iface: "eth0", Cur: &pb.Period{Start: "2026-09-01", Rx: 10, Tx: 20}}}}, netip.MustParseAddr("192.0.2.7"), now)
+		Traffic: []*pb.IfaceTraffic{{Iface: "eth0", Cur: cur}}}, netip.MustParseAddr("192.0.2.7"), now)
 
 	var nodes []struct {
-		ID      string  `json:"id"`
-		Name    string  `json:"name"`
-		Online  bool    `json:"online"`
-		QuotaGB float64 `json:"traffic_quota_gb"`
-		Expire  string  `json:"expire_at"`
-		Days    *int    `json:"expire_days"`
-		Price   string  `json:"price"`
-		Region  string  `json:"region"`
-		Group   string  `json:"group"`
-		Status  *struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Online bool   `json:"online"`
+		Region string `json:"region"`
+		Group  string `json:"group"`
+		Plan   *struct {
+			ExpireAt string `json:"expire_at"`
+			Days     int    `json:"days"`
+			Price    string `json:"price"`
+		} `json:"plan"`
+		Quota *struct {
+			Bytes, Used int64
+			Mode        string
+		} `json:"quota"`
+		Status *struct {
 			CPU     *float64 `json:"cpu"`
 			IP      string   `json:"ip"`
-			Traffic *struct{ RX, TX int64 }
+			Traffic *struct{ Start, End, RX, TX int64 }
 		} `json:"status"`
 	}
 	rec := get(t, h, "GET", "/api/nodes")
 	if err := json.Unmarshal(rec.Body.Bytes(), &nodes); err != nil {
 		t.Fatal(err)
 	}
-	if len(nodes) != 2 || nodes[0].ID != "hk-1" || nodes[0].Name != "香港" || !nodes[0].Online || nodes[0].QuotaGB != 1000 {
+	if len(nodes) != 2 || nodes[0].ID != "hk-1" || nodes[0].Name != "香港" || !nodes[0].Online ||
+		nodes[0].Region != "HK" || nodes[0].Group != "亚洲" {
 		t.Fatalf("nodes: %s", rec.Body)
 	}
-	if *nodes[0].Status.CPU != 50 || nodes[0].Status.Traffic.TX != 20 || nodes[0].Status.IP != "192.0.2.7" {
+	if st := nodes[0].Status; *st.CPU != 50 || st.Traffic.TX != 20 || st.Traffic.End != cur.End || st.IP != "192.0.2.7" {
 		t.Fatalf("status: %s", rec.Body)
 	}
-	if nodes[0].Expire != "2099-01-01" || nodes[0].Days == nil || *nodes[0].Days < 20000 || nodes[0].Price != "$10/年" ||
-		nodes[0].Region != "HK" || nodes[0].Group != "亚洲" {
+	// The quota counts the larger direction (quota_mode: max).
+	if q := nodes[0].Quota; q == nil || q.Bytes != 1000<<30 || q.Used != 20 || q.Mode != "取大" {
+		t.Fatalf("quota: %s", rec.Body)
+	}
+	if p := nodes[0].Plan; p == nil || p.ExpireAt != "2099-01-01" || p.Days < 20000 || p.Price != "$10/年" {
 		t.Fatalf("plan: %s", rec.Body)
 	}
-	if nodes[1].Online || nodes[1].Status != nil || nodes[1].Name != "jp-1" || nodes[1].Days != nil {
+	if n := nodes[1]; n.Online || n.Status != nil || n.Name != "jp-1" || n.Plan != nil || n.Quota != nil {
 		t.Fatalf("silent node: %s", rec.Body)
 	}
 
-	if rec = get(t, h, "GET", "/api/stats"); !strings.Contains(rec.Body.String(), `"version":"9.9.9"`) {
+	if rec = get(t, h, "GET", "/api/stats"); !strings.Contains(rec.Body.String(), `"version":"9.9.9"`) ||
+		!strings.Contains(rec.Body.String(), `"interval":10`) {
 		t.Fatalf("stats: %s", rec.Body)
 	}
-
-	rec = get(t, h, "GET", "/api/traffic/hk-1/daily")
-	if !strings.Contains(rec.Body.String(), `"period":"2026-09-01"`) {
+	if rec = get(t, h, "GET", "/api/traffic"); !strings.Contains(rec.Body.String(), `"billable":20`) ||
+		!strings.Contains(rec.Body.String(), `"used":20`) {
+		t.Fatalf("traffic: %s", rec.Body)
+	}
+	rec = get(t, h, "GET", "/api/nodes/hk-1/traffic/daily")
+	if !strings.Contains(rec.Body.String(), fmt.Sprintf(`"period":%d`, cur.Start)) || !strings.Contains(rec.Body.String(), `"rx":10`) {
 		t.Fatalf("daily: %s", rec.Body)
+	}
+}
+
+// One request returns the node's links to all its peers.
+func TestNodePings(t *testing.T) {
+	h, st := setup(t)
+	now := time.Now()
+	st.Write("hk-1", &pb.Report{Ts: now.Unix() - 20, Pings: []*pb.Ping{
+		{Target: "jp-1", Sent: 10, Lost: 1, Min: 1, Avg: 2, Max: 3},
+		{Target: "cf", Sent: 10, Lost: 10}}}, netip.Addr{}, now)
+	var got map[string]struct {
+		TS   []int64               `json:"ts"`
+		Cols map[string][]*float64 `json:"cols"`
+	}
+	rec := get(t, h, "GET", "/api/nodes/hk-1/ping")
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || *got["jp-1"].Cols["avg"][0] != 2 || got["cf"].Cols["avg"][0] != nil || *got["cf"].Cols["loss_pct"][0] != 100 {
+		t.Fatalf("pings: %s", rec.Body)
 	}
 }
 
@@ -197,11 +246,11 @@ func TestUI(t *testing.T) {
 func TestAlertsFilter(t *testing.T) {
 	h, st := setup(t)
 	now := time.Now().Unix()
-	if err := st.SaveAlerts(nil, nil, []store.AlertEvent{
-		{TS: now - 20, Rule: "cpu_high", Node: "hk-1", Event: "firing", Message: "a"},
+	if err := st.SaveAlerts(store.AlertChanges{Events: []store.AlertEvent{
+		{TS: now - 20, Rule: "cpu_high", Node: "hk-1", Event: "firing", Value: "95.0%", Message: "a"},
 		{TS: now - 10, Rule: "offline", Node: "jp-1", Event: "firing", Message: "b"},
 		{TS: now, Rule: "cpu_high", Node: "hk-1", Event: "recovered", Message: "c"},
-	}); err != nil {
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	var got struct {
@@ -216,7 +265,7 @@ func TestAlertsFilter(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatal(err, rec.Body.String())
 	}
-	if len(got.History) != 1 || got.History[0].Message != "a" || got.Truncated {
+	if len(got.History) != 1 || got.History[0].Message != "a" || got.History[0].Value != "95.0%" || got.Truncated {
 		t.Fatalf("history %+v truncated=%v", got.History, got.Truncated)
 	}
 	// Facets cover the whole range, not just the filtered rows.

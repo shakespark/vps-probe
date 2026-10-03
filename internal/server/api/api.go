@@ -1,5 +1,9 @@
 // Package api serves the read-only JSON API. It registers GET routes only;
 // nothing reachable over HTTP can change data or configuration.
+//
+// Responses say what the page shows: what counts against a quota, whether a
+// node is online and how an alert's value reads are decided here, once, and
+// not again in the browser.
 package api
 
 import (
@@ -13,9 +17,10 @@ import (
 	"strings"
 	"time"
 
-	"vpsprobe/internal/server/alert"
-	"vpsprobe/internal/server/config"
-	"vpsprobe/internal/server/store"
+	"github.com/shakespark/vps-probe/internal/server/alert"
+	"github.com/shakespark/vps-probe/internal/server/config"
+	"github.com/shakespark/vps-probe/internal/server/store"
+	"github.com/shakespark/vps-probe/internal/wire"
 )
 
 const (
@@ -32,6 +37,7 @@ type Stats interface {
 // Alerts exposes the evaluator's current state.
 type Alerts interface {
 	Active() []alert.Active
+	Rules() []alert.RuleView
 }
 
 type API struct {
@@ -63,18 +69,23 @@ func (a *API) Handler(ui http.Handler) http.Handler {
 		mux.Handle("GET /{$}", ui)
 		mux.Handle("GET /static/", ui)
 	}
+	// Every node at a glance.
 	mux.HandleFunc("GET /api/nodes", a.nodes)
 	mux.HandleFunc("GET /api/sparks", a.sparks)
-	mux.HandleFunc("GET /api/nodes/{id}/metrics", a.metrics)
-	mux.HandleFunc("GET /api/nodes/{id}/net", a.net)
-	mux.HandleFunc("GET /api/nodes/{id}/disks", a.disks)
+	mux.HandleFunc("GET /api/traffic", a.traffic)
+	// One node's history; ?from&to in unix seconds, the last hour by default.
+	mux.HandleFunc("GET /api/nodes/{id}/metrics", series(a, (*store.Store).Metrics))
+	mux.HandleFunc("GET /api/nodes/{id}/net", series(a, (*store.Store).Net))
+	mux.HandleFunc("GET /api/nodes/{id}/disks", series(a, (*store.Store).Disks))
+	mux.HandleFunc("GET /api/nodes/{id}/ping", series(a, (*store.Store).Pings))
+	mux.HandleFunc("GET /api/nodes/{id}/ping/{dst}", a.ping)
+	mux.HandleFunc("GET /api/nodes/{id}/traffic/daily", a.daily)
+	// Every link.
 	mux.HandleFunc("GET /api/ping/matrix", a.matrix)
 	mux.HandleFunc("GET /api/ping/availability", a.availability)
-	mux.HandleFunc("GET /api/ping/{src}/{dst}", a.ping)
-	mux.HandleFunc("GET /api/traffic", a.traffic)
-	mux.HandleFunc("GET /api/traffic/{id}/daily", a.daily)
-	mux.HandleFunc("GET /api/stats", a.stats)
+
 	mux.HandleFunc("GET /api/alerts", a.alertsView)
+	mux.HandleFunc("GET /api/stats", a.stats)
 	return secure(mux)
 }
 
@@ -93,39 +104,64 @@ func secure(h http.Handler) http.Handler {
 }
 
 type nodeView struct {
-	ID        string  `json:"id"`
-	Name      string  `json:"name"`
-	Online    bool    `json:"online"`
-	QuotaGB   float64 `json:"traffic_quota_gb,omitempty"`
-	QuotaMode string  `json:"traffic_quota_mode"`
-	// Next expiry date (rolled forward for renew_months) and days left
-	// in the server timezone; absent without expire_at.
-	ExpireAt    string        `json:"expire_at,omitempty"`
-	ExpireDays  *int          `json:"expire_days,omitempty"`
-	RenewMonths int           `json:"renew_months,omitempty"`
-	Price       string        `json:"price,omitempty"`
-	Region      string        `json:"region,omitempty"`
-	Group       string        `json:"group,omitempty"`
-	Status      *store.Status `json:"status"` // null if it never reported
+	ID     string        `json:"id"`
+	Name   string        `json:"name"`
+	Region string        `json:"region,omitempty"`
+	Group  string        `json:"group,omitempty"`
+	Online bool          `json:"online"`
+	Plan   *planView     `json:"plan"`   // null without an expiry date
+	Quota  *quotaView    `json:"quota"`  // null when unlimited
+	Status *store.Status `json:"status"` // null if it never reported
+}
+
+// planView is the node's plan as of now: the next expiry date (rolled
+// forward for a renewing plan) and the days left in the server's timezone
+// (0 = today, negative = past).
+type planView struct {
+	ExpireAt    string `json:"expire_at"`
+	Days        int    `json:"days"`
+	RenewMonths int    `json:"renew_months,omitempty"`
+	Price       string `json:"price,omitempty"`
+}
+
+// quotaView is a node's allowance and what the current period has used of
+// it, counted the way the quota's mode says.
+type quotaView struct {
+	Bytes int64  `json:"bytes"`
+	Mode  string `json:"mode"` // in words, e.g. "收+发"
+	Used  int64  `json:"used"`
+}
+
+func quota(n *config.Node, cur *store.Period) *quotaView {
+	if n.Traffic.Quota() == 0 {
+		return nil
+	}
+	q := &quotaView{Bytes: n.Traffic.Quota(), Mode: n.Traffic.QuotaModeText()}
+	if cur != nil {
+		q.Used = n.Traffic.Billable(cur.RX, cur.TX)
+	}
+	return q
 }
 
 func (a *API) nodes(w http.ResponseWriter, r *http.Request) {
 	now := a.now()
 	out := make([]nodeView, 0, len(a.cfg.Nodes))
-	for _, n := range a.cfg.Nodes {
+	for i := range a.cfg.Nodes {
+		n := &a.cfg.Nodes[i]
 		st, err := a.store.Status(r.Context(), n.ID)
 		if err != nil {
 			a.fail(w, err)
 			return
 		}
-		v := nodeView{ID: n.ID, Name: n.Name, QuotaGB: n.QuotaGB, QuotaMode: n.QuotaMode,
-			RenewMonths: n.RenewMonths, Price: n.Price, Region: n.Region, Group: n.Group, Status: st}
-		if date, days, ok := n.Expiry(now, a.cfg.Location); ok {
-			v.ExpireAt, v.ExpireDays = date, &days
+		v := nodeView{ID: n.ID, Name: n.Name, Region: n.Region, Group: n.Group, Online: st.Online(now), Status: st}
+		if date, days, ok := n.Plan.Expiry(now, a.cfg.Location); ok {
+			v.Plan = &planView{ExpireAt: date, Days: days, RenewMonths: n.Plan.RenewMonths, Price: n.Plan.Price}
 		}
+		var cur *store.Period
 		if st != nil {
-			v.Online = now.Sub(time.Unix(st.FreshAt, 0)) < time.Duration(a.cfg.OfflineAfter)
+			cur = st.Traffic
 		}
+		v.Quota = quota(n, cur)
 		out = append(out, v)
 	}
 	writeJSON(w, out)
@@ -155,44 +191,32 @@ func (a *API) sparks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"from": from, "step": sparkStep, "n": sparkN, "nodes": nodes})
 }
 
-func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
-	id, from, to, ok := a.nodeRange(w, r)
-	if !ok {
-		return
+// series serves one kind of a node's history over ?from&to.
+func series[T any](a *API, query func(*store.Store, context.Context, string, int64, int64) (T, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := a.node(w, r)
+		if !ok {
+			return
+		}
+		from, to, ok := a.timeRange(w, r, defaultRange)
+		if !ok {
+			return
+		}
+		v, err := query(a.store, r.Context(), id, from, to)
+		a.reply(w, v, err)
 	}
-	s, err := a.store.Metrics(r.Context(), id, from, to)
-	a.reply(w, s, err)
-}
-
-func (a *API) net(w http.ResponseWriter, r *http.Request) {
-	id, from, to, ok := a.nodeRange(w, r)
-	if !ok {
-		return
-	}
-	s, err := a.store.Net(r.Context(), id, from, to)
-	a.reply(w, s, err)
-}
-
-func (a *API) disks(w http.ResponseWriter, r *http.Request) {
-	id, from, to, ok := a.nodeRange(w, r)
-	if !ok {
-		return
-	}
-	s, err := a.store.Disks(r.Context(), id, from, to)
-	a.reply(w, s, err)
 }
 
 func (a *API) ping(w http.ResponseWriter, r *http.Request) {
-	src, dst := r.PathValue("src"), r.PathValue("dst")
-	if _, ok := a.cfg.Node(src); !ok {
-		http.NotFound(w, r)
-		return
-	}
-	from, to, ok := a.timeRange(w, r)
+	id, ok := a.node(w, r)
 	if !ok {
 		return
 	}
-	s, err := a.store.Ping(r.Context(), src, dst, from, to)
+	from, to, ok := a.timeRange(w, r, defaultRange)
+	if !ok {
+		return
+	}
+	s, err := a.store.Ping(r.Context(), id, r.PathValue("dst"), from, to)
 	a.reply(w, s, err)
 }
 
@@ -251,11 +275,15 @@ func (a *API) matrix(w http.ResponseWriter, r *http.Request) {
 }
 
 type trafficView struct {
-	ID        string         `json:"id"`
-	Name      string         `json:"name"`
-	QuotaGB   float64        `json:"traffic_quota_gb,omitempty"`
-	QuotaMode string         `json:"traffic_quota_mode"`
-	Periods   []store.Period `json:"periods"` // newest first
+	ID      string       `json:"id"`
+	Name    string       `json:"name"`
+	Quota   *quotaView   `json:"quota"`   // null when unlimited
+	Periods []periodView `json:"periods"` // newest first
+}
+
+type periodView struct {
+	store.Period
+	Billable int64 `json:"billable"` // what counts against the quota
 }
 
 func (a *API) traffic(w http.ResponseWriter, r *http.Request) {
@@ -269,26 +297,39 @@ func (a *API) traffic(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 	out := make([]trafficView, 0, len(a.cfg.Nodes))
-	for _, n := range a.cfg.Nodes {
-		p, err := a.store.Periods(r.Context(), n.ID, limit)
+	for i := range a.cfg.Nodes {
+		n := &a.cfg.Nodes[i]
+		ps, err := a.store.Periods(r.Context(), n.ID, limit)
 		if err != nil {
 			a.fail(w, err)
 			return
 		}
-		out = append(out, trafficView{ID: n.ID, Name: n.Name, QuotaGB: n.QuotaGB, QuotaMode: n.QuotaMode, Periods: p})
+		v := trafficView{ID: n.ID, Name: n.Name, Quota: quota(n, nil), Periods: make([]periodView, len(ps))}
+		for i, p := range ps {
+			v.Periods[i] = periodView{p, n.Traffic.Billable(p.RX, p.TX)}
+		}
+		if v.Quota != nil && len(ps) > 0 {
+			v.Quota.Used = v.Periods[0].Billable
+		}
+		out = append(out, v)
 	}
 	writeJSON(w, out)
 }
 
-// daily: ?period=YYYY-MM-DD (period start); defaults to the current period.
+// daily: ?period=<start, unix seconds>; the current period by default.
 func (a *API) daily(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if _, ok := a.cfg.Node(id); !ok {
-		http.NotFound(w, r)
+	id, ok := a.node(w, r)
+	if !ok {
 		return
 	}
-	period := r.URL.Query().Get("period")
-	if period == "" {
+	var period int64
+	if v := r.URL.Query().Get("period"); v != "" {
+		var err error
+		if period, err = strconv.ParseInt(v, 10, 64); err != nil {
+			http.Error(w, "period: want its start in unix seconds", http.StatusBadRequest)
+			return
+		}
+	} else {
 		p, err := a.store.Periods(r.Context(), id, 1)
 		if err != nil {
 			a.fail(w, err)
@@ -299,9 +340,6 @@ func (a *API) daily(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		period = p[0].Start
-	} else if _, err := time.Parse(time.DateOnly, period); err != nil {
-		http.Error(w, "period: want YYYY-MM-DD", http.StatusBadRequest)
-		return
 	}
 	days, err := a.store.Daily(r.Context(), id, period)
 	if err != nil {
@@ -311,21 +349,18 @@ func (a *API) daily(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"period": period, "days": days})
 }
 
-const maxAlertHistory = 500
+const (
+	maxAlertHistory   = 500
+	alertHistoryRange = 7 * 24 * time.Hour
+)
 
-var alertEvents = []string{"firing", "repeat", "recovered", "level", "changed", "report"}
-
-// alertsView: current alerts, history in ?from&to (default: last 7 days,
+// alertsView: current alerts, history in ?from&to (default: the last 7 days;
 // newest first, at most 500) narrowed by ?node, ?rule and ?event (comma-
 // separated), the nodes and rules with history in the range (for filter
 // menus), and the rules in effect.
 func (a *API) alertsView(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	if q.Get("from") == "" {
-		q.Set("from", strconv.FormatInt(a.now().Add(-7*24*time.Hour).Unix(), 10))
-		r.URL.RawQuery = q.Encode()
-	}
-	from, to, ok := a.timeRange(w, r)
+	from, to, ok := a.timeRange(w, r, alertHistoryRange)
 	if !ok {
 		return
 	}
@@ -333,8 +368,8 @@ func (a *API) alertsView(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("event"); v != "" {
 		f.Events = strings.Split(v, ",")
 		for _, e := range f.Events {
-			if !slices.Contains(alertEvents, e) {
-				http.Error(w, "event: want a comma-separated list of "+strings.Join(alertEvents, ", "), http.StatusBadRequest)
+			if !slices.Contains(alert.Events, e) {
+				http.Error(w, "event: want a comma-separated list of "+strings.Join(alert.Events, ", "), http.StatusBadRequest)
 				return
 			}
 		}
@@ -352,7 +387,7 @@ func (a *API) alertsView(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"active": a.alerts.Active(), "history": hist,
 		"truncated": len(hist) == maxAlertHistory,
 		"facets":    map[string]any{"nodes": nodes, "rules": rules},
-		"rules":     a.cfg.Alerts, "channels": a.cfg.Channels()})
+		"rules":     a.alerts.Rules(), "channels": a.cfg.ChannelNames()})
 }
 
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {
@@ -362,21 +397,23 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"ingest": a.ingest.Stats(), "db_bytes": size, "server_time": a.now().Unix(),
-		"timezone": a.cfg.Timezone, "version": a.version})
+		"timezone": a.cfg.Timezone, "version": a.version, "interval": int(wire.Interval / time.Second)})
 }
 
-// nodeRange parses {id} plus ?from&to (unix seconds). Default: the last hour.
-func (a *API) nodeRange(w http.ResponseWriter, r *http.Request) (id string, from, to int64, ok bool) {
-	id = r.PathValue("id")
+// node returns the {id} of the path, or answers 404 if no such node is
+// configured.
+func (a *API) node(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id := r.PathValue("id")
 	if _, known := a.cfg.Node(id); !known {
 		http.NotFound(w, r)
-		return "", 0, 0, false
+		return "", false
 	}
-	from, to, ok = a.timeRange(w, r)
-	return id, from, to, ok
+	return id, true
 }
 
-func (a *API) timeRange(w http.ResponseWriter, r *http.Request) (from, to int64, ok bool) {
+// timeRange parses ?from&to (unix seconds). to defaults to now, from to
+// span before to.
+func (a *API) timeRange(w http.ResponseWriter, r *http.Request, span time.Duration) (from, to int64, ok bool) {
 	q := r.URL.Query()
 	to = a.now().Unix()
 	var err error
@@ -386,7 +423,7 @@ func (a *API) timeRange(w http.ResponseWriter, r *http.Request) (from, to int64,
 			return 0, 0, false
 		}
 	}
-	from = to - int64(defaultRange/time.Second)
+	from = to - int64(span/time.Second)
 	if v := q.Get("from"); v != "" {
 		if from, err = strconv.ParseInt(v, 10, 64); err != nil {
 			http.Error(w, "from: want unix seconds", http.StatusBadRequest)

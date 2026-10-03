@@ -1,4 +1,4 @@
-// Holds demo.js to the structure of the real API (docs/DESIGN.md §14.3):
+// Holds demo.js to the structure of the real API (docs/DESIGN.md §11):
 // for every endpoint in api-shape.json, the demo's answer must have the same
 // fields and types. Run with `make demo-check`; needs only node.
 'use strict';

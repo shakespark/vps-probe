@@ -5,7 +5,7 @@ import (
 	"time"
 	"unicode"
 
-	pb "vpsprobe/internal/proto/probev1"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
 )
 
 // Limits for values from an authenticated agent. A compromised or buggy
@@ -37,20 +37,12 @@ func Sanitize(rep *pb.Report) (dropped int) {
 			}
 		}
 	}
-	if c := rep.Cpu; c != nil && !(pct(c.Usage) && pct(c.Steal)) {
+	if c := rep.Cpu; c != nil && !(pct(c.Usage) && pct(c.Steal) && pct(c.Softirq)) {
 		rep.Cpu = nil
 		drop()
 	}
-	// Optional fields (agent >= 0.1.14) go on their own; the rest stays.
-	if c := rep.Cpu; c != nil && c.Softirq != nil && !pct(*c.Softirq) {
-		c.Softirq = nil
-		drop()
-	}
-	if l := rep.Load; l != nil && !(inRange(l.L1, 0, maxLoad) && inRange(l.L5, 0, maxLoad) && inRange(l.L15, 0, maxLoad)) {
+	if l := rep.Load; l != nil && !(inRange(l.L1, 0, maxLoad) && inRange(l.L5, 0, maxLoad) && inRange(l.L15, 0, maxLoad) && l.Threads <= maxCount) {
 		rep.Load = nil
-		drop()
-	} else if l != nil && l.Threads > maxCount {
-		l.Threads = 0
 		drop()
 	}
 	if k := rep.Sockets; k != nil && !(k.Tcp <= maxCount && k.Udp <= maxCount && k.TcpTw <= maxCount) {
@@ -66,16 +58,8 @@ func Sanitize(rep *pb.Report) (dropped int) {
 		return validName(d.Mount) && d.Total <= maxBytes && d.Used <= d.Total && d.Avail <= d.Total && pct(d.InodePct)
 	})
 	rep.Net = filter(rep.Net, &dropped, func(n *pb.NetRate) bool {
-		return validName(n.Iface) && n.RxRate <= maxRate && n.TxRate <= maxRate
+		return validName(n.Iface) && n.RxRate <= maxRate && n.TxRate <= maxRate && n.RxPps <= maxPPS && n.TxPps <= maxPPS
 	})
-	for _, n := range rep.Net {
-		for _, p := range []**uint64{&n.RxPps, &n.TxPps} {
-			if *p != nil && **p > maxPPS {
-				*p = nil
-				drop()
-			}
-		}
-	}
 	rep.Traffic = filter(rep.Traffic, &dropped, func(t *pb.IfaceTraffic) bool {
 		return validName(t.Iface) && validPeriod(t.Cur) && validPeriod(t.Prev)
 	})
@@ -108,11 +92,10 @@ func validPeriod(p *pb.Period) bool {
 	if p == nil {
 		return true
 	}
-	if p.Rx > maxBytes || p.Tx > maxBytes {
-		return false
-	}
-	t, err := time.Parse(time.DateOnly, p.Start)
-	return err == nil && t.Format(time.DateOnly) == p.Start
+	// A period is about a month; anything from a day to 32 of them is taken.
+	length := time.Duration(p.End-p.Start) * time.Second
+	return p.Rx <= maxBytes && p.Tx <= maxBytes && p.Start > 0 &&
+		length >= 24*time.Hour && length <= 32*24*time.Hour
 }
 
 func pct(v float32) bool { return inRange(v, 0, 100) }

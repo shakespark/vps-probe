@@ -15,13 +15,14 @@ import (
 	"testing"
 	"time"
 
-	pb "vpsprobe/internal/proto/probev1"
-	"vpsprobe/internal/server/alert"
-	"vpsprobe/internal/server/config"
-	"vpsprobe/internal/server/store"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
+	"github.com/shakespark/vps-probe/internal/server/alert"
+	"github.com/shakespark/vps-probe/internal/server/config"
+	"github.com/shakespark/vps-probe/internal/server/notify"
+	"github.com/shakespark/vps-probe/internal/server/store"
 )
 
-// The demo site (docs/DESIGN.md §14) answers the API from a script, which
+// The demo site (docs/DESIGN.md §11) answers the API from a script, which
 // goes stale silently when a response gains a field. This test pins the
 // structure of every response - names and types, no values - in
 // web/demo/api-shape.json; web/demo/check.js holds the demo to the same file.
@@ -45,19 +46,21 @@ var shapeEndpoints = []struct {
 	{Name: "metrics", Path: "/api/nodes/hk-1/metrics"},
 	{Name: "net", Path: "/api/nodes/hk-1/net", Dynamic: []string{""}},
 	{Name: "disks", Path: "/api/nodes/hk-1/disks", Dynamic: []string{""}},
-	{Name: "ping", Path: "/api/ping/hk-1/tyo-1"},
+	{Name: "pings", Path: "/api/nodes/hk-1/ping", Dynamic: []string{""}},
+	{Name: "ping", Path: "/api/nodes/hk-1/ping/tyo-1"},
 	{Name: "matrix", Path: "/api/ping/matrix?window=1h"},
 	{Name: "availability", Path: "/api/ping/availability?range=24h"},
 	{Name: "traffic", Path: "/api/traffic"},
-	{Name: "daily", Path: "/api/traffic/hk-1/daily"},
+	{Name: "daily", Path: "/api/nodes/hk-1/traffic/daily"},
 	{Name: "stats", Path: "/api/stats", Dynamic: []string{"ingest"}},
 	{Name: "alerts", Path: "/api/alerts"},
 }
 
-type oneActive struct{}
+// The real evaluator describes the rules; one alert is made to be active.
+type oneActive struct{ *alert.Evaluator }
 
 func (oneActive) Active() []alert.Active {
-	return []alert.Active{{Rule: "cpu_high", Metric: "cpu", Node: "hk-1", State: "firing", Since: 1, Value: 99}}
+	return []alert.Active{{Rule: "cpu_high", Node: "hk-1", Firing: true, Since: 1, Value: "99.0%"}}
 }
 
 // shapeOf reduces a decoded JSON value to its structure: "string", "number",
@@ -163,22 +166,20 @@ func emptyArrays(s any, path string) []string {
 	return out
 }
 
-func f32(v float32) *float32 { return &v }
-func u64(v uint64) *uint64   { return &v }
-
 func TestAPIShape(t *testing.T) {
 	cfg, err := config.Parse([]byte(`
 nodes:
-  - {id: hk-1, name: 香港, token: abcdefghijklmnopqrstuvwxyz0123456789, traffic_quota_gb: 1000,
-     expire_at: 2099-01-01, renew_months: 12, price: "$10/年", region: hk, group: 亚洲, addr: 192.0.2.1}
-  - {id: tyo-1, token: bcdefghijklmnopqrstuvwxyz0123456789a, addr: 192.0.2.2}
-webhooks:
-  - {name: hook, url: "https://example.com/hook"}
+  - {id: hk-1, name: 香港, token: abcdefghijklmnopqrstuvwxyz0123456789, region: hk, group: 亚洲,
+     traffic: {quota_gb: 1000}, plan: {expire_at: 2099-01-01, renew_months: 12, price: "$10/年"}, ping: {addr: 192.0.2.1}}
+  - {id: tyo-1, token: bcdefghijklmnopqrstuvwxyz0123456789a, ping: {addr: 192.0.2.2}}
+notify:
+  - {type: webhook, name: hook, url: "https://example.com/hook"}
 alerts:
   - {name: cpu_high, metric: cpu, op: ">", threshold: 90, for: 5m, nodes: [hk-1]}
-  - {name: quota, metric: traffic, levels: [80, 100]}
   - {name: ddos, metric: net_in, op: ">=", threshold: 50, ratio: 4, for: 2m, exclude: [tyo-1]}
-  - {name: weekly, metric: weekly_report, at: "Mon 10:00"}
+reports:
+  - {type: traffic_quota, levels: [80, 100]}
+  - {type: weekly, at: "Mon 10:00"}
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -199,17 +200,21 @@ alerts:
 	now := time.Now().Truncate(10 * time.Second)
 	// One period for both reports, whatever the date: around the start of a
 	// month the earlier report must not open a second, empty-looking one.
-	period := now.In(cfg.Location).Format("2006-01") + "-01"
+	y, m, _ := now.In(cfg.Location).Date()
+	start := time.Date(y, m, 1, 0, 0, 0, 0, cfg.Location)
+	period := func(rx, tx uint64) *pb.Period {
+		return &pb.Period{Start: start.Unix(), End: start.AddDate(0, 1, 0).Unix(), Rx: rx, Tx: tx}
+	}
 	for _, at := range []time.Time{now.Add(-20 * time.Minute), now} {
 		rep := &pb.Report{
 			Ts:      at.Unix(),
-			Sys:     &pb.SysInfo{Hostname: "h", Os: "Debian", Kernel: "6.1", Arch: "amd64", Cores: 2, BootTime: 1, Uptime: 2, AgentVersion: "9.9.9"},
-			Cpu:     &pb.CPU{Usage: 50, Steal: 1, Softirq: f32(2)},
+			Sys:     &pb.SysInfo{Hostname: "h", Os: "Debian", Kernel: "6.1", Arch: "amd64", Cores: 2, BootTime: 1, AgentVersion: "9.9.9"},
+			Cpu:     &pb.CPU{Usage: 50, Steal: 1, Softirq: 2},
 			Load:    &pb.Load{L1: 1, L5: 1, L15: 1, Threads: 100},
 			Mem:     &pb.Mem{Total: 100, Used: 50, SwapTotal: 10, SwapUsed: 1},
 			Disks:   []*pb.Disk{{Mount: "/", Total: 100, Used: 40, Avail: 55, InodePct: 3}},
-			Net:     []*pb.NetRate{{Iface: "eth0", RxRate: 10, TxRate: 20, RxPps: u64(1), TxPps: u64(2)}},
-			Traffic: []*pb.IfaceTraffic{{Iface: "eth0", Cur: &pb.Period{Start: period, Rx: 10, Tx: 20}}},
+			Net:     []*pb.NetRate{{Iface: "eth0", RxRate: 10, TxRate: 20, RxPps: 1, TxPps: 2}},
+			Traffic: []*pb.IfaceTraffic{{Iface: "eth0", Cur: period(10, 20)}},
 			Pings:   []*pb.Ping{{Target: "tyo-1", Addr: "192.0.2.2", Sent: 10, Lost: 1, Min: 1, Avg: 2, Max: 3, Jitter: 0.5}},
 			Sockets: &pb.Sockets{Tcp: 5, Udp: 3, TcpTw: 1},
 		}
@@ -220,12 +225,12 @@ alerts:
 	if err := st.Rollup(now.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SaveAlerts(nil, nil, []store.AlertEvent{
-		{TS: now.Unix(), Rule: "cpu_high", Node: "hk-1", Target: "x", Event: "firing", Value: 99, Message: "m"},
-	}); err != nil {
+	if err := st.SaveAlerts(store.AlertChanges{Events: []store.AlertEvent{
+		{TS: now.Unix(), Rule: "cpu_high", Node: "hk-1", Target: "x", Event: "firing", Value: "99.0%", Message: "m"},
+	}}); err != nil {
 		t.Fatal(err)
 	}
-	h := New(cfg, st, noStats{}, oneActive{}, "9.9.9", log).Handler(nil)
+	h := New(cfg, st, noStats{}, oneActive{alert.New(cfg, st, notify.Log{Log: log}, log)}, "9.9.9", log).Handler(nil)
 
 	for i := range shapeEndpoints {
 		e := &shapeEndpoints[i]

@@ -1,19 +1,18 @@
-# vps-probe-echo config. Install as /etc/vps-probe/echo.yml,
-# owner root:vps-probe-echo, mode 0640 (it contains the key).
+# vps-probe-echo 的配置，安装为 /etc/vps-probe/echo.yml。
+# 里面有 key：root:vps-probe-echo，权限 0640（install.sh 会设好）。
 #
-# The responder answers tunnel probes: an agent peer with `type: echo` sends
-# requests signed with this key (usually through a port forward that ends
-# here) and times the replies. Anything else gets no reply at all.
+# 它只装在隧道的终点：某个 agent 里 `type: echo` 的 peer 用这个 key 签名发来请求
+# （通常经过端口转发），它原样回一个包，agent 据此算出经隧道的时延。
+# 签名不对的包一律不回应。
 
-listen: ":39527"            # UDP, IPv4 + IPv6
+listen: ":39527"            # UDP，IPv4 和 IPv6 都监听
 
-# Shared with every agent peer that probes this responder.
-# Generate with `vps-probe-server gen-token`.
+# 和探测它的 agent peer 共用。用 `vps-probe-server gen-token` 生成。
 key: "<key>"
 
-# Optional: only answer these source IPs / CIDRs, e.g. the egress IPs of the
-# relays in front of this node. Empty = any source with a valid signature.
-allow: []
+# 可选：只回应这些来源 IP / 网段，比如它前面那些中转机的出口 IP。
+# 不写 = 签名正确的来源都回应。
+# allow: [203.0.113.7, 198.51.100.0/24]
 
-# Replies per second, at most (default 1000).
+# 可选：每秒最多回应多少个包，默认 1000。
 # max_pps: 1000

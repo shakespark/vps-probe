@@ -1,17 +1,20 @@
 package config
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
-	agentconfig "vpsprobe/internal/agent/config"
+	agentconfig "github.com/shakespark/vps-probe/internal/agent/config"
+	"github.com/shakespark/vps-probe/internal/agent/traffic"
+	"github.com/shakespark/vps-probe/internal/peer"
 )
 
 func TestAgentConfigRoundTrip(t *testing.T) {
 	c, err := Parse([]byte(`
 nodes:
-  - {id: hk-1, token: ` + tokA + `, addr: 203.0.113.5, reset_day: 15, reset_time: "8:05"}
-  - {id: jp-1, token: ` + tokB + `, addr: jp.example.com}
+  - {id: hk-1, token: ` + tokA + `, ping: {addr: 203.0.113.5}, traffic: {reset_day: 15, reset_time: "8:05"}}
+  - {id: jp-1, token: ` + tokB + `, ping: {addr: jp.example.com}}
   - {id: us-1, token: cdefghijklmnopqrstuvwxyz0123456789ab}
 `))
 	if err != nil {
@@ -25,13 +28,14 @@ nodes:
 	if err != nil {
 		t.Fatalf("generated config does not load: %v\n%s", err, out)
 	}
-	if a.Node != "hk-1" || a.Server.Token != tokA || a.Server.Addr != "198.51.100.1:9527" || a.Traffic.ResetDay != 15 || a.Traffic.ResetHour != 8 || a.Traffic.ResetMinute != 5 {
+	if a.Node != "hk-1" || a.Token != tokA || a.Server != "198.51.100.1:9527" ||
+		a.Traffic.Reset != (traffic.Reset{Day: 15, Hour: 8, Minute: 5}) || a.Traffic.Timezone != c.Timezone {
 		t.Fatalf("got %+v", a)
 	}
-	if len(a.Ping.Peers) != 1 || a.Ping.Peers[0].Name != "jp-1" || a.Ping.Peers[0].Addr != "jp.example.com" {
-		t.Fatalf("peers %+v", a.Ping.Peers)
+	if len(a.Peers) != 1 || a.Peers[0].Name != "jp-1" || a.Peers[0].Addr != "jp.example.com" {
+		t.Fatalf("peers %+v", a.Peers)
 	}
-	if !strings.Contains(out, "Not pinged (no addr in server.yml): us-1") {
+	if !strings.Contains(out, "没有 ping（server.yml 里没写 ping.addr）：us-1") {
 		t.Fatalf("missing-addr note:\n%s", out)
 	}
 	// A node with no peers still produces a valid file.
@@ -49,7 +53,7 @@ nodes:
 
 func TestBadAddr(t *testing.T) {
 	for _, addr := range []string{"1.2.3.4:9527", "a b", "-", "x..y", "http://a"} {
-		if _, err := Parse([]byte("nodes:\n  - {id: a, token: " + tokA + ", addr: '" + addr + "'}\n")); err == nil {
+		if _, err := Parse([]byte("nodes:\n  - {id: a, token: " + tokA + ", ping: {addr: '" + addr + "'}}\n")); err == nil {
 			t.Errorf("addr %q accepted", addr)
 		}
 	}
@@ -58,9 +62,9 @@ func TestBadAddr(t *testing.T) {
 func TestNoPing(t *testing.T) {
 	c, err := Parse([]byte(`
 nodes:
-  - {id: a, token: ` + tokA + `, addr: a.example.com, no_ping: [c]}
-  - {id: b, token: ` + tokB + `, addr: b.example.com}
-  - {id: c, token: cdefghijklmnopqrstuvwxyz0123456789ab, addr: c.example.com}
+  - {id: a, token: ` + tokA + `, ping: {addr: a.example.com, exclude: [c]}}
+  - {id: b, token: ` + tokB + `, ping: {addr: b.example.com}}
+  - {id: c, token: cdefghijklmnopqrstuvwxyz0123456789ab, ping: {addr: c.example.com}}
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +78,7 @@ nodes:
 		if err != nil {
 			t.Fatalf("%v\n%s", err, out)
 		}
-		for _, p := range a.Ping.Peers {
+		for _, p := range a.Peers {
 			names = append(names, p.Name)
 		}
 		return names, out
@@ -85,14 +89,14 @@ nodes:
 		if strings.Join(got, ",") != want {
 			t.Errorf("%s pings %v, want %s", id, got, want)
 		}
-		if id != "b" && !strings.Contains(out, "Not pinged (no_ping in server.yml): ") {
-			t.Errorf("%s: no no_ping note:\n%s", id, out)
+		if id != "b" && !strings.Contains(out, "没有 ping（server.yml 里的 ping.exclude）：") {
+			t.Errorf("%s: no note about the excluded node:\n%s", id, out)
 		}
 	}
 
 	for _, np := range []string{"[x]", "[a]", "[b, b]"} {
-		if _, err := Parse([]byte("nodes:\n  - {id: a, token: " + tokA + ", no_ping: " + np + "}\n  - {id: b, token: " + tokB + "}\n")); err == nil {
-			t.Errorf("no_ping %s accepted", np)
+		if _, err := Parse([]byte("nodes:\n  - {id: a, token: " + tokA + ", ping: {exclude: " + np + "}}\n  - {id: b, token: " + tokB + "}\n")); err == nil {
+			t.Errorf("ping.exclude %s accepted", np)
 		}
 	}
 }
@@ -102,11 +106,12 @@ func TestExtraPeers(t *testing.T) {
 nodes:
   - id: a
     token: ` + tokA + `
-    extra_peers:
-      - {name: cf-ppp, addr: 1.1.1.1}
-      - {name: cf-relay, addr: "127.0.0.1:15353", type: dns}
-      - {name: tun, addr: "127.0.0.1:39527", type: echo, key: ` + tokB + `}
-  - {id: b, token: ` + tokB + `, addr: b.example.com}
+    ping:
+      extra:
+        - {name: cf-ppp, addr: 1.1.1.1}
+        - {name: cf-relay, addr: "127.0.0.1:15353", type: dns}
+        - {name: tun, addr: "127.0.0.1:39527", type: echo, key: ` + tokB + `}
+  - {id: b, token: ` + tokB + `, ping: {addr: b.example.com}}
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -119,22 +124,14 @@ nodes:
 	if err != nil {
 		t.Fatalf("generated config does not load: %v\n%s", err, out)
 	}
-	want := []agentconfig.Peer{
-		{Name: "b", Addr: "b.example.com"},
-		{Name: "cf-ppp", Addr: "1.1.1.1"},
-		{Name: "cf-relay", Addr: "127.0.0.1:15353", Type: "dns"},
-		{Name: "tun", Addr: "127.0.0.1:39527", Type: "echo", Key: tokB},
+	want := []peer.Peer{
+		{Name: "b", Addr: "b.example.com", Type: peer.ICMP},
+		{Name: "cf-ppp", Addr: "1.1.1.1", Type: peer.ICMP},
+		{Name: "cf-relay", Addr: "127.0.0.1:15353", Type: peer.DNS},
+		{Name: "tun", Addr: "127.0.0.1:39527", Type: peer.Echo, Key: tokB},
 	}
-	if len(a.Ping.Peers) != len(want) {
-		t.Fatalf("peers %+v", a.Ping.Peers)
-	}
-	for i := range want {
-		if a.Ping.Peers[i] != want[i] {
-			t.Fatalf("peer %d = %+v, want %+v", i, a.Ping.Peers[i], want[i])
-		}
-	}
-	if strings.Contains(out, `"icmp"`) {
-		t.Fatalf("type written for an icmp peer (older agents reject it):\n%s", out)
+	if !slices.Equal(a.Peers, want) {
+		t.Fatalf("peers %+v, want %+v", a.Peers, want)
 	}
 	// Extra peers are only this node's.
 	out, _ = c.AgentConfig("b", "198.51.100.1:9527")
@@ -154,12 +151,12 @@ func TestBadExtraPeers(t *testing.T) {
 		"echo no key": "{name: x, addr: '1.1.1.1:39527', type: echo}",
 		"key on dns":  "{name: x, addr: '1.1.1.1:53', type: dns, key: " + tokB + "}",
 	} {
-		cfg := "nodes:\n  - {id: a, token: " + tokA + ", extra_peers: [" + p + "]}\n  - {id: b, token: " + tokB + "}\n"
+		cfg := "nodes:\n  - {id: a, token: " + tokA + ", ping: {extra: [" + p + "]}}\n  - {id: b, token: " + tokB + "}\n"
 		if _, err := Parse([]byte(cfg)); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
-	dup := "nodes:\n  - {id: a, token: " + tokA + ", extra_peers: [{name: x, addr: 1.1.1.1}, {name: x, addr: 8.8.8.8}]}\n"
+	dup := "nodes:\n  - {id: a, token: " + tokA + ", ping: {extra: [{name: x, addr: 1.1.1.1}, {name: x, addr: 8.8.8.8}]}}\n"
 	if _, err := Parse([]byte(dup)); err == nil {
 		t.Error("duplicate accepted")
 	}

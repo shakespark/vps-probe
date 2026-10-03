@@ -1,10 +1,13 @@
 package collect
 
 import (
-	"errors"
+	"bytes"
+	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -139,35 +142,35 @@ func fixtureFS(t *testing.T) FS {
 func TestFixtureReads(t *testing.T) {
 	fs := fixtureFS(t)
 
-	if l, err := fs.ReadLoad(); err != nil || l != (Load{0.5, 0.25, 0.1, 234}) {
+	if l, err := fs.Load(); err != nil || l != (Load{0.5, 0.25, 0.1, 234}) {
 		t.Fatalf("load = %+v, %v", l, err)
 	}
-	if k, err := fs.ReadSockets(); err != nil || k != (Sockets{TCP: 30, UDP: 9, TCPTimeWait: 5}) {
+	if k, err := fs.Sockets(); err != nil || k != (Sockets{TCP: 30, UDP: 9, TCPTimeWait: 5}) {
 		t.Fatalf("sockets = %+v, %v", k, err)
 	}
 	// IPv6 disabled: no sockstat6.
 	os.Remove(filepath.Join(fs.Proc, "net", "sockstat6"))
-	if k, err := fs.ReadSockets(); err != nil || k != (Sockets{TCP: 27, UDP: 8, TCPTimeWait: 5}) {
+	if k, err := fs.Sockets(); err != nil || k != (Sockets{TCP: 27, UDP: 8, TCPTimeWait: 5}) {
 		t.Fatalf("sockets without IPv6 = %+v, %v", k, err)
 	}
 	os.WriteFile(filepath.Join(fs.Proc, "net", "sockstat"), []byte("sockets: used 1\n"), 0o644)
-	if _, err := fs.ReadSockets(); err == nil {
+	if _, err := fs.Sockets(); err == nil {
 		t.Fatal("truncated sockstat accepted")
 	}
-	if bt, err := fs.BootTime(); err != nil || !bt.Equal(time.Unix(1790000000, 0)) {
+	if bt, err := fs.bootTime(); err != nil || !bt.Equal(time.Unix(1790000000, 0)) {
 		t.Fatalf("boot time = %v, %v", bt, err)
 	}
 	if id, err := fs.BootID(); err != nil || id != "3f2a1c9e-0000-4000-8000-000000000001" {
 		t.Fatalf("boot id = %q, %v", id, err)
 	}
-	if up, err := fs.Uptime(); err != nil || up != 12345 {
+	if up, err := fs.uptime(); err != nil || up != 12345 {
 		t.Fatalf("uptime = %v, %v", up, err)
 	}
 	// Two physical NICs (eth0, ens4) and no route table: cannot choose yet.
-	if ifaces, err := fs.DetectInterfaces(); !errors.Is(err, ErrNoDefaultRoute) {
-		t.Fatalf("ifaces = %v, %v", ifaces, err)
+	if ifaces, why := fs.detect(); len(ifaces) != 0 || why == "" {
+		t.Fatalf("ifaces = %v, %q", ifaces, why)
 	}
-	si := fs.ReadSysInfo()
+	si := fs.SysInfo()
 	if si.OS != "Debian GNU/Linux 12 (bookworm)" || si.Kernel != "6.1.0-test" || si.Cores < 1 {
 		t.Fatalf("sysinfo = %+v", si)
 	}
@@ -176,8 +179,8 @@ func TestFixtureReads(t *testing.T) {
 func TestDetectInterfacesNone(t *testing.T) {
 	fs := FS{Sys: t.TempDir(), Proc: t.TempDir()}
 	os.MkdirAll(filepath.Join(fs.Sys, "class", "net", "lo"), 0o755)
-	if _, err := fs.DetectInterfaces(); err == nil {
-		t.Fatal("expected error with no physical NIC")
+	if got, why := fs.detect(); len(got) != 0 || why == "" {
+		t.Fatalf("got %v, %q with no physical NIC", got, why)
 	}
 }
 
@@ -219,15 +222,15 @@ func TestDetectInterfacesMultiNIC(t *testing.T) {
 		if c.route6 != "" {
 			os.WriteFile(filepath.Join(fs.Proc, "net", "ipv6_route"), []byte(c.route6), 0o644)
 		}
-		got, err := fs.DetectInterfaces()
+		got, why := fs.detect()
 		if c.noRoute {
-			if !errors.Is(err, ErrNoDefaultRoute) {
-				t.Errorf("%s: got %v, %v; want ErrNoDefaultRoute", name, got, err)
+			if len(got) != 0 || !strings.Contains(why, "no default route") {
+				t.Errorf("%s: got %v, %q; want none for lack of a default route", name, got, why)
 			}
 			continue
 		}
-		if err != nil || strings.Join(got, ",") != c.want {
-			t.Errorf("%s: got %v, %v; want %q", name, got, err, c.want)
+		if why != "" || strings.Join(got, ",") != c.want {
+			t.Errorf("%s: got %v, %q; want %q", name, got, why, c.want)
 		}
 	}
 }
@@ -276,9 +279,9 @@ func TestDetectInterfacesContainer(t *testing.T) {
 		if c.route6 != "" {
 			os.WriteFile(filepath.Join(fs.Proc, "net", "ipv6_route"), []byte(c.route6), 0o644)
 		}
-		got, err := fs.DetectInterfaces()
-		if strings.Join(got, ",") != c.want || (err == nil) != (c.want != "") {
-			t.Errorf("%s: got %v, %v; want %q", name, got, err, c.want)
+		got, why := fs.detect()
+		if strings.Join(got, ",") != c.want || (why == "") != (c.want != "") {
+			t.Errorf("%s: got %v, %q; want %q", name, got, why, c.want)
 		}
 	}
 }
@@ -290,43 +293,48 @@ func TestDetectInterfacesPrefersPhysical(t *testing.T) {
 	os.MkdirAll(filepath.Join(fs.Sys, "class", "net", "tun0"), 0o755)
 	os.MkdirAll(filepath.Join(fs.Proc, "net"), 0o755)
 	os.WriteFile(filepath.Join(fs.Proc, "net", "route"), []byte("tun0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\n"), 0o644)
-	got, err := fs.DetectInterfaces()
-	if err != nil || strings.Join(got, ",") != "ens3" {
-		t.Fatalf("got %v, %v", got, err)
+	got, why := fs.detect()
+	if why != "" || strings.Join(got, ",") != "ens3" {
+		t.Fatalf("got %v, %q", got, why)
 	}
 }
 
 func TestDiskUsageRoot(t *testing.T) {
-	d, err := DiskUsage("/")
+	d, err := Host.Disk("/")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if d.Total == 0 || d.Used > d.Total || d.Avail > d.Total {
 		t.Fatalf("implausible: %+v", d)
 	}
-	if _, err := DiskUsage("/definitely/not/here"); err == nil {
+	if _, err := Host.Disk("/definitely/not/here"); err == nil {
 		t.Fatal("expected error")
+	}
+	// Root is where tests keep their mount points.
+	dir := t.TempDir()
+	if d, err := (FS{Root: dir}).Disk("/"); err != nil || d.Mount != "/" || d.Total == 0 {
+		t.Fatalf("under Root: %+v, %v", d, err)
 	}
 }
 
 func TestHostReads(t *testing.T) {
 	// Smoke test against the real /proc on the build machine.
-	if _, err := Host.ReadCPU(); err != nil {
+	if _, err := Host.CPUTimes(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Host.ReadMem(); err != nil {
+	if _, err := Host.Mem(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Host.ReadNetDev(); err != nil {
+	if _, err := Host.NetCounters(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Host.BootID(); err != nil {
 		t.Fatal(err)
 	}
-	if k, err := Host.ReadSockets(); err != nil || k.TCP+k.UDP == 0 {
+	if k, err := Host.Sockets(); err != nil || k.TCP+k.UDP == 0 {
 		t.Fatalf("sockets = %+v, %v", k, err)
 	}
-	if l, err := Host.ReadLoad(); err != nil || l.Threads == 0 {
+	if l, err := Host.Load(); err != nil || l.Threads == 0 {
 		t.Fatalf("load = %+v, %v", l, err)
 	}
 }
@@ -346,5 +354,92 @@ func TestSystemStart(t *testing.T) {
 	os.WriteFile(filepath.Join(fs.Proc, "uptime"), []byte("728.25 728.25\n"), 0o644)
 	if st, err := fs.SystemStart(now); err != nil || !st.Equal(time.Unix(1800000000-728, 0)) {
 		t.Fatalf("from uptime = %v, %v", st, err)
+	}
+}
+
+// A machine with a public and a private NIC: while there is no default
+// route the private one must never be selected, because a newly selected
+// interface is counted since boot.
+func TestSelectorWaitsForDefaultRoute(t *testing.T) {
+	fs := FS{Sys: t.TempDir(), Proc: t.TempDir()}
+	for _, n := range []string{"eth0", "eth1"} {
+		os.MkdirAll(filepath.Join(fs.Sys, "class", "net", n, "device"), 0o755)
+	}
+	os.MkdirAll(filepath.Join(fs.Proc, "net"), 0o755)
+	route := filepath.Join(fs.Proc, "net", "route")
+	const hdr = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+	up := func(on bool) {
+		s := hdr
+		if on {
+			s += "eth0\t00000000\t0100A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+		}
+		os.WriteFile(route, []byte(s), 0o644)
+	}
+	var logs bytes.Buffer
+	sel := NewSelector(fs, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	now := time.Now()
+	step := func(d time.Duration, want ...string) {
+		t.Helper()
+		now = now.Add(d)
+		if got := sel.Interfaces(now); !slices.Equal(got, want) {
+			t.Fatalf("interfaces = %v, want %v", got, want)
+		}
+	}
+
+	up(false)
+	step(0)                // boot, network not up: nothing yet
+	step(10 * time.Second) // still nothing, and it looked again
+	if n := strings.Count(logs.String(), "not counted yet"); n != 1 {
+		t.Fatalf("%d warnings while waiting, want 1:\n%s", n, &logs)
+	}
+	up(true)
+	step(10*time.Second, "eth0") // picked up at the next sample, not a minute later
+	up(false)
+	step(2*time.Minute, "eth0") // the route goes away: keep the choice
+	up(true)
+	step(2*time.Minute, "eth0")
+
+	// Interfaces from the config are taken as given.
+	if got := NewSelector(fs, []string{"eth1"}, slog.Default()).Interfaces(now); !slices.Equal(got, []string{"eth1"}) {
+		t.Fatalf("fixed = %v", got)
+	}
+}
+
+func TestSampler(t *testing.T) {
+	fs := fixtureFS(t)
+	stat, dev := filepath.Join(fs.Proc, "stat"), filepath.Join(fs.Proc, "net", "dev")
+	cpu := func(user, idle int) {
+		os.WriteFile(stat, []byte(fmt.Sprintf("cpu  %d 0 0 %d 0 0 0 0 0 0\n", user, idle)), 0o644)
+	}
+	net := func(rx, rxPkts int) {
+		os.WriteFile(dev, []byte(fmt.Sprintf("Inter-|\n face |\n  eth0: %d %d 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", rx, rxPkts)), 0o644)
+	}
+	cpu(100, 900)
+	net(1000, 10)
+	s := NewSampler(fs) // takes the baselines
+	now := s.netAt
+
+	cpu(150, 950)
+	if p, ok, err := s.CPU(); err != nil || !ok || p.Usage != 50 {
+		t.Fatalf("cpu = %+v, %v, %v", p, ok, err)
+	}
+	net(3000, 30)
+	counters, rates, err := s.Net(now.Add(10 * time.Second))
+	if err != nil || counters["eth0"].RX != 3000 || rates["eth0"] != (NetRate{RX: 200, RXPkts: 2}) {
+		t.Fatalf("net = %+v, %+v, %v", counters, rates, err)
+	}
+	// A counter that restarted has no rate for that sample.
+	net(500, 5)
+	if _, rates, _ := s.Net(now.Add(20 * time.Second)); len(rates) != 0 {
+		t.Fatalf("rates after a counter restart: %+v", rates)
+	}
+	// After a failed read the next one is a baseline again.
+	os.Remove(stat)
+	if _, ok, err := s.CPU(); ok || err == nil {
+		t.Fatal("cpu read without /proc/stat")
+	}
+	cpu(200, 1000)
+	if _, ok, err := s.CPU(); ok || err != nil {
+		t.Fatalf("first read after a failure: ok=%v, %v", ok, err)
 	}
 }

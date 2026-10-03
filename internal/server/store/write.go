@@ -2,18 +2,18 @@ package store
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"math"
 	"net/netip"
 	"time"
 
-	pb "vpsprobe/internal/proto/probev1"
+	pb "github.com/shakespark/vps-probe/internal/proto/probev1"
 )
 
-// Write stores one (already validated) report piece in a single transaction.
+// Write stores one (already validated) report in a single transaction.
 // Every statement is idempotent, so duplicates and replays change nothing,
-// and pieces of a split report sharing one ts merge into the same rows.
+// and the pieces of a split report merge into the same rows however the
+// agent divided them: a field a piece does not carry is left as it is.
 // from is the packet's source address; it is recorded only when the report
 // is the node's newest.
 func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time.Time) error {
@@ -38,21 +38,17 @@ func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time
 	if fresh, err := res.RowsAffected(); err != nil {
 		return err
 	} else if fresh > 0 && from.IsValid() {
-		if _, err := tx.Exec(`INSERT INTO node_addr(node, ip, since) VALUES (?, ?, ?)
-			ON CONFLICT(node) DO UPDATE SET ip = excluded.ip, since = excluded.since WHERE ip <> excluded.ip`,
-			rid, from.Unmap().String(), arrival.Unix()); err != nil {
+		ip := from.Unmap().String()
+		if _, err := tx.Exec(`UPDATE node_status SET ip = ?, ip_since = ? WHERE node = ? AND ip IS NOT ?`,
+			ip, arrival.Unix(), rid, ip); err != nil {
 			return err
 		}
 	}
-	if rep.Sys != nil {
-		y := rep.Sys
-		js, err := json.Marshal(SysInfo{Hostname: y.Hostname, OS: y.Os, Kernel: y.Kernel, Arch: y.Arch,
-			Cores: y.Cores, BootTime: y.BootTime, Uptime: y.Uptime, AgentVersion: y.AgentVersion})
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`UPDATE node_status SET sys = ?, sys_ts = ?
-			WHERE node = ? AND (sys_ts IS NULL OR sys_ts <= ?)`, string(js), ts, rid, ts); err != nil {
+	if y := rep.Sys; y != nil {
+		if _, err := tx.Exec(`UPDATE node_status SET sys_ts = ?, hostname = ?, os = ?, kernel = ?, arch = ?,
+				cores = ?, boot_time = ?, agent_version = ?
+			WHERE node = ? AND (sys_ts IS NULL OR sys_ts <= ?)`,
+			ts, y.Hostname, y.Os, y.Kernel, y.Arch, y.Cores, y.BootTime, y.AgentVersion, rid, ts); err != nil {
 			return err
 		}
 	}
@@ -61,16 +57,10 @@ func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time
 		var cpu, steal, softirq, l1, l5, l15 sql.NullFloat64
 		var mt, mu, st, su, tcp, udp, tw, threads sql.NullInt64
 		if c := rep.Cpu; c != nil {
-			cpu, steal = nf(c.Usage), nf(c.Steal)
-			if c.Softirq != nil { // unset: an agent before 0.1.14
-				softirq = nf(*c.Softirq)
-			}
+			cpu, steal, softirq = nf(c.Usage), nf(c.Steal), nf(c.Softirq)
 		}
 		if l := rep.Load; l != nil {
-			l1, l5, l15 = nf(l.L1), nf(l.L5), nf(l.L15)
-			if l.Threads > 0 { // 0: an agent before 0.1.9
-				threads = ni(uint64(l.Threads))
-			}
+			l1, l5, l15, threads = nf(l.L1), nf(l.L5), nf(l.L15), ni(uint64(l.Threads))
 		}
 		if m := rep.Mem; m != nil {
 			mt, mu, st, su = ni(m.Total), ni(m.Used), ni(m.SwapTotal), ni(m.SwapUsed)
@@ -97,7 +87,7 @@ func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time
 
 	for _, n := range rep.Net {
 		if _, err := tx.Exec(`INSERT OR REPLACE INTO net_raw(node, iface, ts, rx, tx, rx_pps, tx_pps) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			rid, n.Iface, ts, float64(n.RxRate), float64(n.TxRate), optf(n.RxPps), optf(n.TxPps)); err != nil {
+			rid, n.Iface, ts, float64(n.RxRate), float64(n.TxRate), float64(n.RxPps), float64(n.TxPps)); err != nil {
 			return err
 		}
 	}
@@ -144,23 +134,18 @@ func (s *Store) Write(node string, rep *pb.Report, from netip.Addr, arrival time
 }
 
 func upsertPeriod(tx *sql.Tx, rid int64, iface string, p *pb.Period, ts int64) error {
-	_, err := tx.Exec(`INSERT INTO traffic_period(node, iface, start, rx, tx, ts) VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(node, iface, start) DO UPDATE SET rx = excluded.rx, tx = excluded.tx, ts = excluded.ts
+	_, err := tx.Exec(`INSERT INTO traffic_period(node, iface, start, end, rx, tx, ts) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(node, iface, start) DO UPDATE SET end = excluded.end, rx = excluded.rx, tx = excluded.tx, ts = excluded.ts
 		WHERE excluded.ts > traffic_period.ts`,
-		rid, iface, p.Start, int64(p.Rx), int64(p.Tx), ts)
+		rid, iface, p.Start, p.End, int64(p.Rx), int64(p.Tx), ts)
 	return err
 }
 
-// nf drops float32 noise (12.3 would otherwise read back as 12.30000019).
+// nf is a float column's value. It drops float32 noise: 12.3 would otherwise
+// read back as 12.30000019.
 func nf(v float32) sql.NullFloat64 {
 	return sql.NullFloat64{Float64: math.Round(float64(v)*1000) / 1000, Valid: true}
 }
-func ni(v uint64) sql.NullInt64 { return sql.NullInt64{Int64: int64(v), Valid: true} }
 
-// optf is an optional counter: NULL when the agent didn't send it.
-func optf(v *uint64) sql.NullFloat64 {
-	if v == nil {
-		return sql.NullFloat64{}
-	}
-	return sql.NullFloat64{Float64: float64(*v), Valid: true}
-}
+// ni is an integer column's value.
+func ni(v uint64) sql.NullInt64 { return sql.NullInt64{Int64: int64(v), Valid: true} }

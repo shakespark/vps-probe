@@ -5,7 +5,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/vps-probe-server serve -config /etc/vps-probe/server.yml
+ExecStart=/usr/local/bin/vps-probe-server run -config /etc/vps-probe/server.yml
 Restart=always
 RestartSec=5
 # Shutdown folds the SQLite WAL back into probe.db.

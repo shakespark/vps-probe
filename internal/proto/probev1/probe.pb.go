@@ -21,22 +21,22 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// Report is one sample from an agent. A single (node, ts) sample may be split
-// across several Reports (e.g. pings in a separate packet); the server merges
-// them field by field.
+// Report is one sample from an agent. A sample that does not fit one packet
+// is split across several Reports sharing ts; the server merges them field
+// by field. A field the agent could not read is left out.
 type Report struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ts            int64                  `protobuf:"varint,1,opt,name=ts,proto3" json:"ts,omitempty"`  // sample time, unix seconds, aligned to the agent interval
+	Ts            int64                  `protobuf:"varint,1,opt,name=ts,proto3" json:"ts,omitempty"`  // sample time, unix seconds, a multiple of the report interval
 	Id            uint64                 `protobuf:"varint,2,opt,name=id,proto3" json:"id,omitempty"`  // random, echoed back in Ack
 	Sys           *SysInfo               `protobuf:"bytes,3,opt,name=sys,proto3" json:"sys,omitempty"` // on start and hourly
 	Cpu           *CPU                   `protobuf:"bytes,4,opt,name=cpu,proto3" json:"cpu,omitempty"`
 	Load          *Load                  `protobuf:"bytes,5,opt,name=load,proto3" json:"load,omitempty"`
 	Mem           *Mem                   `protobuf:"bytes,6,opt,name=mem,proto3" json:"mem,omitempty"`
-	Disks         []*Disk                `protobuf:"bytes,7,rep,name=disks,proto3" json:"disks,omitempty"` // every 60s
-	Net           []*NetRate             `protobuf:"bytes,8,rep,name=net,proto3" json:"net,omitempty"`
-	Traffic       []*IfaceTraffic        `protobuf:"bytes,9,rep,name=traffic,proto3" json:"traffic,omitempty"`
-	Pings         []*Ping                `protobuf:"bytes,10,rep,name=pings,proto3" json:"pings,omitempty"`
-	Sockets       *Sockets               `protobuf:"bytes,11,opt,name=sockets,proto3" json:"sockets,omitempty"` // since 0.1.9
+	Sockets       *Sockets               `protobuf:"bytes,7,opt,name=sockets,proto3" json:"sockets,omitempty"`
+	Disks         []*Disk                `protobuf:"bytes,8,rep,name=disks,proto3" json:"disks,omitempty"` // every 60s
+	Net           []*NetRate             `protobuf:"bytes,9,rep,name=net,proto3" json:"net,omitempty"`
+	Traffic       []*IfaceTraffic        `protobuf:"bytes,10,rep,name=traffic,proto3" json:"traffic,omitempty"`
+	Pings         []*Ping                `protobuf:"bytes,11,rep,name=pings,proto3" json:"pings,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -113,6 +113,13 @@ func (x *Report) GetMem() *Mem {
 	return nil
 }
 
+func (x *Report) GetSockets() *Sockets {
+	if x != nil {
+		return x.Sockets
+	}
+	return nil
+}
+
 func (x *Report) GetDisks() []*Disk {
 	if x != nil {
 		return x.Disks
@@ -141,13 +148,6 @@ func (x *Report) GetPings() []*Ping {
 	return nil
 }
 
-func (x *Report) GetSockets() *Sockets {
-	if x != nil {
-		return x.Sockets
-	}
-	return nil
-}
-
 type SysInfo struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Hostname      string                 `protobuf:"bytes,1,opt,name=hostname,proto3" json:"hostname,omitempty"`
@@ -155,9 +155,8 @@ type SysInfo struct {
 	Kernel        string                 `protobuf:"bytes,3,opt,name=kernel,proto3" json:"kernel,omitempty"`
 	Arch          string                 `protobuf:"bytes,4,opt,name=arch,proto3" json:"arch,omitempty"`
 	Cores         uint32                 `protobuf:"varint,5,opt,name=cores,proto3" json:"cores,omitempty"`
-	BootTime      int64                  `protobuf:"varint,6,opt,name=boot_time,json=bootTime,proto3" json:"boot_time,omitempty"` // unix seconds
-	Uptime        uint64                 `protobuf:"varint,7,opt,name=uptime,proto3" json:"uptime,omitempty"`                     // seconds
-	AgentVersion  string                 `protobuf:"bytes,8,opt,name=agent_version,json=agentVersion,proto3" json:"agent_version,omitempty"`
+	BootTime      int64                  `protobuf:"varint,6,opt,name=boot_time,json=bootTime,proto3" json:"boot_time,omitempty"` // unix seconds; 0 = unknown
+	AgentVersion  string                 `protobuf:"bytes,7,opt,name=agent_version,json=agentVersion,proto3" json:"agent_version,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -234,13 +233,6 @@ func (x *SysInfo) GetBootTime() int64 {
 	return 0
 }
 
-func (x *SysInfo) GetUptime() uint64 {
-	if x != nil {
-		return x.Uptime
-	}
-	return 0
-}
-
 func (x *SysInfo) GetAgentVersion() string {
 	if x != nil {
 		return x.AgentVersion
@@ -249,12 +241,10 @@ func (x *SysInfo) GetAgentVersion() string {
 }
 
 type CPU struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	Usage float32                `protobuf:"fixed32,1,opt,name=usage,proto3" json:"usage,omitempty"` // percent, 0-100
-	Steal float32                `protobuf:"fixed32,2,opt,name=steal,proto3" json:"steal,omitempty"` // percent, 0-100
-	// Share of time in softirq (mostly network packet processing), percent;
-	// part of usage, not on top of it. Unset before agent 0.1.14.
-	Softirq       *float32 `protobuf:"fixed32,3,opt,name=softirq,proto3,oneof" json:"softirq,omitempty"`
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Usage         float32                `protobuf:"fixed32,1,opt,name=usage,proto3" json:"usage,omitempty"`     // percent, 0-100
+	Steal         float32                `protobuf:"fixed32,2,opt,name=steal,proto3" json:"steal,omitempty"`     // percent, 0-100
+	Softirq       float32                `protobuf:"fixed32,3,opt,name=softirq,proto3" json:"softirq,omitempty"` // percent, part of usage: mostly network packet processing
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -304,8 +294,8 @@ func (x *CPU) GetSteal() float32 {
 }
 
 func (x *CPU) GetSoftirq() float32 {
-	if x != nil && x.Softirq != nil {
-		return *x.Softirq
+	if x != nil {
+		return x.Softirq
 	}
 	return 0
 }
@@ -315,7 +305,7 @@ type Load struct {
 	L1            float32                `protobuf:"fixed32,1,opt,name=l1,proto3" json:"l1,omitempty"`
 	L5            float32                `protobuf:"fixed32,2,opt,name=l5,proto3" json:"l5,omitempty"`
 	L15           float32                `protobuf:"fixed32,3,opt,name=l15,proto3" json:"l15,omitempty"`
-	Threads       uint32                 `protobuf:"varint,4,opt,name=threads,proto3" json:"threads,omitempty"` // all threads on the host, 4th field of /proc/loadavg (since 0.1.9)
+	Threads       uint32                 `protobuf:"varint,4,opt,name=threads,proto3" json:"threads,omitempty"` // all threads on the host, from /proc/loadavg
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -378,67 +368,6 @@ func (x *Load) GetThreads() uint32 {
 	return 0
 }
 
-// Sockets in use from /proc/net/sockstat and sockstat6, IPv4 + IPv6.
-type Sockets struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Tcp           uint32                 `protobuf:"varint,1,opt,name=tcp,proto3" json:"tcp,omitempty"` // TCP sockets other than TIME_WAIT (listening ones included)
-	Udp           uint32                 `protobuf:"varint,2,opt,name=udp,proto3" json:"udp,omitempty"`
-	TcpTw         uint32                 `protobuf:"varint,3,opt,name=tcp_tw,json=tcpTw,proto3" json:"tcp_tw,omitempty"` // TIME_WAIT
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *Sockets) Reset() {
-	*x = Sockets{}
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[4]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *Sockets) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*Sockets) ProtoMessage() {}
-
-func (x *Sockets) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[4]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use Sockets.ProtoReflect.Descriptor instead.
-func (*Sockets) Descriptor() ([]byte, []int) {
-	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{4}
-}
-
-func (x *Sockets) GetTcp() uint32 {
-	if x != nil {
-		return x.Tcp
-	}
-	return 0
-}
-
-func (x *Sockets) GetUdp() uint32 {
-	if x != nil {
-		return x.Udp
-	}
-	return 0
-}
-
-func (x *Sockets) GetTcpTw() uint32 {
-	if x != nil {
-		return x.TcpTw
-	}
-	return 0
-}
-
 type Mem struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Total         uint64                 `protobuf:"varint,1,opt,name=total,proto3" json:"total,omitempty"` // bytes
@@ -451,7 +380,7 @@ type Mem struct {
 
 func (x *Mem) Reset() {
 	*x = Mem{}
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[5]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -463,7 +392,7 @@ func (x *Mem) String() string {
 func (*Mem) ProtoMessage() {}
 
 func (x *Mem) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_probe_v1_probe_proto_msgTypes[5]
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -476,7 +405,7 @@ func (x *Mem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Mem.ProtoReflect.Descriptor instead.
 func (*Mem) Descriptor() ([]byte, []int) {
-	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{5}
+	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Mem) GetTotal() uint64 {
@@ -503,6 +432,67 @@ func (x *Mem) GetSwapTotal() uint64 {
 func (x *Mem) GetSwapUsed() uint64 {
 	if x != nil {
 		return x.SwapUsed
+	}
+	return 0
+}
+
+// Sockets in use, IPv4 + IPv6, from /proc/net/sockstat and sockstat6.
+type Sockets struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Tcp           uint32                 `protobuf:"varint,1,opt,name=tcp,proto3" json:"tcp,omitempty"` // other than TIME_WAIT, listening ones included
+	Udp           uint32                 `protobuf:"varint,2,opt,name=udp,proto3" json:"udp,omitempty"`
+	TcpTw         uint32                 `protobuf:"varint,3,opt,name=tcp_tw,json=tcpTw,proto3" json:"tcp_tw,omitempty"` // TIME_WAIT
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Sockets) Reset() {
+	*x = Sockets{}
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Sockets) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Sockets) ProtoMessage() {}
+
+func (x *Sockets) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_probe_v1_probe_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Sockets.ProtoReflect.Descriptor instead.
+func (*Sockets) Descriptor() ([]byte, []int) {
+	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *Sockets) GetTcp() uint32 {
+	if x != nil {
+		return x.Tcp
+	}
+	return 0
+}
+
+func (x *Sockets) GetUdp() uint32 {
+	if x != nil {
+		return x.Udp
+	}
+	return 0
+}
+
+func (x *Sockets) GetTcpTw() uint32 {
+	if x != nil {
+		return x.TcpTw
 	}
 	return 0
 }
@@ -588,8 +578,8 @@ type NetRate struct {
 	Iface         string                 `protobuf:"bytes,1,opt,name=iface,proto3" json:"iface,omitempty"`
 	RxRate        uint64                 `protobuf:"varint,2,opt,name=rx_rate,json=rxRate,proto3" json:"rx_rate,omitempty"` // bytes per second
 	TxRate        uint64                 `protobuf:"varint,3,opt,name=tx_rate,json=txRate,proto3" json:"tx_rate,omitempty"`
-	RxPps         *uint64                `protobuf:"varint,4,opt,name=rx_pps,json=rxPps,proto3,oneof" json:"rx_pps,omitempty"` // packets per second; unset before agent 0.1.14
-	TxPps         *uint64                `protobuf:"varint,5,opt,name=tx_pps,json=txPps,proto3,oneof" json:"tx_pps,omitempty"`
+	RxPps         uint64                 `protobuf:"varint,4,opt,name=rx_pps,json=rxPps,proto3" json:"rx_pps,omitempty"` // packets per second
+	TxPps         uint64                 `protobuf:"varint,5,opt,name=tx_pps,json=txPps,proto3" json:"tx_pps,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -646,19 +636,21 @@ func (x *NetRate) GetTxRate() uint64 {
 }
 
 func (x *NetRate) GetRxPps() uint64 {
-	if x != nil && x.RxPps != nil {
-		return *x.RxPps
+	if x != nil {
+		return x.RxPps
 	}
 	return 0
 }
 
 func (x *NetRate) GetTxPps() uint64 {
-	if x != nil && x.TxPps != nil {
-		return *x.TxPps
+	if x != nil {
+		return x.TxPps
 	}
 	return 0
 }
 
+// IfaceTraffic is what one interface carried in the current billing period
+// and in the one before it.
 type IfaceTraffic struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Iface         string                 `protobuf:"bytes,1,opt,name=iface,proto3" json:"iface,omitempty"`
@@ -719,11 +711,14 @@ func (x *IfaceTraffic) GetPrev() *Period {
 	return nil
 }
 
+// Period is a billing period [start, end) and the bytes counted in it. The
+// agent alone decides when periods begin; the server never computes one.
 type Period struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Start         string                 `protobuf:"bytes,1,opt,name=start,proto3" json:"start,omitempty"` // period start date, YYYY-MM-DD in the agent's timezone
-	Rx            uint64                 `protobuf:"varint,2,opt,name=rx,proto3" json:"rx,omitempty"`      // bytes accumulated in this period
-	Tx            uint64                 `protobuf:"varint,3,opt,name=tx,proto3" json:"tx,omitempty"`
+	Start         int64                  `protobuf:"varint,1,opt,name=start,proto3" json:"start,omitempty"` // unix seconds
+	End           int64                  `protobuf:"varint,2,opt,name=end,proto3" json:"end,omitempty"`
+	Rx            uint64                 `protobuf:"varint,3,opt,name=rx,proto3" json:"rx,omitempty"`
+	Tx            uint64                 `protobuf:"varint,4,opt,name=tx,proto3" json:"tx,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -758,11 +753,18 @@ func (*Period) Descriptor() ([]byte, []int) {
 	return file_proto_probe_v1_probe_proto_rawDescGZIP(), []int{9}
 }
 
-func (x *Period) GetStart() string {
+func (x *Period) GetStart() int64 {
 	if x != nil {
 		return x.Start
 	}
-	return ""
+	return 0
+}
+
+func (x *Period) GetEnd() int64 {
+	if x != nil {
+		return x.End
+	}
+	return 0
 }
 
 func (x *Period) GetRx() uint64 {
@@ -781,14 +783,14 @@ func (x *Period) GetTx() uint64 {
 
 type Ping struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Target        string                 `protobuf:"bytes,1,opt,name=target,proto3" json:"target,omitempty"` // peer name from agent config
-	Addr          string                 `protobuf:"bytes,2,opt,name=addr,proto3" json:"addr,omitempty"`     // resolved IP, empty if resolution failed
+	Target        string                 `protobuf:"bytes,1,opt,name=target,proto3" json:"target,omitempty"` // peer name from the agent config
+	Addr          string                 `protobuf:"bytes,2,opt,name=addr,proto3" json:"addr,omitempty"`     // resolved address, empty if resolution failed
 	Sent          uint32                 `protobuf:"varint,3,opt,name=sent,proto3" json:"sent,omitempty"`
 	Lost          uint32                 `protobuf:"varint,4,opt,name=lost,proto3" json:"lost,omitempty"`
 	Min           float32                `protobuf:"fixed32,5,opt,name=min,proto3" json:"min,omitempty"` // milliseconds, over replies only
 	Avg           float32                `protobuf:"fixed32,6,opt,name=avg,proto3" json:"avg,omitempty"`
 	Max           float32                `protobuf:"fixed32,7,opt,name=max,proto3" json:"max,omitempty"`
-	Jitter        float32                `protobuf:"fixed32,8,opt,name=jitter,proto3" json:"jitter,omitempty"` // mean absolute difference of consecutive RTTs
+	Jitter        float32                `protobuf:"fixed32,8,opt,name=jitter,proto3" json:"jitter,omitempty"` // mean absolute difference of consecutive round trips
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -934,65 +936,61 @@ const file_proto_probe_v1_probe_proto_rawDesc = "" +
 	"\x03sys\x18\x03 \x01(\v2\x11.probe.v1.SysInfoR\x03sys\x12\x1f\n" +
 	"\x03cpu\x18\x04 \x01(\v2\r.probe.v1.CPUR\x03cpu\x12\"\n" +
 	"\x04load\x18\x05 \x01(\v2\x0e.probe.v1.LoadR\x04load\x12\x1f\n" +
-	"\x03mem\x18\x06 \x01(\v2\r.probe.v1.MemR\x03mem\x12$\n" +
-	"\x05disks\x18\a \x03(\v2\x0e.probe.v1.DiskR\x05disks\x12#\n" +
-	"\x03net\x18\b \x03(\v2\x11.probe.v1.NetRateR\x03net\x120\n" +
-	"\atraffic\x18\t \x03(\v2\x16.probe.v1.IfaceTrafficR\atraffic\x12$\n" +
-	"\x05pings\x18\n" +
-	" \x03(\v2\x0e.probe.v1.PingR\x05pings\x12+\n" +
-	"\asockets\x18\v \x01(\v2\x11.probe.v1.SocketsR\asockets\"\xd1\x01\n" +
+	"\x03mem\x18\x06 \x01(\v2\r.probe.v1.MemR\x03mem\x12+\n" +
+	"\asockets\x18\a \x01(\v2\x11.probe.v1.SocketsR\asockets\x12$\n" +
+	"\x05disks\x18\b \x03(\v2\x0e.probe.v1.DiskR\x05disks\x12#\n" +
+	"\x03net\x18\t \x03(\v2\x11.probe.v1.NetRateR\x03net\x120\n" +
+	"\atraffic\x18\n" +
+	" \x03(\v2\x16.probe.v1.IfaceTrafficR\atraffic\x12$\n" +
+	"\x05pings\x18\v \x03(\v2\x0e.probe.v1.PingR\x05pings\"\xb9\x01\n" +
 	"\aSysInfo\x12\x1a\n" +
 	"\bhostname\x18\x01 \x01(\tR\bhostname\x12\x0e\n" +
 	"\x02os\x18\x02 \x01(\tR\x02os\x12\x16\n" +
 	"\x06kernel\x18\x03 \x01(\tR\x06kernel\x12\x12\n" +
 	"\x04arch\x18\x04 \x01(\tR\x04arch\x12\x14\n" +
 	"\x05cores\x18\x05 \x01(\rR\x05cores\x12\x1b\n" +
-	"\tboot_time\x18\x06 \x01(\x03R\bbootTime\x12\x16\n" +
-	"\x06uptime\x18\a \x01(\x04R\x06uptime\x12#\n" +
-	"\ragent_version\x18\b \x01(\tR\fagentVersion\"\\\n" +
+	"\tboot_time\x18\x06 \x01(\x03R\bbootTime\x12#\n" +
+	"\ragent_version\x18\a \x01(\tR\fagentVersion\"K\n" +
 	"\x03CPU\x12\x14\n" +
 	"\x05usage\x18\x01 \x01(\x02R\x05usage\x12\x14\n" +
-	"\x05steal\x18\x02 \x01(\x02R\x05steal\x12\x1d\n" +
-	"\asoftirq\x18\x03 \x01(\x02H\x00R\asoftirq\x88\x01\x01B\n" +
-	"\n" +
-	"\b_softirq\"R\n" +
+	"\x05steal\x18\x02 \x01(\x02R\x05steal\x12\x18\n" +
+	"\asoftirq\x18\x03 \x01(\x02R\asoftirq\"R\n" +
 	"\x04Load\x12\x0e\n" +
 	"\x02l1\x18\x01 \x01(\x02R\x02l1\x12\x0e\n" +
 	"\x02l5\x18\x02 \x01(\x02R\x02l5\x12\x10\n" +
 	"\x03l15\x18\x03 \x01(\x02R\x03l15\x12\x18\n" +
-	"\athreads\x18\x04 \x01(\rR\athreads\"D\n" +
-	"\aSockets\x12\x10\n" +
-	"\x03tcp\x18\x01 \x01(\rR\x03tcp\x12\x10\n" +
-	"\x03udp\x18\x02 \x01(\rR\x03udp\x12\x15\n" +
-	"\x06tcp_tw\x18\x03 \x01(\rR\x05tcpTw\"k\n" +
+	"\athreads\x18\x04 \x01(\rR\athreads\"k\n" +
 	"\x03Mem\x12\x14\n" +
 	"\x05total\x18\x01 \x01(\x04R\x05total\x12\x12\n" +
 	"\x04used\x18\x02 \x01(\x04R\x04used\x12\x1d\n" +
 	"\n" +
 	"swap_total\x18\x03 \x01(\x04R\tswapTotal\x12\x1b\n" +
-	"\tswap_used\x18\x04 \x01(\x04R\bswapUsed\"y\n" +
+	"\tswap_used\x18\x04 \x01(\x04R\bswapUsed\"D\n" +
+	"\aSockets\x12\x10\n" +
+	"\x03tcp\x18\x01 \x01(\rR\x03tcp\x12\x10\n" +
+	"\x03udp\x18\x02 \x01(\rR\x03udp\x12\x15\n" +
+	"\x06tcp_tw\x18\x03 \x01(\rR\x05tcpTw\"y\n" +
 	"\x04Disk\x12\x14\n" +
 	"\x05mount\x18\x01 \x01(\tR\x05mount\x12\x14\n" +
 	"\x05total\x18\x02 \x01(\x04R\x05total\x12\x12\n" +
 	"\x04used\x18\x03 \x01(\x04R\x04used\x12\x14\n" +
 	"\x05avail\x18\x04 \x01(\x04R\x05avail\x12\x1b\n" +
-	"\tinode_pct\x18\x05 \x01(\x02R\binodePct\"\x9f\x01\n" +
+	"\tinode_pct\x18\x05 \x01(\x02R\binodePct\"\x7f\n" +
 	"\aNetRate\x12\x14\n" +
 	"\x05iface\x18\x01 \x01(\tR\x05iface\x12\x17\n" +
 	"\arx_rate\x18\x02 \x01(\x04R\x06rxRate\x12\x17\n" +
-	"\atx_rate\x18\x03 \x01(\x04R\x06txRate\x12\x1a\n" +
-	"\x06rx_pps\x18\x04 \x01(\x04H\x00R\x05rxPps\x88\x01\x01\x12\x1a\n" +
-	"\x06tx_pps\x18\x05 \x01(\x04H\x01R\x05txPps\x88\x01\x01B\t\n" +
-	"\a_rx_ppsB\t\n" +
-	"\a_tx_pps\"n\n" +
+	"\atx_rate\x18\x03 \x01(\x04R\x06txRate\x12\x15\n" +
+	"\x06rx_pps\x18\x04 \x01(\x04R\x05rxPps\x12\x15\n" +
+	"\x06tx_pps\x18\x05 \x01(\x04R\x05txPps\"n\n" +
 	"\fIfaceTraffic\x12\x14\n" +
 	"\x05iface\x18\x01 \x01(\tR\x05iface\x12\"\n" +
 	"\x03cur\x18\x02 \x01(\v2\x10.probe.v1.PeriodR\x03cur\x12$\n" +
-	"\x04prev\x18\x03 \x01(\v2\x10.probe.v1.PeriodR\x04prev\">\n" +
+	"\x04prev\x18\x03 \x01(\v2\x10.probe.v1.PeriodR\x04prev\"P\n" +
 	"\x06Period\x12\x14\n" +
-	"\x05start\x18\x01 \x01(\tR\x05start\x12\x0e\n" +
-	"\x02rx\x18\x02 \x01(\x04R\x02rx\x12\x0e\n" +
-	"\x02tx\x18\x03 \x01(\x04R\x02tx\"\xa8\x01\n" +
+	"\x05start\x18\x01 \x01(\x03R\x05start\x12\x10\n" +
+	"\x03end\x18\x02 \x01(\x03R\x03end\x12\x0e\n" +
+	"\x02rx\x18\x03 \x01(\x04R\x02rx\x12\x0e\n" +
+	"\x02tx\x18\x04 \x01(\x04R\x02tx\"\xa8\x01\n" +
 	"\x04Ping\x12\x16\n" +
 	"\x06target\x18\x01 \x01(\tR\x06target\x12\x12\n" +
 	"\x04addr\x18\x02 \x01(\tR\x04addr\x12\x12\n" +
@@ -1003,7 +1001,7 @@ const file_proto_probe_v1_probe_proto_rawDesc = "" +
 	"\x03max\x18\a \x01(\x02R\x03max\x12\x16\n" +
 	"\x06jitter\x18\b \x01(\x02R\x06jitter\"\x17\n" +
 	"\x03Ack\x12\x10\n" +
-	"\x03ids\x18\x01 \x03(\x04R\x03idsB!Z\x1fvpsprobe/internal/proto/probev1b\x06proto3"
+	"\x03ids\x18\x01 \x03(\x04R\x03idsB8Z6github.com/shakespark/vps-probe/internal/proto/probev1b\x06proto3"
 
 var (
 	file_proto_probe_v1_probe_proto_rawDescOnce sync.Once
@@ -1023,8 +1021,8 @@ var file_proto_probe_v1_probe_proto_goTypes = []any{
 	(*SysInfo)(nil),      // 1: probe.v1.SysInfo
 	(*CPU)(nil),          // 2: probe.v1.CPU
 	(*Load)(nil),         // 3: probe.v1.Load
-	(*Sockets)(nil),      // 4: probe.v1.Sockets
-	(*Mem)(nil),          // 5: probe.v1.Mem
+	(*Mem)(nil),          // 4: probe.v1.Mem
+	(*Sockets)(nil),      // 5: probe.v1.Sockets
 	(*Disk)(nil),         // 6: probe.v1.Disk
 	(*NetRate)(nil),      // 7: probe.v1.NetRate
 	(*IfaceTraffic)(nil), // 8: probe.v1.IfaceTraffic
@@ -1036,12 +1034,12 @@ var file_proto_probe_v1_probe_proto_depIdxs = []int32{
 	1,  // 0: probe.v1.Report.sys:type_name -> probe.v1.SysInfo
 	2,  // 1: probe.v1.Report.cpu:type_name -> probe.v1.CPU
 	3,  // 2: probe.v1.Report.load:type_name -> probe.v1.Load
-	5,  // 3: probe.v1.Report.mem:type_name -> probe.v1.Mem
-	6,  // 4: probe.v1.Report.disks:type_name -> probe.v1.Disk
-	7,  // 5: probe.v1.Report.net:type_name -> probe.v1.NetRate
-	8,  // 6: probe.v1.Report.traffic:type_name -> probe.v1.IfaceTraffic
-	10, // 7: probe.v1.Report.pings:type_name -> probe.v1.Ping
-	4,  // 8: probe.v1.Report.sockets:type_name -> probe.v1.Sockets
+	4,  // 3: probe.v1.Report.mem:type_name -> probe.v1.Mem
+	5,  // 4: probe.v1.Report.sockets:type_name -> probe.v1.Sockets
+	6,  // 5: probe.v1.Report.disks:type_name -> probe.v1.Disk
+	7,  // 6: probe.v1.Report.net:type_name -> probe.v1.NetRate
+	8,  // 7: probe.v1.Report.traffic:type_name -> probe.v1.IfaceTraffic
+	10, // 8: probe.v1.Report.pings:type_name -> probe.v1.Ping
 	9,  // 9: probe.v1.IfaceTraffic.cur:type_name -> probe.v1.Period
 	9,  // 10: probe.v1.IfaceTraffic.prev:type_name -> probe.v1.Period
 	11, // [11:11] is the sub-list for method output_type
@@ -1056,8 +1054,6 @@ func file_proto_probe_v1_probe_proto_init() {
 	if File_proto_probe_v1_probe_proto != nil {
 		return
 	}
-	file_proto_probe_v1_probe_proto_msgTypes[2].OneofWrappers = []any{}
-	file_proto_probe_v1_probe_proto_msgTypes[7].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
