@@ -228,13 +228,14 @@ class ChartGroup {
 // over outages instead of bridging them. "Missing" is judged against the
 // series' own typical spacing, since some data (disks: every 60s) is sparser
 // than the bucket step.
-function points(ts, vals, step, f = v => v) {
+// extra: more columns to carry along in each point, e.g. loss beside avg.
+function points(ts, vals, step, f = v => v, extra = []) {
   const diffs = ts.slice(1).map((t, i) => t - ts[i]).sort((a, b) => a - b);
   const typical = Math.max(step, diffs.length ? diffs[diffs.length >> 1] : step);
   const out = [];
   for (let i = 0; i < ts.length; i++) {
     if (i > 0 && ts[i] - ts[i - 1] > typical * 2.5) out.push([(ts[i - 1] + step) * 1000, null]);
-    out.push([ts[i] * 1000, vals[i] == null ? null : f(vals[i])]);
+    out.push([ts[i] * 1000, vals[i] == null ? null : f(vals[i]), ...extra.map(a => a[i])]);
   }
   return out;
 }
@@ -844,8 +845,35 @@ function renderStrips(box, avail, nodes, cols, nameOf) {
   box.replaceChildren(...out);
 }
 
+// Loss levels of one sample, in the availability strips' colors: below 1%
+// is fine there too, and a 5-minute period losing 20% or more counts as
+// unavailable.
+const LOSS_LEVELS = [[1, 'a-up', '< 1%'], [20, 'a-lossy', '1–20%'], [50, 'a-part', '20–50%'],
+  [Infinity, 'a-down', '≥ 50%']];
+const lossLevel = pct => LOSS_LEVELS.findIndex(l => pct < l[0]);
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+// lossPieces colors a line by each point's loss (column 2), as a visualMap
+// over time: ECharts colors line segments only by an axis dimension. Each
+// point owns the time up to halfway to its neighbors.
+function lossPieces(pts, colors) {
+  const ps = pts.filter(p => p[1] != null && p[2] != null);
+  const pieces = [];
+  ps.forEach((p, i) => {
+    const lo = i ? (ps[i - 1][0] + p[0]) / 2 : p[0] - 1e9;
+    const hi = i < ps.length - 1 ? (p[0] + ps[i + 1][0]) / 2 : p[0] + 1e9;
+    const color = colors[lossLevel(p[2])];
+    const last = pieces[pieces.length - 1];
+    if (last && last.color === color && last.lt === lo) last.lt = hi;
+    else pieces.push({ gte: lo, lt: hi, color });
+  });
+  return pieces;
+}
+
 function linkPage(src, dst) {
   const chart = new Chart('时延与丢包');
+  chart.el.insertBefore(h('div', { class: 'legend chart-legend' }, '平均线和丢包柱按丢包率着色：',
+    LOSS_LEVELS.map(([, cls, label]) => h('span', { class: cls, text: label }))), chart.box);
   const stats = h('div', { class: 'summary' });
   const el = h('div', null,
     h('div', { class: 'row' }, h('a', { href: '#/ping', text: '← 时延矩阵' })),
@@ -871,13 +899,22 @@ function linkPage(src, dst) {
         kv('平均', avgs.length ? fmtMs(avgs.reduce((a, v) => a + v, 0) / avgs.length) : '—'),
         kv('最大', vals('max').length ? fmtMs(Math.max(...vals('max'))) : '—'),
         kv('数据粒度', `${s.tier} / ${st}s`));
-      chart.set(timeOption(from, to, fmtMs, [
-        line('最小', points(s.ts, c.min, st), { lineStyle: { width: 1, type: 'dashed' } }),
-        line('平均', points(s.ts, c.avg, st), { lineStyle: { width: 2 } }),
-        line('最大', points(s.ts, c.max, st), { lineStyle: { width: 1, type: 'dashed' } }),
+      // Min and max stay neutral so no series color reads as a loss level.
+      const colors = LOSS_LEVELS.map(l => cssVar('--' + l[1])), gray = cssVar('--muted');
+      const avg = points(s.ts, c.avg, st, undefined, [c.loss_pct]);
+      const option = timeOption(from, to, fmtMs, [
+        line('最小', points(s.ts, c.min, st), { lineStyle: { width: 1, type: 'dashed' }, itemStyle: { color: gray } }),
+        line('平均', avg, { lineStyle: { width: 2 }, itemStyle: { color: colors[0] } }),
+        line('最大', points(s.ts, c.max, st), { lineStyle: { width: 1, type: 'dotted' }, itemStyle: { color: gray } }),
         { type: 'bar', name: '丢包', yAxisIndex: 1, data: points(s.ts, c.loss_pct, st), barMaxWidth: 6,
-          itemStyle: { opacity: 0.5 }, tooltip: { valueFormatter: v => v == null ? '—' : fmtPct(v, 1) } },
-      ], { y2: { type: 'value', min: 0, max: 100, axisLabel: { formatter: '{value}%' }, splitLine: { show: false } } }));
+          itemStyle: { opacity: 0.6, color: p => colors[p.value[1] == null ? 0 : lossLevel(p.value[1])] },
+          tooltip: { valueFormatter: v => v == null ? '—' : fmtPct(v, 1) } },
+      ], { y2: { type: 'value', min: 0, max: 100, axisLabel: { formatter: '{value}%' }, splitLine: { show: false } } });
+      // The bars' own color varies by level; visible ones always have loss.
+      option.legend.data = ['最小', '平均', '最大', { name: '丢包', itemStyle: { color: colors[3] } }];
+      option.visualMap = { type: 'piecewise', show: false, dimension: 0, seriesIndex: 1,
+        pieces: lossPieces(avg, colors), outOfRange: { color: colors[0] } };
+      chart.set(option);
     },
   };
 }
