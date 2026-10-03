@@ -47,9 +47,13 @@ set_role() {
 preflight() {
 	[ "$(id -u)" = 0 ] || die "run as root"
 	command -v systemctl >/dev/null 2>&1 || die "systemd is required"
-	[ -x "$HERE/bin/$NAME" ] || die "$HERE/bin/$NAME not found; run this from the unpacked release directory"
-	"$HERE/bin/$NAME" version >/dev/null 2>&1 ||
+	[ -f "$HERE/bin/$NAME" ] || die "$HERE/bin/$NAME not found; run this from the unpacked release directory"
+	if ! "$HERE/bin/$NAME" version >/dev/null 2>&1; then
+		if command -v findmnt >/dev/null 2>&1 && findmnt -no OPTIONS -T "$HERE" | grep -qw noexec; then
+			die "$HERE is on a filesystem mounted noexec, so the programs in it cannot be run. Unpack the release somewhere else (for the one-line install command: put TMPDIR=/root in front of it)."
+		fi
 		die "$HERE/bin/$NAME does not run here: this package is for another CPU architecture? (this machine: $(uname -m))"
+	fi
 }
 
 ensure_user() {

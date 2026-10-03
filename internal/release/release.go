@@ -40,7 +40,8 @@ var (
 	versionRE = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 	// What may appear unquoted inside the command: no quote, space or
 	// shell metacharacter.
-	baseRE = regexp.MustCompile(`^https?://[A-Za-z0-9._~:/@%+=-]+$`)
+	baseRE      = regexp.MustCompile(`^https?://[A-Za-z0-9._~:/@%+=-]+$`)
+	principalRE = regexp.MustCompile(`^[A-Za-z0-9._@-]+$`)
 )
 
 // signerLines returns the key lines of an allowed_signers file and the
@@ -55,7 +56,7 @@ func signerLines(s string) (lines []string, principal string, err error) {
 		if principal != "" && p != principal {
 			return nil, "", fmt.Errorf("release signers: principals %q and %q differ; use one name for every key", principal, p)
 		}
-		if !regexp.MustCompile(`^[A-Za-z0-9._@-]+$`).MatchString(p) {
+		if !principalRE.MatchString(p) {
 			return nil, "", fmt.Errorf("release signers: principal %q: want letters, digits and . _ @ -", p)
 		}
 		principal = p
@@ -78,7 +79,7 @@ func signerLines(s string) (lines []string, principal string, err error) {
 // Debian does not set it).
 func (c Command) Line() (string, error) {
 	if !versionRE.MatchString(c.Version) {
-		return "", fmt.Errorf("version %q: want a release like 0.1.17 (pass -version)", c.Version)
+		return "", fmt.Errorf("version %q: want a release like 0.2.0 (pass -version)", c.Version)
 	}
 	base := strings.TrimRight(c.Base, "/")
 	if base == "" {
@@ -102,9 +103,11 @@ func (c Command) Line() (string, error) {
 		return "", errors.New("empty agent config")
 	}
 	b64 := base64.StdEncoding.EncodeToString
-	install := `echo ` + b64([]byte(c.AgentConfig)) + ` | base64 -d > agent.yml; ./$P/install.sh agent --config agent.yml`
+	// Through sh, not by its executable bit: where the temporary directory is
+	// mounted noexec the installer still starts, and says so.
+	install := `echo ` + b64([]byte(c.AgentConfig)) + ` | base64 -d > agent.yml; sh ./$P/install.sh agent --config agent.yml`
 	if c.Upgrade {
-		install = `./$P/install.sh agent --upgrade`
+		install = `sh ./$P/install.sh agent --upgrade`
 	}
 
 	// Inside single quotes: the script itself must not contain one. Data
