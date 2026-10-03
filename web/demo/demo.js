@@ -1,4 +1,4 @@
-// Demo data for the static demo site (docs/DESIGN.md §14). Loaded before
+// Demo data for the static demo site (docs/DESIGN.md §11). Loaded before
 // app.js, it answers the UI's /api/* requests in the browser: there is no
 // server. Every node, host name and address here is made up.
 //

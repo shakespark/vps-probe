@@ -1,749 +1,482 @@
-# VPS 探针设计文档
+# vps-probe 设计文档
 
-## 0. 背景与目标
+本文描述 0.2 的设计：它为什么是现在这个样子，以及改动它时要守住什么。怎么安装和使用见 [README](../README.md) 和 `docs/` 下的其他文档。
 
-之前使用哪吒探针，面板被攻破后所有 VPS 均被控制，只能全部重装。根本原因在于架构：面板持有对全部 agent 的 root 命令通道。本项目的首要目标是**即使服务端被完全攻破，也无法控制任何一台 VPS**。
+## 1. 目标与范围
 
-功能需求：
+起因：之前用的探针，面板被攻破后所有被监控的机器都被控制，只能全部重装。根本原因在架构上：面板握着通往每台 agent 的 root 命令通道。所以首要目标是：**即使服务端被完全攻破，也无法控制任何一台被监控的机器。**
 
-| # | 需求 | 说明 |
+功能：
+
+| 需求 | 说明 |
+|---|---|
+| 资源监控 | CPU、内存、Swap、磁盘、负载、网速、包速率、连接数，可看历史曲线 |
+| 节点间时延 | N×N 互测，记录 min / avg / max / 抖动 / 丢包；也能测经隧道的时延 |
+| 流量统计 | 计入配额的网卡的收发总量，按每台机器自己的计费周期累计，**重启不丢** |
+| 告警与报告 | 资源阈值、离线、丢包、DDoS 识别；配额、到期、周期结算、每周汇总 |
+
+范围：十几台 Linux + systemd 的 VPS（amd64 / arm64），一个人或几个人自己用。KVM 上长期运行过；LXC 容器支持（§6.7）；OpenVZ 只有网卡识别的兜底，没有在真机上验证过。
+
+## 2. 安全原则
+
+这些是硬约束，任何功能都不能放松它们。
+
+1. **agent 只出不进**：不监听任何端口，只主动向服务端发 UDP 报文；唯一接收的是服务端对报文的加密确认（ACK），里面只有已收到的报文 id，作用只是把报文移出重传队列。
+2. **agent 不接受任何指令**：不执行命令、不下载脚本、不自动更新、不从服务端拉配置。ping 谁、统计哪块网卡、周期哪天开始，都写在它自己的配置文件里。
+3. **agent 非 root**：专用系统用户，没有任何 capability，systemd 沙箱（§6.6）。它只读 `/proc`、`/sys` 和 `statfs`。
+4. **网页只读、必须先登录**：只有 GET 接口；默认只监听 `127.0.0.1`，前面必须有一层登录（Cloudflare Access、内置 Basic 认证，或自带登录的反向代理）。没有匿名可见的页面。所有配置都在服务端的配置文件里。
+5. **ingest 对未认证的包不作任何回应**：服务端唯一面向公网的是一个 UDP 端口，校验不过的包静默丢弃，端口扫描分辨不出它和被防火墙过滤的端口。
+6. **通知渠道只发不收**：Telegram 只调用 `sendMessage`，不读消息；webhook 不使用响应内容。不存在经通知渠道下指令的路。
+7. **每个节点独立的 token**：token 派生该节点的加密密钥，泄露一个只影响那一个节点的数据。
+8. **隧道应答端与 agent 分离**：要被探测的隧道终点另装 `vps-probe-echo`，独立的程序和用户，只回应带正确签名的请求。agent 本身仍然不监听。
+9. **发布包可验证**：离线密钥签名，CI 不持有密钥；构建可复现（§10）。
+
+最坏情况：
+
+| 被攻破的 | 攻击者能做的 | 做不到的 |
 |---|---|---|
-| F1 | VPS 之间时延 | N×N 互测，ICMP，记录 min/avg/max/抖动/丢包，可图形化查看历史 |
-| F2 | 资源监控 | CPU、内存、Swap、磁盘占用、负载、网络速率，图形化查看历史 |
-| F3 | 告警 | 资源阈值、离线、时延/丢包、流量配额，通过 Telegram 推送 |
-| F4 | 月流量统计 | 物理网口收/发总量，按周期（默认自然月，可配置账单日）累计，**重启不丢数据** |
+| 服务端 | 看到、篡改监控数据；用通知渠道发消息 | 在任何节点上执行代码 |
+| 一个节点 | 伪造这一个节点自己的数据 | 冒充别的节点；借主机名之类的字符串在网页里执行脚本 |
+| GitHub 账号或 CI | 推代码、替换 Release 里的文件 | 发出能通过签名验证的发布包 |
 
-规模：≤10 台 Linux VPS，以 KVM 等完整虚拟化为主。LXC 容器从 0.1.21 起支持（§5.7，在 Proxmox 的 LXC 上实测过）；OpenVZ 只有网卡识别的兜底（§4.1），没有在真机上验证。
-
-## 1. 安全原则（硬性约束）
-
-1. **agent 只出不进**：不监听任何端口，只主动向服务端发送 UDP 上报包；唯一接收的是服务端对上报包的加密确认（ACK），ACK 里只有已收到的报文 ID。
-2. **agent 不接受任何指令**：不执行命令、不下载脚本、不远程更新、不从服务端拉取配置。agent 只从服务端接收 ACK，ACK 仅用于把已送达的报文移出重传队列，不含任何其他语义。
-3. **agent 非 root 运行**：专用系统用户 `vps-probe`，systemd 加固；采集数据只读 `/proc`、`/sys`、`statfs`，都不需要 root。
-4. **互测目标由 agent 本地配置**：不由服务端下发，防止服务端被利用去探测任意地址。
-5. **Web 必须先鉴权才能访问**：Web 默认只监听 `127.0.0.1`，前面必须有一层登录，三选一：Cloudflare Tunnel + Access（推荐，服务端再校验 Access 令牌，§6.1 cf_access）；内置 HTTP Basic 认证（§6.1 basic_auth，放在 HTTPS 反向代理之后）；或者由自带鉴权的反向代理负责。没有匿名可见的页面。服务端唯一直接面向公网的端口是 UDP ingest（agent 上报），**校验不通过的包一律静默丢弃、不做任何回应**，端口扫描器无法把它与被防火墙过滤的端口区分开（见 §6.2）。
-6. **Web 只读**：Web 没有任何写接口，所有配置通过服务端配置文件修改。
-7. **通知渠道只发不收**：Telegram Bot 不设置 webhook、不调用 getUpdates；webhook 通知（§7）只发请求、不使用响应内容。不存在通过通知渠道下达指令的通道。
-8. **每台 agent 独立 token**：token 派生出该节点的加密密钥（§5.3），一台的 token 泄露只影响该节点的数据。服务端需要用 token 解密，因此服务端配置文件中保存 token 明文，文件权限 0600。
-
-9. **隧道探测应答端与 agent 分离**：需要被探测的隧道终点另装 `vps-probe-echo`（§5.2），它是独立的程序和系统用户，只回应用共享密钥签名的请求，其他包静默丢弃；agent 本身仍不监听任何端口。
-
-最坏情况分析：服务端被攻破 → 攻击者能看到/篡改监控数据、能用 TG bot 发消息，但**无法在任何 agent 上执行代码**。
-
-## 2. 总体架构
+## 3. 总体架构
 
 ```
- ┌──────────── VPS × N ────────────┐
- │ vps-probe-agent (非 root)        │
+ ┌──────────── 每台 VPS ────────────┐
+ │ vps-probe-agent（非 root）        │
  │  ├ 采集 /proc /sys statfs         │
- │  ├ ICMP 互测 peers（本地配置）     │
+ │  ├ 探测本地配置里的 peers          │
  │  ├ 流量累计 → 本地状态文件         │
- │  └ 每 10s 发送加密 UDP 包 ────────┼──┐  公网直连
- └─────────────────────────────────┘  │  UDP + protobuf + XChaCha20-Poly1305
-                                      │  ▲ 仅对合法包回 ACK
- ┌──────────── 服务端 VPS ───────────┐ │
- │ vps-probe-server                  │ │
- │   ├ :9527/udp         ingest ◄────┼─┘  非法包静默丢弃
- │   ├ 127.0.0.1:8080 Web + 只读 API │
- │   ├ SQLite (WAL)                  │
- │   ├ 降采样 / 过期清理              │
- │   └ 告警引擎 → api.telegram.org    │
- │ cloudflared ──→ 127.0.0.1:8080    │ ◄── 浏览器 → Cloudflare Access 登录
- │ vps-probe-agent（本机也装一份）     │
+ │  └ 每 10 秒发一个加密 UDP 报文 ────┼──┐  UDP + protobuf + XChaCha20-Poly1305
+ └──────────────────────────────────┘  │  ▲ 只对合法报文回 ACK
+ ┌──────────── 服务端 ───────────────┐  │
+ │ vps-probe-server                  │  │
+ │   ├ :9527/udp  ingest ◄───────────┼──┘  其余一律静默丢弃
+ │   ├ SQLite（一个文件）             │
+ │   ├ 聚合 / 清理 / 每日备份         │
+ │   ├ 告警与报告 → 通知渠道（只发）   │
+ │   └ 127.0.0.1:8080 只读 API + 网页 │ ◄── 反向代理 / 隧道 ◄── 登录后的浏览器
  └───────────────────────────────────┘
 ```
 
-- **ingest 与 Web 完全独立**：ingest 是 UDP，只接受加密上报包，不提供任何查询；Web 只绑定 `127.0.0.1`，公网无法直接访问。
-- Web：cloudflared 把 `probe.example.com` 映射到 `127.0.0.1:8080`，Cloudflare Access 配置登录策略（邮箱 OTP / GitHub 等）。服务端可选校验 `Cf-Access-Jwt-Assertion` JWT（纵深防御，推荐开启）。
-- 不用 Cloudflare 时：任意 HTTPS 反向代理（Caddy、nginx）转发到 `127.0.0.1:8080`，服务端开 `basic_auth`；或者由反向代理自己做鉴权。
-- 服务端宕机或网络中断时：监控曲线会出现缺口（agent 内存缓冲 1 小时，恢复后补传），**月流量不受影响**（在 agent 本地累计，见 §4）。
+- ingest 和网页互不相干：ingest 只收报文、不提供查询；网页只绑定本机。
+- 服务端宕机或网络中断：曲线上出现缺口（agent 在内存里保留 1 小时的报文，恢复后补传）；**流量总量不受影响**，它在 agent 本地累计。
+- 服务端不需要知道 agent 的地址，agent 在 NAT 后面也一样工作。
 
-## 3. 技术选型
+## 4. 技术选型
 
 | 部分 | 选型 | 理由 |
 |---|---|---|
-| 语言 | Go 1.24 | 单文件静态二进制，交叉编译 amd64/arm64 方便 |
-| 数据库 | SQLite（`modernc.org/sqlite`，纯 Go） | 10 台规模绰绰有余，无需 cgo，备份就是一个文件 |
-| 前端 | 原生 JS + ECharts，`go:embed` 打包进二进制 | 无构建链；ECharts 本地打包，不引用外部 CDN |
-| 上报编码 | protobuf（`google.golang.org/protobuf`） | 紧凑，一份上报约 600 字节，单个 UDP 包即可装下；生成代码提交进仓库，日常开发无需 protoc |
-| 加密 | XChaCha20-Poly1305（`golang.org/x/crypto`）+ HKDF-SHA256（标准库） | 加密与防伪造一步完成；24 字节随机 nonce 无需计数器 |
-| ICMP | `golang.org/x/net/icmp` | 支持非特权 datagram ICMP socket |
-| 配置 | YAML（`gopkg.in/yaml.v3`） | 可读性好，支持注释 |
+| 语言 | Go | 单文件静态程序，交叉编译方便 |
+| 数据库 | SQLite（`modernc.org/sqlite`，纯 Go） | 这个规模绰绰有余；不需要 cgo；备份就是一个文件 |
+| 前端 | 原生 ES 模块 + ECharts，`go:embed` 进服务端 | 没有构建链；不引用外部 CDN |
+| 报文 | protobuf | 紧凑，一份报文约 600 字节，一个 UDP 包装得下；生成的代码已提交 |
+| 加密 | XChaCha20-Poly1305 + HKDF-SHA256 | 加密和防伪造一步完成；24 字节随机 nonce 不需要计数器 |
+| 配置 | YAML | 可读、能写注释 |
 | 部署 | systemd + 安装脚本 | 不依赖 Docker |
 
-依赖尽量少，每个第三方库都要能说出存在的理由。
+依赖尽量少：每个第三方库都要说得出为什么需要它。
 
-## 4. 月流量统计（重点）
+## 5. 代码结构
 
-### 4.1 网卡选择
-
-- 默认自动识别：`/sys/class/net/<if>/device` 存在的网卡视为物理网卡（KVM 下 virtio 网卡也有 device 链接），排除 `lo`、`docker*`、`veth*`、`br-*`、`wg*`、`tun*`、`tailscale*` 等。
-- 一块物理网卡都识别不到时（OpenVZ 的 `venet0`、LXC 里由 veth 充当的 `eth0` 都没有 device 链接），退而统计默认路由所在的网卡：读 `/proc/net/route` 和 `/proc/net/ipv6_route` 里已启用的默认路由，`lo` 除外。仍然找不到才报错（agent ≥ 0.1.18）。
-- 有**两块以上**物理网卡时，只统计带默认路由的那几块（agent ≥ 0.1.20）：第二块网卡常常是商家的内网，算进去会把内网流量记到配额里。IPv4 和 IPv6 的默认路由在不同网卡上时两块都统计。只有一块物理网卡的机器不看路由表，行为不变。
-  - 有默认路由、但不在任何物理网卡上（默认路由走 WireGuard、WARP、ppp 等隧道）：统计全部物理网卡，与以前相同。计费流量走的是物理网卡，不是隧道接口。
-  - 一条默认路由都没有（开机时网络还没起来、DHCP 续租的瞬间）：这时判断不了，**沿用上一次的选择**；刚启动还没有上一次的选择时先不统计任何网卡，每个采样周期重新看一次，直到有默认路由。不能在这时退回"全部物理网卡"：新出现的网卡会按开机以来的累计值计入本周期（§4.2），内网网卡哪怕只被选中一次，整段累计流量就进了配额。
-  - 读不到的情况：策略路由写在别的路由表里的默认路由。第二块物理网卡也走公网计费流量、但上面没有默认路由时会少算，这种机器需要手写 `interfaces`。
-- 可在配置中显式指定 `interfaces: [eth0]`，指定后以配置为准；不写或写空列表即自动识别。
-- 选中多块网卡时分别统计，并提供合计值。
-
-### 4.2 累计算法
-
-数据源：`/proc/net/dev` 中的 rx_bytes / tx_bytes（内核 64 位计数器，开机后从 0 开始）。
-
-本地状态文件 `/var/lib/vps-probe/traffic.json`：
-
-```json
-{
-  "version": 1,
-  "boot_id": "c1a7...",
-  "interfaces": {
-    "eth0": {
-      "last_rx": 123456789, "last_tx": 98765432,
-      "periods": {
-        "2026-09-01": { "rx": 51234567890, "tx": 40123456789 },
-        "2026-08-01": { "rx": 61234567890, "tx": 50123456789 }
-      }
-    }
-  }
-}
+```
+cmd/vps-probe-{agent,server,echo}/   三个程序的入口：解析命令行，把下面的包接起来
+internal/
+  wire/        报文的封装与加密；两端共同遵守的时间常量
+  proto/       生成的 protobuf 代码（源文件在 proto/）
+  peer/        一个探测目标的定义，agent 和服务端的配置共用
+  netaddr/     配置里各种地址的校验
+  echo/        隧道回显协议、应答端和它的配置
+  cli/         三个程序共用的命令行框架
+  atomicfile/  原子地替换文件
+  release/     发布公钥、一行安装命令的生成
+  agent/
+    config/    agent.yml
+    collect/   从内核读指标：FS（此刻的值）、Sampler（两次读数之间的变化）、Selector（算哪些网卡）
+    traffic/   流量按周期累计并落盘
+    ping/      探测 peers
+    report/    拆包、发送、确认、重传
+    agent.go   采样循环：每个间隔把上面几样拼成一份报文
+  server/
+    config/    server.yml：服务端本身、节点、通知渠道、告警规则、报告，各一个文件
+    ingest/    收报文：认证、去重、检查数值范围
+    store/     SQLite：写入、聚合、清理、查询、备份
+    alert/     告警规则的状态机、各指标的定义、报告、消息的措辞
+    notify/    通知渠道：一个队列加重试，后面接 Telegram 或 webhook
+    api/       只读 HTTP API
+    cfaccess/、basicauth/   网页的两种登录保护
+web/           嵌入服务端的网页；web/demo 是演示站的假数据
+deploy/        install.sh、systemd 单元、示例配置
 ```
 
-每次采样（10s）：
+几条贯穿各处的规矩：
 
-1. 读取当前 `boot_id`（`/proc/sys/kernel/random/boot_id`）和计数器 `cur`。
-2. 计算增量：
-   - `boot_id` 与状态文件不同（机器重启过）→ `delta = cur`（开机以来的全部流量）
-   - `boot_id` 相同且 `cur >= last` → `delta = cur - last`
-   - `boot_id` 相同但 `cur < last`（驱动重载/网卡重建导致计数器归零）→ `delta = cur`
-3. 把 `delta` 累加到**当前时间所属周期**，更新 `last = cur`、`boot_id`。
-4. 首次见到某块网卡（首次安装，或新加入统计的网卡）时没有历史读数：若本次开机时间晚于当前周期起点，开机以来的流量全部属于本周期，`delta = cur`；否则无法判断其中有多少属于本周期，只记录基线、不计入。开机时间取「当前时间 − `/proc/uptime`」，读不到 uptime 时取 `/proc/stat` 的 `btime`；两个都读不到（§5.7 的 lxcfs 失效）按「无法判断」处理，只记录基线（agent ≥ 0.1.21，之前只用 `btime`，读不到就拒绝启动）。普通机器上两种取法相等；LXC 容器里 `btime` 是宿主机的开机时间，而网卡计数器是从容器启动时开始的，所以要用 uptime。
-5. 落盘：每 30s 一次 + 收到 SIGTERM 时一次。写法为写临时文件 → fsync → rename → fsync 目录，保证不会写出半个文件。
-6. 周期记录保留最近 24 个。
-7. 状态文件损坏（无法解析）时，将其改名为 `traffic.json.corrupt-<时间>` 保留现场，按首次运行处理并记录错误日志。
+- **一件事只在一处定义。** 上报间隔、多久算离线、报文重传多久，都是 `wire` 里的常量，服务端的存储步长、告警窗口从它们推出来；"节点是否在线"只有 `store.Status.Online` 一个定义；一个指标怎么测、怎么显示，只在 `alert` 的指标表里；一个 peer 合不合法只由 `peer.Validate` 说了算。
+- **能由程序决定的不做成配置项。** agent 没有采样间隔、状态目录、探测频率这些选项：它们改了只会让两端对不上。
+- **服务端说了算的东西不在浏览器里再算一遍。** 配额用了多少、告警的数值和规则怎么写成文字、周期的起止，都由接口给出，页面只负责摆放。
+- **agent 说了算的东西服务端不再推算。** 计费周期的起止由 agent 算好随报文上报，服务端不需要知道重置日。
+- **读不到的数据就不报，而不是报一个假的。** 报文里缺一项，数据库里那一列就是 NULL，页面显示「—」。
 
-数据丢失窗口分析：
+## 6. Agent
 
-| 场景 | 丢失 |
-|---|---|
-| 正常重启 / 关机（systemd 先停 agent） | 0（SIGTERM 时落盘）；agent 停止到内核关闭之间的极少量流量除外 |
-| agent 崩溃 / 升级重启 | 0（boot_id 不变，下次启动用 `cur - last` 补回） |
-| 服务端宕机 / 网络中断 | 0（在 agent 本地累计，恢复后上报总量） |
-| 宿主机断电 / 内核 panic | ≤ 最后 30s 的流量 |
-| agent 被停用期间机器又重启过 | 停用到重启之间的流量（无法避免，属于运维操作） |
+### 6.1 配置
 
-### 4.3 周期计算
+```yaml
+node: hk-1                    # 节点 id
+server: probe.example.com:9527
+token: "<这个节点的 token>"
+# disks: ["/", "/data"]       # 默认只有 /
+# interfaces: [eth0]          # 默认自动识别
+traffic:
+  timezone: Asia/Shanghai
+  reset_day: 1
+  reset_time: "00:00"
+peers:
+  - { name: jp-1, addr: 203.0.113.5 }
+  - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }
+```
 
-- 配置 `timezone`（默认 `Asia/Shanghai`）、`reset_day`（默认 `1`，即自然月）和可选的 `reset_time`（`"HH:MM"`，默认 `00:00`）。
-- 周期以起始日期命名（如 `2026-09-01`）。`reset_day=15` 表示每月 15 日 00:00 起算；`reset_day: 21` + `reset_time: "18:21"` 表示每月 21 日 18:21 起算（按购买时刻重置的商家）；`reset_day` 大于当月天数时取当月最后一天（如 31 在 2 月取 28/29 日），时刻不变。
-- 按日流量以自然日记录：`reset_time` 不是 00:00 时，重置当天的记录归新周期，旧周期的按日明细里缺最后那半天（周期总量不受影响）。
-- 修改已有节点的 `reset_day` / `reset_time` 后，周期起始日期变了，服务端里旧起始日期的那条记录不会自动消失；若它比新周期的起始日期更晚，页面会把它当成当前周期，需要手动删掉（见 README「排查」）。
-- 增量归入**采样时刻**所属的周期。10s 采样粒度下跨月边界的误差可忽略。
-- 若 agent 在月末停止、次月才启动，停止期间积攒的增量会计入新周期（已知限制，写入文档）。
+这个文件通常由服务端的 `add-node` / `install-cmd` 按 `server.yml` 生成（§7.2），但 agent 只认这个本地文件。未知的键是错误，不是被忽略的默认值。
 
-### 4.4 上报与服务端存储
-
-- agent 每次上报**当前周期和上一周期的累计总量**（而不是增量）。服务端做幂等 upsert，丢包、重复都不会导致重复计数；月初上报失败时，上一周期的最终值也能补齐。
-- 服务端对每个 `(node, iface, period_start)` 保存总量及其报文 `ts`，**只接受 `ts` 更新的报文**（latest-ts-wins）。重放的旧包 `ts` 旧（`ts` 在密文里，无法篡改），会被忽略；agent 状态文件重建后总量合法变小，但新报文 `ts` 更新，服务端照常跟随。
-- **按日流量**：服务端记录每个 `(node, iface, 日期)` 当天最后一次看到的本周期总量，某日用量 = 当日值 − 前一日值（同一周期内；周期首日前一日视为 0；差值为负说明 agent 状态重建过，取当日值）。日期按服务端 `timezone` 划分，**必须与各 agent 的 `traffic.timezone` 一致**（默认都是 `Asia/Shanghai`）。
-- agent 状态文件是权威数据源；服务端是副本加展示层。
-
-## 5. Agent 设计
-
-### 5.1 采集项
+### 6.2 采集
 
 | 类别 | 指标 | 来源 | 频率 |
 |---|---|---|---|
-| CPU | 使用率（总体）、steal、软中断占比 | `/proc/stat` 差分 | 10s |
-| 负载 | load1/5/15、线程总数 | `/proc/loadavg`（第 4 字段 `运行/总数` 的总数） | 10s |
-| 连接 | TCP（不含 TIME_WAIT，含监听）、UDP、TIME_WAIT，IPv4 + IPv6 合计 | `/proc/net/sockstat`、`sockstat6`（没有 sockstat6 = 关了 IPv6，按 0 计） | 10s |
-| 内存 | total / available / used、swap total/used | `/proc/meminfo`（used = total − MemAvailable） | 10s |
-| 磁盘 | 每个挂载点 used/total、inode 使用率 | `statfs`，挂载点可配置，默认 `/` | 60s |
-| 网络 | 各物理网卡 rx/tx 速率（字节/秒、包/秒） | `/proc/net/dev` 差分 | 10s |
-| 流量 | 当前/上一周期累计 | 见 §4 | 10s |
-| 系统 | uptime、内核版本、主机名、CPU 核数 | `/proc/uptime` 等 | 启动时 + 每小时 |
-| 时延 | 每个 peer 的 sent/lost/min/avg/max/jitter | ICMP，或 UDP DNS 查询 / 隧道回显 | 每秒 1 包，10s 汇总 |
+| CPU | 使用率、steal、软中断 | `/proc/stat` 两次读数之差 | 10s |
+| 负载 | load1/5/15、线程总数 | `/proc/loadavg` | 10s |
+| 内存 | total、used（= total − MemAvailable）、swap | `/proc/meminfo` | 10s |
+| 连接 | TCP（不含 TIME_WAIT）、UDP、TIME_WAIT，IPv4 + IPv6 | `/proc/net/sockstat`、`sockstat6` | 10s |
+| 网络 | 计入流量的网卡的收发速率，字节/秒和包/秒 | `/proc/net/dev` 两次读数之差 | 10s |
+| 流量 | 当前和上一周期的累计、周期的起止 | §6.4 | 10s |
+| 磁盘 | 各挂载点的用量、inode | `statfs` | 60s |
+| 系统 | 主机名、系统、内核、核数、开机时间、agent 版本 | `/proc`、`/etc/os-release` | 启动时和每小时 |
+| 时延 | 每个 peer 的 sent / lost / min / avg / max / jitter | §6.5 | 每秒一个探测，10s 汇总 |
 
-CPU steal 单独记录，便于发现超售的机器。
+- `collect.FS` 读此刻的值；`collect.Sampler` 保存上一次读数，直接给出"这段时间里"的百分比和速率，采样循环不替它记任何东西。
+- **读不到就不报**：某一项读取失败，这一项在本次报文里留空，其余照常上报；同一项连续失败只在第一次记一条日志，恢复时再记一条。唯一不能缺的是 `boot_id`（流量统计靠它识别重启）。
+- 软中断主要是内核处理网络包的时间，是 CPU 使用率的一部分；它和包速率一起用来识别"包多流量小"的攻击（SYN flood 的包只有约 60 字节）。
+- 报线程总数而不是进程数：沙箱里的 agent 在 `/proc` 里只看得到自己的进程，`/proc/loadavg` 的总数不受影响。
+- steal 单独记录，便于发现超售的机器。
 
-**读不到就不报，不退出**：CPU、负载、内存、连接数任何一项读取失败，这一项在本次上报里留空，其余照常上报；页面上对应位置显示「—」。同一项连续失败只在第一次记一条错误日志，恢复时再记一条，不会每 10 秒刷一条（agent ≥ 0.1.21）。启动时唯一不能缺的是 `boot_id`（流量统计靠它识别重启）；开机时间读不到时带着「未知」启动（§4.2 第 4 条），上报的 `boot_time` 为 0，页面的运行时间显示「—」。
+### 6.3 网卡选择
 
-软中断（softirq）主要是内核处理网络收发包的时间，是 CPU 使用率的一部分、不是额外的；包速率来自 `/proc/net/dev` 的 rx/tx packets。两者用来识别「包多流量小」的攻击（SYN flood、小包 UDP flood）：字节速率不高，但包速率和软中断很高，入站平均包长很小（SYN 约 60 字节）。从 agent 0.1.14 起上报，protobuf 里是 `optional` 字段——0 包/秒、0% 软中断都是正常值，不能像线程数那样用 0 表示「旧 agent」；旧 agent 的这些列为 NULL，页面上不显示包速率图。
+`collect.Selector` 决定哪些网卡的流量算数。配置里写了 `interfaces` 就以它为准，否则自动识别：
 
-线程总数而不是进程数：agent 的 systemd 单元有 `ProtectProc=invisible`，在 `/proc` 里只看得到自己的进程，数不了全部进程；`/proc/loadavg` 的总数不受影响，统计的是全部线程（内核调度实体）。连接数来自 agent 所在的网络命名空间，所以 agent 不能加 `PrivateNetwork`（见 §5.6）。连接数和线程数从 agent 0.1.9 起上报，旧 agent 这些字段为空，页面显示「—」。
+- 物理网卡：`/sys/class/net/<网卡>/device` 存在（KVM 的 virtio 网卡也有），再排除常见的虚拟网卡名。
+- 一块物理网卡都没有（OpenVZ 的 `venet0`、LXC 里由 veth 充当的 `eth0`）：算默认路由所在的网卡。
+- 有两块以上物理网卡：只算带默认路由的那几块。第二块通常是商家的内网，算进去会把内网流量记到配额里。IPv4 和 IPv6 的默认路由在不同网卡上时两块都算；默认路由不在任何物理网卡上（走 WireGuard、WARP 之类的隧道）时算全部物理网卡，计费流量走的是物理网卡。
+- **判断不了时不猜**：没有默认路由（开机时网络还没起来、DHCP 续租的瞬间）就沿用上一次的选择；从没选过就先一块都不算，下个采样再看。Selector 有三个明确的状态：没看过、看过但定不下来、已选定。之所以不能先"全算上"：新出现的网卡会按开机以来的累计值计入本周期，内网网卡哪怕只被选中一次，整段流量就进了配额。
+- 识别不了的情况：默认路由写在策略路由的别的表里；第二块网卡也走计费流量但上面没有默认路由。这些机器要手写 `interfaces`。
 
-### 5.2 ICMP 互测
+### 6.4 流量累计
 
-- 优先使用**非特权 ICMP datagram socket**（`SOCK_DGRAM` + `IPPROTO_ICMP`），需要 `net.ipv4.ping_group_range` 包含 agent 的 gid。systemd ≥ 243 的发行版默认 `0 2147483647`，一般无需改动。
-- 不满足时回退为 systemd `AmbientCapabilities=CAP_NET_RAW`（只授予这一项能力）。
-- 安装脚本会检测并提示走哪种方式。
-- 每个 peer 每秒发 1 个包，超时 2s；每 10s 汇总一次 sent/lost/min/avg/max/jitter（jitter 为相邻 RTT 差绝对值的均值）。超过超时才回来的应答算丢包，不记 RTT（ICMP 和 UDP 探测都一样）。汇总时还没回应、也没到超时的包留到下一次汇总，所以某次汇总的 sent 可能是 11、12。0.1.14 之前超时只在汇总时判断，汇总时还在等的包若在下一次汇总前回来，会被记成长达 10 多秒的 RTT 而不是丢包，旧数据里因此有这类异常大的 max / avg。
-- peers 在 agent 本地配置，既可以是其他 VPS，也可以是外部目标（如 `1.1.1.1`）。
-- IPv4/IPv6 均支持，按配置的地址族决定。
-- 后续可选：TCP 连接时延。测量时连接对端**已有的端口**（如 SSH 22）即可，不需要新开监听端口。首版不做。
+数据源是 `/proc/net/dev` 的字节计数器：64 位，开机后从 0 开始。agent 把它累计进计费周期并存在 `/var/lib/vps-probe-agent/traffic.json`。**这个文件是流量的权威数据，服务端只是副本。**
 
-**DNS 探测（`type: dns`）**：经 TCP/UDP 端口转发（realm 等）的隧道过不了 ICMP，而用户态转发程序会在本地完成 TCP 握手，TCP connect 时延只反映到转发入口的一段。所以在隧道上加一条转发到 `1.1.1.1:53` 的规则，agent 向 `addr`（`host:port`）每秒发一个 UDP DNS 查询（`one.one.one.one A`：1.1.1.1 是它的权威，其他递归解析器也必有缓存；最初用的 `. IN SOA` 在 1.1.1.1 上偶有 40ms 的缓存未命中尖峰），以收到响应的时间为 RTT，超时算丢包；任何 rcode 都算收到。每个 DNS peer 一个 connect 过的 UDP socket（内核丢弃其他来源的包，也让转发程序保持同一个会话），按 DNS ID 匹配响应，不需要任何特权。结果与 ICMP 一样上报为 `Ping`，`addr` 字段为 `ip:port`，服务端无需改动。UDP 与 ICMP 在同一路径上的时延可能不同（实测同一台机器直连 1.1.1.1，DNS 比 ICMP 低 1–10ms 不等，随源端口变化），只宜与同类型的数据比较。若到 53 端口的路径上有透明 DNS 劫持，测到的是劫持者的时延，无法从响应里分辨。
+每次采样，对每块网卡：
 
-**隧道回显（`type: echo`）**：不经公共服务、直接测隧道本身。隧道远端指向某台机器上的 `vps-probe-echo`（默认 `39527/udp`），agent 经隧道发请求，应答端原样签名回应：
+1. `boot_id`（`/proc/sys/kernel/random/boot_id`）和上次不同，说明重启过：增量 = 当前值（开机以来的全部）。
+2. `boot_id` 相同、计数器变大：增量 = 当前值 − 上次的值。
+3. `boot_id` 相同、计数器变小（驱动重载、网卡重建）：增量 = 当前值。
+4. 第一次见到这块网卡：如果开机时间晚于当前周期的起点，开机以来的流量都属于本周期，增量 = 当前值；否则分不清有多少属于本周期，只记下基线。开机时间取「现在 − `/proc/uptime`」，读不到时取 `/proc/stat` 的 `btime`，都读不到就当作不知道，只记基线。（LXC 里 `btime` 是宿主机的开机时间，而网卡计数器从容器启动时开始，所以优先用 uptime。）
+5. 增量计入**采样时刻**所属的周期。
 
-- 包固定 31 字节：`"VPE1"` | 类型（0 请求 / 1 应答）| seq（2）| 发送时刻 unix 纳秒（8）| HMAC-SHA256(key, 前面全部) 的前 16 字节。应答是把类型改为 1 并重算 MAC，**不比请求大**；应答端不回应应答包，两个应答端无法被利用互相弹包。
-- 应答端只回应 MAC 正确、时间戳与本机时钟相差 ≤ 5 分钟（限制截获重放的窗口）的请求，其余一律静默丢弃，端口扫描看不出它开着；另有全局每秒回包上限（默认 1000）。时间戳超窗的合法请求说明两端时钟不一致，每分钟最多记一条日志。可选 `allow` 只回应指定来源（如中转机出口 IP）。
-- agent 侧与 DNS 探测共用同一套 UDP 机制（每个 peer 一个 connect 过的 socket，按 seq 匹配，超时算丢包），只验证应答的 MAC。密钥写在该 peer 的配置里，同一应答端的所有探测方共用一个密钥。
-- `vps-probe-echo` 以独立系统用户 `vps-probe-echo` 运行，无任何 capability，不写文件，`install.sh echo` 安装。
+落盘：每 30 秒一次，收到 SIGTERM 时再一次；写临时文件、fsync、rename。状态文件损坏时改名保留，从头开始并记日志。每块网卡保留最近 24 个周期。
 
-VPN 型隧道（tun 设备）直接用 ICMP peer 即可，前提是到目标的路由走隧道。注意隧道进程退出、设备消失后，路由会回落到默认出口，测到的就变成直连时延。
+| 场景 | 丢失的流量 |
+|---|---|
+| 正常重启、关机 | 无（停止时落盘） |
+| agent 崩溃或升级 | 无（`boot_id` 不变，启动后用差值补回） |
+| 服务端宕机、网络中断 | 无（在本地累计） |
+| 断电、内核崩溃 | 最后 30 秒以内 |
+| agent 被停用期间机器又重启过 | 停用到重启之间的（运维操作造成，无法避免） |
 
-### 5.3 上报协议
+**周期**：每月 `reset_day` 日 `reset_time` 开始，按 `timezone`；当月没有这一天时取月末（31 在 2 月是 28 或 29 日）。agent 每次上报当前周期和上一周期的**累计总量及起止时间**，而不是增量：丢包和重复都不会重复计数，月初那一刻报文没到，上一周期的最终值之后也会补齐。
 
-**传输**：UDP，默认端口 9527。单包上限 1200 字节（低于常见 MTU，避免 IP 分片）；超出时把 ping 结果拆到额外的包里，各包独立确认。
+已知的限制：agent 在月末停止、下个月才启动时，停止期间攒下的流量计入新周期。
+
+### 6.5 探测
+
+每个 peer 每秒一个探测，2 秒内没有回应算丢失；每 10 秒汇总一次。超时之后才回来的应答算丢失，不记时延。jitter 是相邻两次时延之差的绝对值的平均。
+
+不管怎么发，一个探测都是"一个编号的请求，要么在超时内被回应，要么丢失"。发送方式是一个接口（`ping.link`），其余的逻辑（编号、等待表、超时、汇总）只有一份：
+
+| 类型 | 做法 | 用途 |
+|---|---|---|
+| `icmp`（默认） | ICMP echo。优先用非特权的 datagram socket，系统不允许时由 `install.sh` 只给 agent 服务加 `CAP_NET_RAW` | 节点之间；VPN 型隧道 |
+| `dns` | 向 `host:port` 发一个 UDP DNS 查询（`one.one.one.one A`），收到任何响应就算回应 | 把隧道转发到 `1.1.1.1:53` 来测隧道 |
+| `echo` | 向 `vps-probe-echo` 发带签名的请求，校验回应的签名 | 直接测隧道本身，不经公共服务 |
+
+- UDP 类型每个 peer 一个 connect 过的 socket：内核丢弃其他来源的包，转发程序也因此保持同一个会话。
+- **回显协议**：31 字节，`"VPE1"`、类型、编号、发送时刻、HMAC-SHA256 的前 16 字节。应答是把类型改掉再重算 MAC，**不比请求大**；应答端不回应应答包，两个应答端不能被利用互相弹包。应答端只回应签名正确、时间戳在 5 分钟以内的请求，另有每秒回包上限和可选的来源白名单；其余静默丢弃。
+- TCP 连接时延不做：用户态转发程序在本地完成 TCP 握手，测到的只是到转发入口的一段。
+
+### 6.6 上报
 
 **包格式**：
 
 ```
-+---------+------+----------+-------------+------------+------------------------------+
-| ver (1) | type | node_len | node (1-32) | nonce (24) | ciphertext + Poly1305 tag(16) |
-+---------+------+----------+-------------+------------+------------------------------+
-ver = 1；type：1 = Report（agent → server），2 = Ack（server → agent）
+ver(1) | type(1) | node_len(1) | node | nonce(24) | 密文 + Poly1305 标签(16)
+ver = 2；type：1 = Report（agent → 服务端），2 = Ack（服务端 → agent）
 ```
 
-- 密钥：`key = HKDF-SHA256(secret=token, salt="vps-probe/v1", info=node)`，32 字节。
-- 加密：XChaCha20-Poly1305，nonce 每包随机生成；`ver | type | node_len | node` 作为附加认证数据（AAD），因此篡改头部、把 ACK 反射成 Report 都会解密失败。
-- 明文：Report 或 Ack 的 protobuf 编码（§5.4）。
-
-**服务端处理顺序**（§6.2）：检查长度与版本 → 按 node 查密钥（未知节点丢弃）→ 解密（失败丢弃）→ 解析 protobuf → 回加密 ACK。任何一步失败都不回应。
+- 密钥 = `HKDF-SHA256(secret = token, salt = "vps-probe/v2", info = node)`。
+- XChaCha20-Poly1305，nonce 每包随机；头部（`ver | type | node_len | node`）作为附加认证数据，所以改头部、把 ACK 反射成 Report 都会解密失败。
+- 明文是 protobuf（`proto/probe/v1/probe.proto`）。单包不超过 1200 字节，避免 IP 分片；装不下时把字段分到几个报文里，它们的 `ts` 相同，服务端逐字段合并，怎么分都行。
 
 **可靠性**：
 
-- 每个 Report 带随机 64 位 `id`；服务端收到后回 `Ack{ids}`。
-- agent 维护一个未确认队列（上限 360 条，约 1 小时，超出丢弃最旧的；超过 2 小时的也丢弃）。新报文立即发送；5s 内未确认的，之后重发。
-- 服务端在线（30s 内收到过 ACK）时，每秒最多重发 20 条积压报文，优先发最新的；服务端离线时只重发最新的一条作为探测，收到 ACK 后再补传积压。
-- agent 使用**已连接的 UDP socket**（`connect()` 到服务端 IP:端口），内核会丢弃来自其他任何地址的数据报，agent 不接收公网上任意来源的包。
-- 服务端离线期间每 60s 重新 `connect()` 一次（服务端地址是域名时会重新解析）。
-- 服务端对非法包静默丢弃，因此 token 写错、node 不一致、防火墙/安全组未放行、时钟偏差过大，在 agent 看来都和"服务端宕机"一样。agent 启动后或上次 ACK 之后超过 2 分钟没收到 ACK 时打印 WARN 日志并列出这些可能原因（10 分钟重复一次），方便首次部署排查。
-- 队列不落盘：流量总量已单独落盘，监控曲线出现缺口可以接受。
+- 每个报文带随机 id，服务端回 `Ack{ids}`。没确认的留在队列里（最多 1 小时的量），5 秒后重发；超过 2 小时的放弃。
+- 服务端可达时每秒最多重发 20 个积压报文，新的优先；不可达时只用最新的一个报文探路，通了再补传。
+- 队列不落盘：流量总量另有落盘，曲线上有缺口可以接受。
+- 服务端对非法包不回应，所以 token 写错、节点 id 不一致、防火墙没放行、时钟偏差过大，在 agent 看来都和"服务端没开"一样。超过 2 分钟没收到 ACK 时，agent 的日志会列出这几种可能。
 
-**防重放**：不单独做序列号，依靠数据幂等性：
+**防重放**不靠序列号，靠数据本身幂等：指标按 `(节点, ts)` 存，重复写入结果相同；流量总量只接受 `ts` 更新的报文；在线状态只由"`ts` 比见过的都新"的报文刷新；`ts` 与服务端时间相差超过 2 小时 5 分的报文不要。没有密钥造不出新报文，重放旧报文改变不了任何状态。
 
-- 监控数据按 `(node, ts)` 存储，重复写入结果相同；
-- 流量总量在同一周期内只增不减，重放旧包无法改小；
-- 告警与在线状态只基于**报文中的最大 `ts`**，而不是服务端收包时间，否则重放抓到的旧包就能让一台已离线的机器在 2h 内看起来仍然在线；
-- 服务端拒绝 `ts` 与当前时间偏差超过 2h 的报文。
+### 6.7 沙箱与 LXC
 
-没有密钥就无法构造新报文，重放旧报文也改变不了任何状态。
+`deploy/vps-probe-agent.service`：用户 `vps-probe-agent`，`CapabilityBoundingSet=` 为空，`ProtectSystem=strict`，只有 `/var/lib/vps-probe-agent` 可写，`ProtectProc=invisible`、`ProtectKernel*`、`RestrictAddressFamilies`、`SystemCallFilter=@system-service`、`MemoryMax=64M` 等。几处不能加的：
 
-### 5.4 报文定义（protobuf）
+- `PrivateNetwork`：`/proc/net/dev` 按网络命名空间隔离，加了只看得到 `lo`。
+- `ProcSubset=pid`：会藏掉 `/proc/stat`、`/proc/meminfo`。
+- `ProtectHome=yes`（用的是 `read-only`）：否则对 `/home` 下的挂载点做 `statfs`，得到的是遮盖用的空 tmpfs。
 
-见 `proto/probe/v1/probe.proto`，要点：
+**LXC 容器**和宿主机共用内核，`/proc/meminfo`、`/proc/stat`、`/proc/uptime` 默认是宿主机的数据；宿主机上的 lxcfs 把容器自己的数据逐个文件盖在这些路径上。
 
-```proto
-message Report {
-  int64  ts = 1;                 // 采样时间，unix 秒，对齐到 interval 整数倍
-  uint64 id = 2;                 // 随机，用于 ACK
-  SysInfo sys = 3;               // 启动时 + 每小时
-  CPU cpu = 4;
-  Load load = 5;
-  Mem mem = 6;
-  repeated Disk disks = 7;       // 每 60s
-  repeated NetRate net = 8;      // 各网卡速率，字节/秒
-  repeated IfaceTraffic traffic = 9;  // 当前 + 上一周期累计
-  repeated Ping pings = 10;
-}
-message Ack { repeated uint64 ids = 1; }
-```
+- 沙箱的 `ProtectProc`、`ProtectKernelTunables`、`ProtectControlGroups` 任何一项都会给服务挂一个全新的 `/proc`，上面没有 lxcfs 盖的那一层，agent 会报出宿主机的内存和 CPU。所以 `install.sh` 发现 `/proc/mounts` 里有 `fuse.lxcfs` 时，写一个 drop-in 把这三项关掉。代价是在 LXC 里 agent 能看到别的进程的 `/proc` 条目（和任何普通用户一样）；它仍然没有任何 capability。
+- 没有采用"保留这三项、把 lxcfs 的文件绑回沙箱"：lxcfs 失效后这些文件连 stat 都报错，systemd 建不起沙箱，服务完全起不来。
+- lxcfs 失效时（宿主机上它崩溃或被重启，容器里 `free` 报 `Transport endpoint is not connected`，直到容器重启）：agent 照常运行，CPU、负载、内存留空，流量、磁盘、连接数、时延不受影响。
+- 修不了的：lxcfs 给什么 agent 就报什么。很多商家的容器里，负载是宿主机的，CPU 是容器所在那个核的。
 
-同一 `(node, ts)` 可能拆成多个包（例如 ping 结果单独一个包），服务端按字段合并。
+## 7. 服务端
 
-### 5.5 agent 配置示例
+### 7.1 配置
 
-```yaml
-node: hk-1
-server:
-  addr: 203.0.113.1:9527    # UDP；也可以写域名
-  token: "<node token>"     # 由 vps-probe-server gen-token 生成
-interval: 10s
-state_dir: /var/lib/vps-probe
-disks: ["/"]
-interfaces: []              # 空 = 自动识别物理网卡；或 [eth0]
-traffic:
-  timezone: Asia/Shanghai
-  reset_day: 1              # 1 = 自然月
-ping:
-  interval: 1s
-  timeout: 2s
-  peers:                    # name 要写成对端在服务端登记的节点 id，时延矩阵才能对上
-    - { name: jp-1, addr: 203.0.113.5 }
-    - { name: us-1, addr: 198.51.100.7 }
-    - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }   # 经端口转发到 1.1.1.1:53
-```
+`/etc/vps-probe/server.yml`，`root:vps-probe-server 0640`；其他用户可读或组可写时拒绝启动（里面有全部 token）。结构，一段对应 `config` 包的一个文件：
 
-### 5.6 systemd 加固
+| 段 | 内容 |
+|---|---|
+| `listen`、`public_addr`、`db`、`timezone`、`retention`、`backup`、`cf_access` / `basic_auth` | 服务端本身 |
+| `nodes` | 节点：`id`、`name`、`token`、`region`、`group`，以及三组设置：`traffic`（配额、计费方式、周期）、`plan`（到期日、续费周期、价格）、`ping`（地址、互斥、额外目标） |
+| `notify` | 通知渠道列表：`type: telegram` 或 `type: webhook` |
+| `alerts` | 告警规则：指标满足条件并持续一段时间后告警，不再满足后恢复 |
+| `reports` | 报告：发生一次通知一次的事 |
 
-见 `deploy/vps-probe-agent.service`，要点：
+- `alerts`、`reports` 整段不写用默认的一组，写空列表表示不要。示例配置里把默认的一组完整写了出来，有测试保证它和代码里的默认值一致。
+- 节点的 `traffic.reset_day` / `reset_time` 和 `ping` 整段**服务端自己不用**，只用来生成那个节点的 agent 配置。改了以后要在节点上重新安装配置才生效。
+- 没有热加载：改了配置要重启服务端。重启不到一秒，期间的报文 agent 会重传。
 
-- `User=vps-probe`，`StateDirectory=vps-probe`（mode 0700），`UMask=0077`。
-- `CapabilityBoundingSet=` 为空；ICMP 走非特权 datagram socket。主机不允许时改为 `CAP_NET_RAW`。
-- `ProtectSystem=strict`、`ProtectHome=read-only`（不能用 `yes`，否则对 /home 下挂载点做 statfs 时，得到的是遮盖用的空 tmpfs 的数据）、`PrivateTmp`、`PrivateDevices`、`ProtectProc=invisible`、`ProtectKernel*`、`ProtectClock`、`ProtectHostname`。其中 `ProtectProc`、`ProtectKernelTunables`、`ProtectControlGroups` 在 LXC 容器里由 `install.sh` 关掉，原因见 §5.7。
-- `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`、`RestrictNamespaces`、`MemoryDenyWriteExecute`、`SystemCallFilter=@system-service`、`MemoryMax=64M`。
-- **不能加 `PrivateNetwork`**：`/proc/net/dev` 按网络命名空间隔离，加了之后只能看到 `lo`。
-- 不能加 `ProcSubset=pid`：它会隐藏 `/proc/stat`、`/proc/meminfo`。
-- `TimeoutStopSec=15`：留出退出前最后一次读数和落盘的时间。
+**网页的登录保护**：
 
-### 5.7 LXC 容器（agent ≥ 0.1.21）
+- `cf_access`：每个请求必须带 Cloudflare Access 注入的 JWT，否则 403。只接受 RS256，校验签名、`aud`、`iss`、有效期；公钥每小时刷新，遇到没见过的 `kid` 立即刷新但每分钟最多一次；取到公钥之前一律 403。
+- `basic_auth`：HTTP Basic。选它而不是登录页，是因为不需要登录接口、会话和 cookie，网页仍然只有 GET。配置里只存 bcrypt 哈希。验证通过的凭据在内存里记一个 HMAC 摘要，后续请求只比对摘要（bcrypt 一次几十毫秒，一个页面有十几个请求）。验证失败按来源地址限速，同时最多两个 bcrypt 在算。密码随每个请求发送，所以必须在 HTTPS 反向代理后面。
 
-LXC 容器和宿主机共用内核，`/proc/meminfo`、`/proc/stat`、`/proc/uptime`、`/proc/loadavg`、`/proc/cpuinfo` 默认是宿主机的数据；宿主机上的 lxcfs（一个 FUSE 文件系统）把容器自己的数据逐个文件盖在这些路径上，容器里的 `free`、`top` 才显示得对。
+### 7.2 添加节点与一行安装命令
 
-**问题一：沙箱把 lxcfs 盖的那一层丢了。** `ProtectProc`、`ProtectKernelTunables`、`ProtectControlGroups` 三项中任何一项都会让 systemd 给服务挂一个全新的 `/proc`，上面没有 lxcfs 的文件。0.1.20 及之前的 agent 在 LXC 里上报的是宿主机的内存、CPU 和开机时间（实测：1 GiB 的容器报成 504 GiB）。
+目标是"服务端一条命令，节点上粘贴一条命令"，同时不放松 §2：agent 仍然不从服务端获取任何东西，配置和 token 仍然由人带过去，只是从拷文件变成了复制粘贴。
 
-做法：`install.sh` 发现 `/proc/mounts` 里有 `fuse.lxcfs` 时，写一个 drop-in `vps-probe-agent.service.d/lxcfs.conf`，把这三项关掉（`ProtectProc=default`、`ProtectKernelTunables=no`、`ProtectControlGroups=no`），服务用容器原本的 `/proc`。不是 LXC 的机器没有这个文件，单元不变；`--upgrade` 也会走这一步，所以旧节点升级后就修好了。
+- `add-node -id ID …`：生成 token，把节点**以文本方式**插到 `nodes` 列表末尾。YAML 解析器只用来找插入位置和缩进，文件其余部分一个字节都不动（注释、手写的格式都留着）。插入后的配置通不过校验就不动原文件；原文件留一份 `.bak-<时间>`。
+- `install-cmd -node ID`：打印那个节点的安装命令。每次都用服务端生成的配置覆盖节点上的 `agent.yml`。
+- `install-cmd -upgrade`：打印只换程序、不动配置的命令；里面没有 token，所有节点通用。
 
-- 代价：只在 LXC 里，agent 能看到别的进程在 `/proc` 下的条目（和任何普通用户一样），`/proc/sys`、cgroup 不再被额外挂成只读。agent 仍是没有任何 capability 的普通用户，本来就写不了这些地方，实测写入都是 Permission denied；其余加固项不变。
-- 没有采用的做法：保留三项，用 `BindReadOnlyPaths=-/proc/meminfo …` 把 lxcfs 的文件绑回沙箱。lxcfs 正常时可行，但 lxcfs 失效后这些文件连 stat 都报错，systemd 建沙箱失败（`226/NAMESPACE`），服务完全起不来（在 systemd 252 上用失效的 FUSE 文件实测）；前缀 `-` 只忽略「不存在」，不忽略这种错误。
-- 手工安装（不用 `install.sh`）的 LXC 节点要自己加这个 drop-in。
+安装命令是一行 `sh -c '…'`，在节点上以 root 执行：按 CPU 架构下载发布包、`.sha256` 和签名（有超时，连不上会报错而不是挂着）→ 用命令里带的发布公钥验签，再核对校验和 → 解包 → 把命令里带的 `agent.yml` 交给包里的 `install.sh`。任何一步不过就停，临时目录无论成败都删除。
 
-**问题二：lxcfs 失效。** 宿主机的 lxcfs 进程崩溃或被重启后，容器里这几个文件一读就报 `Transport endpoint is not connected`，直到容器重启；容器自带的 `free`、`uptime` 同样报错。这时 agent 照常启动和运行，只是 CPU、负载、内存留空（§5.1），流量、磁盘、连接数、时延不受影响。
+信任关系：被执行的只有两样，操作者自己的服务端打印的这行命令，和验签通过的发布包里的 `install.sh`；没有 `curl | sh`。发布公钥编在服务端程序里，而服务端程序是操作者自己验证后装上的。下载地址可以换成镜像（`-base`），镜像不需要可信。
 
-**修不了的**：lxcfs 给什么 agent 就报什么。Proxmox 默认不虚拟化负载，容器里看到的 load 是宿主机的；`/proc/stat` 给的是容器所在 CPU 核的数据，同一个核上别的租户的占用也算在里面。这和容器里 `uptime`、`vmstat` 看到的一致。
+### 7.3 Ingest
 
-**升级时的一次性多计**：0.1.18–0.1.20 的 agent 在 LXC 里读到的是宿主机的 `boot_id`，升级后读到的是容器自己的，流量统计会当成一次重启，把容器启动以来的流量再计一遍。只发生在升级的那一次；介意的话先重启容器再升级（计数器归零，多计的量接近 0）。
+一个 UDP socket。包太短、太长、版本不对、节点没登记、解密失败、protobuf 解析失败、`ts` 偏差过大：**任何一种都静默丢弃**，按原因计数显示在网页底部，日志限频。
 
-## 6. 服务端设计
+- 解密之前只做"读头部、查节点、AEAD 校验"，未认证的数据进不了 protobuf 解析器。
+- 只对通过校验的包回 ACK，ACK 比报文小，不能用来放大。
+- 认证过的 agent 也可能出错或被攻破：数值做范围检查，不合理的字段丢掉，其余照收。
+- 近 2 小时处理过的报文 id 留在内存里，重复的直接回 ACK 不再写库。
 
-### 6.1 节点注册
+### 7.4 存储
 
-节点只能在服务端配置文件中登记，Web 上不能添加（`add-node` 命令也只是替你改这个文件，见 §6.1.1）：
+全部数据在一个 SQLite 文件里。WAL 模式；正常停止时把 WAL 并回主文件，停机后只剩一个文件。一个专用的写连接（ingest、聚合、清理、告警状态都走它），另有只读连接池给网页。
 
-```yaml
-listen:
-  web: 127.0.0.1:8080        # 只给 cloudflared 用
-  ingest: ":9527"           # UDP，agent 上报（IPv4 + IPv6）
-db: /var/lib/vps-probe-server/probe.db   # 全部数据都在这一个文件里
-timezone: Asia/Shanghai    # 按日流量的日期划分，须与 agent 的 traffic.timezone 一致
-server_addr: probe.example.com:9527   # 可选：agent 上报用的地址，agent-config / add-node / install-cmd 的 -server 默认值
-cf_access:                 # 可选：校验 Web 请求的 Access JWT（见下）
-  team_domain: myteam.cloudflareaccess.com
-  aud: "<application AUD tag>"
-basic_auth:                # 可选，与 cf_access 二选一：HTTP Basic 认证（见下）
-  user: admin
-  password_hash: "$2a$12$..."   # vps-probe-server hash-password 生成
-nodes:
-  - id: hk-1
-    name: 香港 1
-    token: "<node token>"      # 配置文件需为 root:vps-probe-server 0640
-    traffic_quota_gb: 1000     # 可选，用于显示进度和告警
-    traffic_quota_mode: sum    # sum(收+发) | max(取大) | tx | rx，不同服务商计费方式不同
-    expire_at: 2027-03-15      # 可选：到期日（按 timezone），总览显示剩余天数，expiry 规则提醒
-    renew_months: 12           # 可选：自动续费周期（月），过了到期日按周期顺延
-    price: "$10/年"            # 可选：只用于显示，最多 64 字符
-    region: HK                 # 可选：地区代码，显示为卡片上的角标（字母、数字、-，最多 8 个，自动转大写）
-    group: 亚洲                # 可选：总览按分组切换；页面上的默认顺序就是配置文件里的顺序
-telegram:                  # 可选；telegram 和 webhooks 都不配置则只记录不发送
-  bot_token: "<token>"
-  chat_id: "<chat id>"
-webhooks:                  # 可选：更多通知渠道，见 §7
-  - name: bark
-    url: "https://api.day.app/<key>/{{title}}/{{message}}"
-    method: GET
-alerts: [...]              # 见 §7；不写则用默认规则
-offline_after: 30s         # 超过多久没有新报文算离线，约 agent interval 的 3 倍
-retention:
-  raw: 48h                 # 10s 原始数据
-  m5: 30d                  # 5 分钟聚合
-  h1: 400d                 # 1 小时聚合
-backup:
-  dir: /var/lib/vps-probe-server/backups
-  keep: 7                  # 每日一份
-```
+| 表 | 内容 | 保留 |
+|---|---|---|
+| `metrics_raw` / `_5m` / `_1h` | CPU、steal、软中断、负载、内存、swap、连接、线程；聚合表存平均值和最大值 | 48 小时 / 30 天 / 400 天 |
+| `net_raw` / `_5m` / `_1h` | 各网卡的字节速率和包速率 | 同上 |
+| `disk_raw` / `_1h` | 各挂载点的用量 | 48 小时 / 400 天 |
+| `ping_raw` / `_5m` / `_1h` | 各链路的 sent、lost、min / avg / max、jitter | 同 metrics |
+| `traffic_period` | 每个（节点、网卡、周期）的总量和周期的起止 | 永久 |
+| `traffic_daily` | 每天最后看到的周期总量 | 永久 |
+| `node_status` | 最新报文的 `ts`、它到达的时间、来源 IP、系统信息 | — |
+| `alert_state` | 正在观察和告警中的告警 | — |
+| `report_state` | 每种报告上次对每个节点发的是什么 | — |
+| `alert_history` | 发出过的（或本该发出的）每一条消息 | 400 天 |
 
-**cf_access**：配置后，每个网页请求（`/`、`/static/`、`/api/`）都必须带 Cloudflare Access 注入的 `Cf-Access-Jwt-Assertion`，否则 403：
+- 报文的每一次写入都是幂等的；同一个 `ts` 的几个报文合并进同一行，缺的列保持原样。
+- **在线**：只有 `ts` 比该节点见过的都新的报文才刷新"最后到达时间"；在线 = 这个时间在 30 秒以内（三个上报间隔）。重放的旧包不能让离线的节点显示在线。来源 IP 的更新是同一个条件。
+- **每日流量**：记下每天最后看到的周期总量，某天的用量 = 当天的值 − 前一天的值；差值为负说明 agent 的状态重建过，取当天的值。日期按服务端的 `timezone` 分。
+- 聚合按报文的 `ts` 分桶，与到达时间无关。每分钟重算最近 3 小时的桶（补传的报文最多晚 2 小时）；启动时重算整个原始数据的保留期。
+- 查询按时间跨度选表：6 小时以内用原始数据，7 天以内用 5 分钟的，更长用 1 小时的；每条曲线最多约 1000 个点。
+- 数据库是 0.2 的新格式；0.1.x 的文件会被拒绝并说明原因，不会被读错。
 
-- 只接受 RS256；校验签名、`aud`（可为数组，须包含配置的 AUD tag）、`iss` = `https://<team_domain>`、`exp`/`nbf`（30s 容差）。
-- 公钥从 `https://<team_domain>/cdn-cgi/access/certs` 获取，每小时刷新；遇到未知 `kid`（密钥轮换）立即重新获取，但每分钟最多一次，防止伪造 kid 刷请求。
-- 启动时不等待公钥：取到之前所有请求都 403，后台每 30s 重试（fail closed）。
-- 拒绝原因按类别限频写日志。开启后在服务器上直接 `curl 127.0.0.1:8080` 也会 403，属预期。
+`backup -o FILE` 在运行中也能得到一个一致的单文件（`VACUUM INTO`）；服务端每天自动备份一份。**迁移只需要两个文件**：`server.yml` 和数据库。
 
-**basic_auth**：给不用 Cloudflare Access 的部署。配置后每个网页请求都必须带正确的用户名和密码，否则 401（浏览器弹出登录框）。与 `cf_access` 不能同时配置。
+### 7.5 API
 
-- 选 Basic 而不是登录页：不需要登录接口、会话和 cookie，Web 仍然只有 GET，没有任何由请求改变的服务端状态可供攻击（除下面的限速计数）。代价是没有"退出登录"（关闭浏览器即可）。
-- 配置里只存 bcrypt 哈希（cost ≥ 10），`vps-probe-server hash-password` 生成（密码从终端读取、不回显，或从标准输入读一行）；`htpasswd -B`、`caddy hash-password` 生成的哈希也能用。
-- 校验：用户名常数时间比较；密码用 bcrypt。bcrypt 每次约几十毫秒，页面一次刷新有十几个请求，所以验证通过的凭据在内存里记一个 HMAC 摘要（密钥每次启动随机生成），后续请求只比对摘要。
-- 防暴力破解：验证失败按来源地址限速（每个地址 5 次突发，之后每 12 秒 1 次；IPv6 按 /64），超限直接 429、不再计算 bcrypt；同时最多 2 个 bcrypt 在算，防止被用来耗尽 CPU。来源地址：连接来自本机（反向代理）时取 `X-Forwarded-For` 最右边一项（反向代理自己添加的，客户端伪造不了），否则取连接地址。已登录的浏览器不受限速影响。
-- 失败按来源地址限频写日志。
-- **密码随每个请求发送，必须走 HTTPS**：`listen.web` 保持 `127.0.0.1`，由反向代理终结 TLS。服务端自己不做 TLS。`listen.web` 不是本机地址又开了 `basic_auth` 时启动告警。
-
-**到期日**：剩余天数按服务端 `timezone` 的日历日计算（当天为 0，过期为负）。写了 `renew_months` 时，到期日过去后按 `expire_at + k × renew_months` 个月顺延到第一个不早于今天的日期；每次都从 `expire_at` 起算，月底按当月最后一天截断（1-31 起每月续费：2-28、3-31……），不会越算越早。API 和告警共用同一个计算函数，显示的天数与提醒一致。
-
-节点的 `addr`（其他节点 ping 它的地址）、`no_ping`（与哪些节点互不 ping，双向生效）、`extra_peers`（该节点额外的非节点目标，原样写进它的 `ping.peers`，`name` 不能与节点 id 重名）、`reset_day` 和 `reset_time` 只供 `vps-probe-server agent-config` 生成 agent.yml 使用；agent 自己的配置文件仍是唯一依据，agent 不从服务端获取任何配置。
-
-提供 `vps-probe-server gen-token` 子命令：生成 32 字节随机 token（base64url），同一个值同时填进 agent 和服务端配置。服务端启动时检查配置文件权限：其他用户可读或组可写则拒绝启动。推荐 `root:vps-probe-server 0640`，服务能读但不能改。
-
-#### 6.1.1 添加节点与一行安装命令
-
-目标：加一台节点从"两台机器上六步、scp 一个带 token 的文件"变成"服务端一条命令，VPS 上粘贴一条命令"，同时不放松 §1：agent 仍然不从服务端获取任何东西，配置和 token 仍然由人带过去，只是从 scp 换成了复制粘贴。
-
-- `vps-probe-server add-node -id ID [-name -addr -region -group]`（root 执行）：
-  - 生成 token，把新节点**以文本方式插入** `server.yml` 的 `nodes` 列表末尾。只用 YAML 解析器定位插入位置和缩进，文件其余部分一个字节都不动（注释、手写的格式都保留）；不整体重新序列化。
-  - 改之前校验：id 不重复；插入后的整份配置必须能通过 `check`，否则原文件不动。
-  - 原文件留一份 `server.yml.bak-<时间>`；新文件写到同目录临时文件再 rename，属主和权限照旧（`root:vps-probe-server 0640`）。
-  - 不重启服务端（没有热加载，见 §12）：打印要执行的 `systemctl restart vps-probe-server`，以及这台节点的安装命令和"其他节点要 ping 它时需要重装哪些节点"的提示。
-- `vps-probe-server install-cmd -node ID`：打印任意已登记节点的安装命令。新装、对端列表变了以后重新生成配置，都是这条命令；它每次都用服务端生成的 agent.yml **覆盖**那台机器上的配置（旧的留一份 `.bak-<时间>`）。
-- `vps-probe-server install-cmd -upgrade`：打印**只升级**的命令。它不带配置也不带 token，所有节点通用，不读 `server.yml`；只换程序和 systemd unit，`/etc/vps-probe/agent.yml` 原样保留。手工改过 agent.yml 的节点（比如指定了 `interfaces`）用它升级。那台机器上没有 agent.yml 时拒绝执行（`install.sh agent --upgrade`），不会留下一个装了示例配置、不工作的 agent。`--upgrade` 是 0.1.19 加的，所以 `-upgrade` 不能和更早的 `-version` 一起用。
-- 两个命令都要知道 agent 上报用的地址：`-server host:port`，或配置里的 `server_addr`。
-
-**安装命令**是服务端打印的一行 `sh -c '...'`，在 VPS 上以 root 执行，做这些事：
-
-1. 按 `uname -m` 选 amd64 / arm64，从发布地址下载该版本的 tar 包、`.sha256` 和 `.sha256.sig`（curl，没有则 wget）。下载有时限：连接 20 秒，连续 30 秒几乎没有数据就放弃，单个文件最多 10 分钟；失败时说明是哪个文件、从哪里下载，并提示改用 `-base` 镜像或手工拷贝发布包，而不是一直挂着（连不上 GitHub 的机器上遇到过）；
-2. 用命令里带着的发布公钥 `ssh-keygen -Y verify` 验签，再核对 tar 包的 sha256，任何一步不过就停；
-3. 解包，把命令里带着的 agent.yml（base64）写到临时目录，执行包里的 `./install.sh agent --config agent.yml`（只升级的命令没有 agent.yml，执行 `./install.sh agent --upgrade`）；
-4. 临时目录（含带 token 的 agent.yml）无论成败都删除。
-
-信任关系：
-
-- 不 `curl | sh` 任何未经校验的脚本。被执行的只有两样：操作者自己的服务端打印出来的这行命令，和签名验证通过的发布包里的 `install.sh`。
-- 发布公钥编进服务端程序（`internal/release/release-signers`，§13.3），而服务端程序本身是操作者验证后装上的。
-- 版本默认是服务端自己的版本（`-version` 可改），发布地址默认 GitHub Releases（`-base` 可换成镜像；镜像不需要可信，因为签名照验）。
-- 命令里有该节点的 token：只影响这一个节点（§1.8）。粘贴执行后它会留在那台 VPS 的 root shell 历史里（Debian 的 root 默认没有设 `HISTCONTROL`，开头的空格只在设了 `ignorespace` 的机器上起作用）；token 本来就在同一台机器的 `agent.yml` 里、同样只有 root 可读，暴露面没有扩大。不想留历史就不经过终端：`vps-probe-server install-cmd -node ID | ssh root@那台VPS sh`。
-- 目标机需要 OpenSSH ≥ 8.1（`ssh-keygen -Y verify`）、`base64`、`sha256sum`、`tar`、systemd。
-
-### 6.2 Ingest
-
-- 单个 UDP socket 接收，包长 < 最小头部或 > 1200 字节、版本不对、node 未登记、解密失败、protobuf 解析失败、`ts` 偏差超过 2h、node 与包头不一致——**任何一种情况都静默丢弃，不回应**。
-- 解密前只执行"读头部 + 查表 + AEAD 校验"，未认证的数据不会进入 protobuf 解析器，暴露给攻击者的代码面很小。
-- 只对通过校验的包回 ACK，ACK 大小远小于请求，不存在放大攻击。
-- 丢弃事件按原因计数（不逐条打日志，避免被刷日志），在 Web 上显示。
-- 数值做范围检查（百分比 0-100、时延非负等），不合理的字段丢弃。
-- 防火墙建议：只对各 VPS 的 IP 放行 9527/udp（可选，安装脚本给出示例规则）。
-
-### 6.3 存储与降采样
-
-**全部数据在一个 SQLite 文件里**（纯 Go 驱动 `modernc.org/sqlite`，无 CGO），方便备份和迁移。
-
-- WAL 模式：运行中旁边会有 `probe.db-wal` / `-shm`，里面可能有已提交的数据。正常停止时执行 `wal_checkpoint(TRUNCATE)` 并删除它们，停机后只剩 `probe.db` 一个文件。
-- 一个专用写连接（ingest、降采样、清理都走它），另开只读连接池给 Web 查询，避免 `SQLITE_BUSY`。
-- 节点 id 映射为整数（`nodes` 表），各数据表用 `WITHOUT ROWID` + 复合主键，减少体积。
-- schema 有版本号（`meta.schema_version`，当前为 4），升级按版本逐步执行，只加表或给表加可空的列，不删数据（v4 给 metrics 表加了连接数、线程数列）；遇到比程序更新的版本拒绝打开。
-
-| 表 | 主键 | 内容 | 保留 |
-|---|---|---|---|
-| `metrics_raw` / `_5m` / `_1h` | (node, ts) | cpu、steal、load、mem、swap、tcp、udp、tcp_tw、threads；聚合表存 avg 与 max | 48h / 30d / 400d |
-| `net_raw` / `_5m` / `_1h` | (node, iface, ts) | 各网卡收/发速率 | 同上 |
-| `disk_raw` / `_1h` | (node, mount, ts) | 用量、inode | 48h / 400d |
-| `ping_raw` / `_5m` / `_1h` | (src, dst, ts) | sent、lost、min/avg/max、jitter | 同 metrics |
-| `traffic_period` | (node, iface, period_start) | rx、tx、ts（latest-ts-wins） | 永久 |
-| `traffic_daily` | (node, iface, day) | 当日最后看到的周期总量 | 永久 |
-| `node_status` | node | 最大报文 ts、最后"新鲜"到达时间、系统信息 | — |
-| `node_addr` | node | 最新报文的来源 IP、从何时起用这个 IP | — |
-| `alert_state` | (rule, node, target) | firing 状态、流量已提醒的档位（target 为挂载点 / peer 名 / 周期起始） | 规则删除时清理 |
-| `alert_history` | id（按 ts 索引） | 告警、重复提醒、恢复、流量档位事件及消息原文 | 跟随 `retention.h1` |
-
-写入规则：
-
-- 一份报文可能拆成多个包，共享同一 `ts`。`metrics_raw` 用 `ON CONFLICT DO UPDATE SET col = COALESCE(excluded.col, col)` 合并；其他表的行天然由各自主键区分。全部写入都是幂等的，重复包不会产生重复数据。
-- **在线判断**：只有 `ts` 大于该节点已见最大 `ts` 的报文才更新"最后新鲜到达时间"；在线 = 该时间在 `offline_after`（默认 30s）内。重放的旧包不会让离线节点显示在线；agent 时钟偏快也不会让它在死后一直显示在线。这两个值持久化在 `node_status`，服务端重启后恢复。
-- 服务端内存里保留近 2h 已处理的包 id：重放/重传的包直接回 ACK，不再写库。
-- **来源 IP**：与"新鲜到达时间"同一条件，只有抬高了 `max_ts` 的报文才记录其来源 IP（IPv4-mapped 地址还原为 IPv4，不记端口）。服务端重启后已处理 id 清空，截获的旧包从别处重放仍能通过认证，但它不会比已见的最新报文新，所以改不了记录的 IP，也触发不了 IP 变化通知。
-
-降采样与清理：
-
-- 聚合一律按报文 `ts` 分桶，与到达时间无关。
-- 每分钟重算最近 3h 内的 5m、1h 桶（agent 补传最多晚到 2h）；服务端启动时重算整个 raw 保留窗口，弥补停机期间没算的桶。重算用 `INSERT OR REPLACE`，天然幂等。
-- 每小时清理过期数据。
-- 估算：10 节点 × 各 10 个 peer，ping 是大头：raw 约 170 万行、5m 约 86 万行、1h 约 96 万行，总体积在几百 MB 以内。
-
-### 6.3.1 备份与迁移
-
-- `vps-probe-server backup -o <file>`：运行中也能用（`VACUUM INTO`），得到一个一致的单文件。
-- 服务端每天自动备份一份到 `backup.dir`，保留 `backup.keep` 份。
-- **迁移只需要两个文件**：`server.yml`（含各节点 token）+ `probe.db`（或 `backup` 产生的文件）。手动复制时先 `systemctl stop`，确认 `probe.db` 旁边没有 `-wal`/`-shm` 文件再拷贝。
-- 迁移后服务端 IP 变化，需要改各 agent 的 `server.addr`；若写的是域名，改 DNS 即可（agent 断线期间每 60s 重新解析）。
-
-### 6.4 Web 只读 API
+全部是 GET，服务端不注册任何写接口。
 
 | 路径 | 内容 |
 |---|---|
-| `GET /api/nodes` | 节点列表 + 最新状态（含来源 IP、连接数、线程数）+ 到期日（已按续费周期顺延）、剩余天数、价格、地区、分组 |
-| `GET /api/sparks` | 总览卡片上的迷你趋势线：每个节点最近 1 小时、每分钟一个点的 CPU 和全部网卡合计的收发速率，没有数据的分钟为 null |
-| `GET /api/nodes/{id}/metrics?from&to` | 自动按时间跨度选择 raw/1m/5m |
-| `GET /api/nodes/{id}/disks?from&to` | 磁盘用量 |
-| `GET /api/nodes/{id}/net?from&to` | 各网卡速率 |
-| `GET /api/ping/matrix?window=5m` | N×N 最近窗口的 avg/loss |
-| `GET /api/ping/availability?range=24h` | 各链路的可用率条：`24h` = 48 格 × 30 分钟，`7d` = 56 格 × 3 小时，`30d` = 60 格 × 12 小时，最后一格包含当前时刻 |
-| `GET /api/ping/{src}/{dst}?from&to` | 单条链路的历史 |
-| `GET /api/traffic?periods=N` | 各节点最近 N 个周期的总量（默认 24，含各网卡明细） |
-| `GET /api/traffic/{id}/daily?period=...` | 某节点周期内每日流量 |
-| `GET /api/alerts?from&to&node&rule&event` | 当前告警、告警历史（默认最近 7 天，最多 500 条，可按节点 / 规则 / 事件筛选，`event` 逗号分隔）、该时间段内出现过的节点和规则（供筛选菜单）、生效的规则、已配置的通知渠道名 |
+| `/api/nodes` | 每个节点：是否在线、最新状态、套餐（到期日已按续费周期顺延、剩余天数）、配额（总量、计费方式、已用） |
+| `/api/sparks` | 总览卡片上的迷你曲线：最近 1 小时，每分钟一个点 |
+| `/api/traffic?periods=N` | 每个节点最近 N 个周期的总量和计费量 |
+| `/api/nodes/{id}/metrics`、`/net`、`/disks`、`/ping` | 一个节点的历史，`?from&to`；`/ping` 一次返回它到所有 peer 的链路 |
+| `/api/nodes/{id}/ping/{dst}` | 一条链路的历史 |
+| `/api/nodes/{id}/traffic/daily?period=` | 一个周期里每天的流量 |
+| `/api/ping/matrix?window=5m` | 所有链路最近一个窗口的汇总 |
+| `/api/ping/availability?range=24h` | 所有链路的可用率条 |
+| `/api/alerts?from&to&node&rule&event` | 当前告警、历史、规则的文字描述、通知渠道名 |
+| `/api/stats` | ingest 的计数、数据库大小、版本、时区 |
 
-- 按时间跨度自动选表：≤ 6h 用 raw，≤ 7d 用 5m，更长用 1h；再在 SQL 里按 `ts / step` 分组，每条曲线最多约 1000 个点。
-- ping 矩阵的列是各 peer 的 `name`；与节点 id 不一致的 name 也会显示为单独一列。
-- `GET /api/stats`：ingest 各丢弃原因的计数、数据库大小、服务端版本。
+响应里是页面要显示的东西：配额用了多少、告警的数值（`"95.2%"`）、规则的条件（`"CPU > 90.0%，持续 5m"`）都已经算好、写好。这样浏览器里没有第二份计费逻辑和指标表，演示站也不需要。
 
-所有接口都是 GET，服务端不注册任何写接口。
+## 8. 告警与报告
 
-## 7. 告警
+值得发一条消息的事有两种，它们在配置里、代码里、数据库里都是分开的：
 
-规则示例：
+- **告警规则**：一个指标上的条件，持续一段时间后告警，不再满足后恢复。
+- **报告**：发生一次就通知一次，没有"恢复"。
+
+每 10 秒评估一轮；一轮里产生的消息合并成一条发出。状态变化和消息在这一轮结束时一起落库。
+
+### 8.1 告警规则
 
 ```yaml
 alerts:
   - name: cpu_high
-    metric: cpu            # cpu | mem | swap | disk | load1 | steal | offline | ping_loss | ping_avg | net_in | net_out | pps_in | pps_out | softirq | traffic | expiry | ip_change | period_report | weekly_report
-    op: ">"
+    metric: cpu
+    op: ">"                  # > | >= | < | <=
     threshold: 90
-    for: 5m                # 持续多久才触发
-    nodes: all             # 或 [hk-1, jp-1]
-    # exclude: [hk-2]      # 只能配 nodes: all：除这些节点外全部（以后新加的节点自动包含）
-    repeat: 1h             # 仍未恢复时的重复提醒间隔，0 表示不重复
-    notify_recovery: true
-  - name: disk_full
-    metric: disk
-    op: ">"
-    threshold: 85
-    for: 10m
-  - name: offline
-    metric: offline
-    for: 60s               # 超过 60s 未上报
-  - name: link_loss
-    metric: ping_loss      # 按 (src, dst) 链路评估
-    op: ">"
-    threshold: 20
-    for: 3m
-  - name: ddos
-    metric: net_in         # 入站 Mbps，最近 60s 平均
-    op: ">="
-    threshold: 50
-    ratio: 4               # 且入站 ≥ 4 × 出站
-    for: 2m
-  - name: abuse_out
-    metric: net_out        # 出站，被利用对外攻击
-    op: ">="
-    threshold: 50
-    ratio: 4
-    for: 5m
-  - name: traffic_quota
-    metric: traffic        # 按配额百分比，每个周期每个档位只提醒一次
+    for: 5m                  # 持续多久才告警
+    # nodes: [hk-1]          # 默认全部
+    # exclude: [jp-1]        # 全部节点中排除这些
+    # repeat: 1h             # 仍未恢复时的提醒间隔，默认不提醒
+    # notify_recovery: false # 默认恢复时也发
+```
+
+状态机只有一个，里面不出现任何指标的名字：
+
+```
+条件成立：    （无）→ 观察中 → 告警中；告警中按 repeat 提醒
+条件不成立：  观察中 →（无）；告警中在 min(for, 1 分钟) 之后 →（无），发恢复
+没有观测：    观察中 →（无）；告警中保持不动
+```
+
+"没有观测"是指没有可用的数据：节点离线（它最后的数值是旧的，不代表现在）、链路没了、服务端刚启动。恢复前的那段等待是防抖，免得在阈值附近来回跳。
+
+**指标表**（`alert/metrics.go`）：每个指标一项，说明它叫什么、数值怎么写成文字、怎么从这一轮的数据里得到观测。规则里能写的 `metric`、消息里的措辞、网页上的显示，都出自这一张表。
+
+| 指标 | 观测 |
+|---|---|
+| `cpu`、`steal`、`softirq`、`load1`、`mem`、`swap` | 节点最新的值 |
+| `disk` | 每个挂载点各一个 |
+| `ping_loss`、`ping_avg` | 每条链路各一个，取最近 60 秒的汇总（一份报文只有十个探测，太抖）。目标节点离线且有离线规则管着它时不观测：节点宕机时所有对端必然全丢，离线告警已经说明了 |
+| `net_in`、`net_out` | 最近 60 秒各网卡相加后的平均，Mbps。可选 `ratio`：本方向还要不低于反方向的若干倍 |
+| `pps_in`、`pps_out` | 同上，包/秒 |
+| `offline` | 距最后一份报文的时间超过 `for`。条件里已经含了时间，所以一成立就告警、一有报文就恢复；服务端启动后的头 2 分钟不观测 |
+
+**DDoS 识别**靠 `ratio`：中转机的正常流量收发大致对称，被流量型攻击时入站远大于出站，被利用去打别人时出站远大于入站。比例条件让阈值不必按带宽精调，对称的大流量不报。带 `ratio` 的规则在消息里写明"疑似 DDoS"/"疑似被利用对外攻击"和倍数，并附上佐证（不是条件）：
+
+- 多少个节点到它丢包 ≥ 20%：入口被打满时所有对端同时丢包，线路问题只影响一部分。
+- 包速率、入站平均包长、软中断。
+- 离线告警触发时回看节点最后 5 分钟里入站最高的一分钟，满足带 `ratio` 的入站规则时，离线消息附一句"疑似被攻击后遭商家黑洞"。
+- 只封入站的黑洞不会让节点离线，入站回落后规则会恢复；这时如果多数对端仍然丢包，恢复消息附一句"可能已被商家黑洞"。
+
+观测带着三样文字：主文（"CPU 95.2%"）、佐证（另起一行）、条件从何时成立（离线：最后一份报文的时间）。消息由这些字段拼成，不靠解析别的消息的文字来决定格式。
+
+### 8.2 报告
+
+```yaml
+reports:
+  - type: traffic_quota      # 用量到配额的这些百分比；每个周期每档一次
     levels: [80, 90, 100]
-  - name: expiry
-    metric: expiry         # 到期前几天提醒，0 = 当天
-    levels: [7, 1]
-  - name: ip_change
-    metric: ip_change      # 只接受 nodes
-  - name: period_report
-    metric: period_report  # 每个节点的流量周期结束时发一份结算，只接受 nodes / exclude
-  - name: weekly_report
-    metric: weekly_report  # 每周一份所有节点的流量汇总
-    at: "Mon 09:00"        # 星期（Mon…Sun）+ 时刻，按 timezone
+  - type: expiry             # 到期前这些天，0 = 当天；每个到期日每档一次
+    days: [7, 1]
+  - type: period             # 节点的周期结束时发一份结算
+  - type: weekly             # 每周一份全部节点的流量汇总
+    at: "Mon 09:00"
+  - type: ip_change          # 上报来源 IP 变了（不在默认里）
 ```
 
-- 状态机：`ok → pending（满足条件但未达到 for）→ firing → ok`；进入 firing 和恢复时各发一条 TG 消息。
-- **防抖**：firing 之后，条件要连续 `min(for, 1m)` 不满足才算恢复，避免在阈值附近来回跳时反复告警/恢复。
-- 每 10s 评估一次，基于最新数据：
-  - cpu、steal、load1、mem、swap 取最新一条；disk 按挂载点分别评估；
-  - ping_loss、ping_avg 按 (src, dst) 链路取最近 60s 的汇总（单个 10s 样本只有 10 个包，太抖）；
-  - offline = 超过 `for` 没有新鲜报文（从未上报的节点也算），不经过 pending；
-  - 目标节点已离线（超过 `offline_after` 没有新鲜报文）且有 offline 规则覆盖它时，指向它的链路不评估 ping_loss / ping_avg：节点宕机时其他节点必然全部 ping 不通，离线告警已经说明了，不再每条链路各报一次。目标还在上报、只是 ping 不通时照常告警；没有 offline 规则覆盖的目标也照常告警。
-  - net_in / net_out：节点最近 60s（按 agent 时钟，到最新一条报文为止）的每个采样把各网卡速率相加，再取平均，单位 Mbps（10^6 bit/s）；按平均而不是单个 10s 采样，一次几秒的下载尖峰不会触发。可选 `ratio`：本方向还要 ≥ ratio × 反方向才算满足（只能配 `>` / `>=`）。
-    - 用途是识别 DDoS：中转机的正常流量收发大致对称（从一边收进来，从另一边发出去），被流量型攻击（UDP flood、反射放大）时入站远大于出站；被利用去打别人时出站远大于入站。比例条件让阈值不必按端口带宽精调，对称的大流量不会误报。下载为主（入站多）或做种（出站多）的节点用 `exclude` 排除。
-    - 写了 ratio 的规则在告警时标明「疑似 DDoS」/「疑似被利用对外攻击」并给出倍数；net_in 另附「N 个节点中 M 个到它丢包 ≥ 20%」（按最近 60s 的链路汇总），作为入口被打满的佐证：流量打满入口时所有对端同时丢包，线路问题只影响部分对端。只是佐证、不是条件——有的节点没人 ping，有的只有少数几个对端。
-    - 2026-10 用线上 48 小时数据回测：阈值 50 Mbps、ratio 4 时，单向流量最长持续 130s（下载为主的家宽节点之外入站方向为 0），所以默认入站 `for: 2m`、出站 `for: 5m`。
-    - 「包多但流量不大」的攻击（SYN flood、小包 UDP flood）字节速率看不出来，用 pps_in（见下）。agent ≥ 0.1.14 的节点，net_in 告警另附一行包速率、入站平均包长和软中断占比作为佐证。
-  - pps_in / pps_out：与 net_in / net_out 同样取最近 60s 平均、各网卡相加，单位包/秒，也可以写 `ratio`；没有包速率的旧 agent 不评估。消息里带入站平均包长和软中断占比。不加「疑似 DDoS」字样，也不建议靠 ratio 判断：SYN flood 时机器对每个 SYN 回一个 SYN-ACK，进出包数差不多，平均包长才是区分点。不在默认规则里：阈值要用实际数据回测后再定（0.1.14 部署后先收集包速率数据）。
-  - softirq：软中断占 CPU 的百分比，取最新一条，与 cpu、steal 相同。
-  - 黑洞提示：offline 告警触发时，回看节点最后一条报文之前 5 分钟内入站最高的 60s 平均；它满足某条覆盖该节点、写了 ratio 的 net_in 规则时，离线消息附「停止上报前入站 X、出站 Y，疑似被攻击后遭商家黑洞」。商家通常在被打时把 IP 丢进黑洞，流量到不了网卡，这时只剩离线告警会响。被打期间丢失的报文 agent 会在恢复后补传，所以提示依据的是服务端当时已经收到的数据。
-  - 只封入站的黑洞（目标是该 IP 的流量被丢弃，机器自己发出的包照常出去）不会让节点离线：入站回落到 0，ddos 规则会恢复。所以写了 ratio 的 net_in 规则恢复时，若最近 60s 至少一半 ping 它的节点丢包 ≥ 20%，恢复消息附「入站已回落，但 N 个节点中 M 个到它仍丢包 ≥ 20%，可能已被商家黑洞」。只加说明，不阻止恢复。
-  - expiry 只评估写了 `expire_at` 的节点：剩余天数 ≤ 某档且该档比已提醒过的更紧迫时提醒一次（一轮跨过多档只发最紧迫的一档，首次配置时已过期也只发一条）。状态按 (规则, 节点, 到期日) 记录，续费改了 `expire_at` 或按 `renew_months` 顺延后是新的到期日，重新计档，旧日期的状态删除。
-  - ip_change：最新报文的来源 IP 与记录的不同时通知一次「旧 → 新」，没有告警中/恢复状态；某节点第一次看到的 IP 只记录不通知（升级后不会每个节点报一遍）。当前 IP 存在 `alert_state.target`，重启不重复。agent 重新解析服务端地址时换了地址族（v4 ↔ v6）也会算作变化。
-  - period_report：节点最新的周期起始日变了，说明上一周期结束，发一份上一周期的结算：起止日期和天数、下行/上行/合计、配额使用率（有配额时）、日均、用量最多的一天。周期起止都取自 agent 上报的周期起始日，天数是两个起始日之差，日均 = 合计 ÷ 天数（`reset_time` 不是 00:00 时按日明细缺最后半天，所以不用按日记录条数去除）。agent 每次上报都带上一周期的最终总量，新周期的第一条报文到达时上一周期已经结清。当前周期起始日存在 `alert_state.target`，重启不重复；某节点第一次看到时只记录不发（升级后不会把每个节点上个月的结算补发一遍）。服务端停机跨过了好几个周期时只结算最近结束的那一个。起始日变小（agent 状态重建、改了重置日）只记录不发。
-  - weekly_report：每周在 `at` 指定的时刻发一条汇总（不是每个节点一条），每个覆盖的节点一行：本周期已用（有配额时带百分比）、近 7 天用量（按日明细中今天之前的 7 个完整自然日；刚开始上报、不足 7 天的节点按实际天数，显示「近 N 天」）、按近 7 天的日均速率推算的周期末用量（下行和上行分别推算后再按计费方式合计，`max` 模式才正确；推算超过配额时标 ⚠️）、下次重置日期。末尾列出 30 天内到期或已过期的节点。推算和重置日期依赖服务端配置里该节点的 `reset_day` / `reset_time`：用它们算不出 agent 上报的当前周期起始日（两边配置不一致）时，只显示已用量。错过发送时刻（服务端停机）后 24 小时内补发，超过就跳过这一周；部署当周已经过了发送时刻超过 24 小时也不补发。已发送的时刻存在 `alert_state.target`（节点字段为空），重启不重复。
-  - 告警和报告消息里的流量单位最大到 GB（不换算成 TB）：配额按 GB 配置，`1146.88 GB / 1000.00 GB` 比 `1.12 TB / 1000.00 GB` 好比较。
-  - traffic 按节点的 `traffic_quota_mode` 计算已用量，没设配额的节点跳过；状态按 (规则, 节点, 周期起始) 记录，每个周期每个档位只提醒一次，下个周期自动重新计。
-- **数据缺失**（节点离线、没有对应数据）时：firing 的告警保持不动，不发恢复；pending 的归零。
-- 服务端启动后的前 2 分钟不评估 offline，避免服务端重启时误报所有节点离线。
-- 未配置 `alerts` 时使用默认规则：offline 60s、cpu > 90% 5m、mem > 90% 5m、disk > 90% 10m、ping_loss > 20% 3m、traffic [80, 90, 100]、expiry [7, 1]、ddos（net_in ≥ 50 Mbps 且 ≥ 4 × 出站 2m）、abuse_out（net_out ≥ 50 Mbps 且 ≥ 4 × 入站 5m）、period_report、weekly_report（Mon 09:00）。ip_change 不在默认规则里（动态 IP 的节点会频繁触发）。写了 `alerts` 就只用写的规则。
-- firing 状态和流量档位持久化在 `alert_state`，服务端重启不会重复告警；`alert_history` 保留 400 天（跟随 `retention.h1`）。配置里删掉的规则，其状态在启动时清理。
+每种报告为每个节点记一个**标记**：它上次发的是关于什么（哪个周期、哪个到期日、哪个 IP、哪一周），带档位的还记到了哪一档。标记不同就是新的一回事，从头算；相同就不再发。第一次见到某个节点时只记标记不发消息（否则升级后会把每个节点补发一遍）。
 
-Telegram：
+- `traffic_quota`：一轮里跨过几档只发最高的一档。
+- `expiry`：剩余天数按服务端时区的日历日算。有 `renew_months` 的套餐过了到期日自动顺延，顺延后是新的到期日。
+- `period`：节点当前周期的起点变晚了，说明上一个周期结束；发上一周期的起止、收发、配额使用率、日均和用量最多的一天。起止来自 agent 上报的值。
+- `weekly`：每个节点一行：本周期已用、近 7 个完整自然日的用量、按这个速率推算到周期末的用量（收和发分别推算再按计费方式合计；超过配额时标出）、重置时间；末尾列出 30 天内到期的节点。错过发送时刻的 24 小时内补发。
+- `ip_change`：消息是"旧 → 新"。
 
-- 只调用 `sendMessage`，不收消息（不用 getUpdates / webhook），bot 无法向服务端下指令。
-- 纯文本发送（不用 parse_mode），agent 上报的字符串无法注入格式。
-- 同一评估轮次的消息合并成一条，超过 4096 字符拆分；发送失败按指数退避重试，队列有上限。
-- 请求失败的错误信息里会带 URL（含 bot token），记录日志前脱敏。
-- 未配置 telegram 时，告警照常评估和记录，消息内容写入服务端日志。
-- 消息里的时间按配置的 `timezone` 显示。
+消息里的流量单位最大到 GB：配额按 GB 配置，`1146.88 GB / 1000.00 GB` 比 `1.12 TB / 1000.00 GB` 好比较。
 
-Webhook（服务端 ≥ 0.1.18）：让任何有 HTTP 接口的推送服务都能当通知渠道（Bark、ntfy、Discord、Slack、Server 酱、企业微信、自建服务……），不为每家各写一个客户端。
+### 8.3 通知渠道
 
-- `webhooks` 是一个列表，每项：`name`（日志和告警页里显示的渠道名）、`url`、`method`（POST 默认 / GET / PUT）、`headers`、`body`。每条告警消息对每个 webhook 发一个请求，与 Telegram 并行，各有各的队列和重试。
-- 模板变量：`{{title}}` 是消息第一行，`{{message}}` 是全文。在 `url` 里做百分号编码（`/`、`?`、`&` 都会被编码，注入不了路径和参数）；在 `body` 里按 `Content-Type` 编码：JSON 时替换成带引号的 JSON 字符串字面量，表单时百分号编码，其他类型原样。所以 JSON 模板里变量**不要再加引号**：`{"content": {{message}}}`。
-- 不写 `body` 的 POST / PUT 发 `{"title": {{title}}, "message": {{message}}}`，`Content-Type` 默认 `application/json`。
-- 只发不收：2xx 算成功，429 和 5xx、网络错误按指数退避重试，其他 4xx 不重试并记日志；响应内容读完即弃，不解析、不执行。
-- URL 里通常带密钥：日志和错误信息只写渠道名和状态码，不写 URL。
-- 消息不拆分（各家长度限制不同；一轮评估合并的长消息可能被对方截断）。
+一个渠道 = 一个队列加一个发送方式。队列按顺序投递，失败按指数退避重试，被对方明确拒绝（4xx）的不重试；队列满了丢弃新消息，因为等它恢复时这些消息也过时了。发送方式有两种：
 
-`vps-probe-server test-notify` 向 Telegram 和每个 webhook 各发一条测试消息并逐个报告结果（`test-telegram` 是它的旧名字，仍然可用）。
+- **Telegram**：纯文本（不用 `parse_mode`，节点上报的字符串注入不了格式）；超过长度拆成几条；错误信息里的 token 在记日志前抹掉。
+- **Webhook**：按模板发一个 HTTP 请求，任何有 HTTP 接口的推送服务都能接。`{{title}}` 是消息第一行，`{{message}}` 是全文；在 URL 里做百分号编码，在 body 里按 `Content-Type` 编码（JSON 时变成带引号的字符串字面量）。日志里只写渠道名和状态码，不写 URL（里面通常有密钥）。
 
-## 8. 前端页面
+一个渠道都没配时，告警照常评估、记进历史，消息写进服务端日志。
 
-1. **总览**：可切换卡片 / 表格（仿 ServerStatus 的一行一台，点行进入详情，窄屏横向滚动），可按名称、地区、CPU、内存、磁盘、网速、本周期流量、配额使用率、TCP 连接、到期排序（按实时数值排序时离线和从未上报的节点排最后），配置了 `group` 时按分组切换（顺序为分组在配置文件里首次出现的顺序，另有「未分组」），汇总条跟随所选分组。这三个选择存在浏览器 localStorage（只是本机偏好，存不了时用默认值）。卡片和表格都显示 `region` 角标，卡片多一行「连接」（TCP、UDP、线程）。卡片顶部有两条最近 1 小时的迷你趋势线：CPU（纵轴固定 0–100%，各节点之间可以直接比高低）和网速（收、发两条线，纵轴按这台自己这一小时的峰值，只看形状；峰值在悬停提示里）。趋势线是手写的 SVG 折线，不为每张卡片建一个 ECharts 实例；数据断档处折线断开。顶部汇总条：在线数、在线节点实时网速之和、各节点本周期流量之和（各自按自己的周期起始日）、最近到期的节点。每个节点一张卡片，显示在线状态、CPU/内存/磁盘进度条、实时网速、本周期流量/配额进度、运行时长、到期日/剩余天数/价格（7 天内到期或已过期时标题旁加角标）。agent 版本低于其他节点中最新的 agent 版本时显示「agent 可升级」：与 agent 互相比较而不是与服务端比较，因为只改服务端的版本不需要升级 agent；`dev` 等无法解析的版本不比较。节点详情另显示上报来源 IP。
-2. **节点详情**：时间范围可选 1h / 6h / 24h / 7d / 30d / 自定义；图表包括 CPU（含 steal、软中断）、负载、内存/Swap、磁盘、各网卡速率、各网卡包速率（agent < 0.1.14 时隐藏）、连接与线程（TCP / UDP / TIME_WAIT，线程用右轴；agent < 0.1.9 时隐藏），以及该节点到各 peer 的时延。鼠标停在任一张图上，其他图的竖线跟到同一时刻（按时间值对齐，不用 `echarts.connect`：它按数据下标同步，采样间隔不同的图——磁盘 60s 一点——或有断档的图会对错时刻），方便看 CPU 尖峰和时延尖峰是否同时发生；只有鼠标所在的图显示数值框，其他图只显示竖线，免得数值框挡住要对比的曲线。手机上点按同样生效。
-3. **时延**：
-   - **网络质量**：统计窗口内丢包最多、抖动最大的 3 条链路，以及可用率条所选范围内可用率最低的 3 条（只算窗口内仍有数据的链路，被 `no_ping` 去掉的链路留下的旧数据不参与），点击进入链路历史。
-   - **时延矩阵**：N×N 热力图（颜色表示 avg，角标表示丢包），点击格子查看该链路的历史曲线：min / max 为灰色虚线，avg 为实线，加丢包柱。仿 Smokeping，avg 线和丢包柱按每个采样的丢包率着色，配色与可用性条相同（< 1% 绿、1–20% 黄、20–50% 橙、≥ 50% 红；20% 与「5 分钟丢包 ≥ 20% 记为不可用」一致），不看丢包柱也能看出哪段在丢包；图上方有颜色说明，数值框里有具体丢包率，不只靠颜色表达。ECharts 的线条只能按坐标轴维度分段着色，所以按时间生成分段：每个采样点管到与相邻点的中点。
-   - 时延图（链路历史、节点详情的「到各 peer」）的纵轴按常见值定上限：取 avg 的 99 分位和 max 的 75 分位中较大者，乘 1.15 后取整；只有最高点超过这个值的 2 倍时才截，图上注明「纵轴上限 X，最高 Y」，超出的部分从图表顶部出去，数值框里仍是实际值。否则一个 10 秒的 RTT 会把 40 ms 的曲线压成一条贴底的线。
-   - **链路可用性**（仿 Uptime Kuma 的状态条）：每条链路一行，24 小时 / 7 天 / 30 天分成约 50–60 格，可按发起方筛选。数据来自 `ping_5m`：某个 5 分钟丢包 ≥ 20%（与默认 `link_loss` 阈值一致）记为不可用；可用率 = 可用的 5 分钟数 / 有数据的 5 分钟数，没有数据（agent 离线、链路未配置）的时段不计入。格子颜色：全部可用且丢包 < 1% 绿、丢包 ≥ 1% 黄、有不可用时段橙、一半以上不可用红、无数据灰；鼠标悬停显示该格的时间段、可用时段数、丢包和平均时延。颜色只看丢包不看时延：跨洲链路时延高是常态，时延看矩阵。这部分 60s 刷新一次。
-4. **流量**：各节点本周期/历史周期的收、发、合计与配额表格，以及本周期每日流量柱状图。
-5. **告警**：告警历史列表。
+## 9. 网页
 
-- 页面自动适配深色/浅色模式，移动端可用（卡片在窄屏下单列，矩阵表格可横向滚动）。
-- 实时刷新采用 10s 轮询（时间范围超过 24h 时 60s），不使用 WebSocket，保持服务端简单。
+原生 ES 模块，没有构建步骤：`js/` 是各页共用的（DOM、格式化、接口、图表、路由），`pages/` 每页一个模块。文件和 ECharts 一起嵌进服务端程序，和 API 同一个端口。
 
-实现方式：
+- **页面显示什么由地址决定**：`#/node/hk-1?range=6h`、`#/alerts?range=30d&node=hk-1`。时间范围、筛选条件都在地址里，页面可以刷新、收藏、发给别人。只有总览的布局偏好（卡片还是表格、排序、分组）存在浏览器里。
+- **总览**：卡片或表格；卡片上有最近 1 小时的 CPU 和网速迷你曲线；可排序、按分组切换。
+- **节点详情**：各项指标的曲线共用时间轴，鼠标停在一张图上，其他图的竖线跟到同一时刻（按时间对齐而不是按数据下标：磁盘 60 秒一个点，有断档的图也会对错）。数据缺口处曲线断开，不连过去。
+- **时延**：最差的几条链路；N×N 矩阵；每条链路的可用率条（某个 5 分钟丢包 ≥ 20% 记为不可用）；单条链路的历史，平均线按丢包率着色。时延图的纵轴按常见值定上限，个别极端值从顶部出去并注明，否则一个 10 秒的回应会把 40 毫秒的曲线压成贴底的一条线。
+- **流量**：各节点本周期和历史周期，一个节点的每日流量。
+- **告警**：当前告警、历史（可筛选）、生效的规则。
 
-- 原生 JS 单页应用，无构建步骤；hash 路由（`#/`、`#/node/{id}`、`#/ping`、`#/ping/{src}/{dst}`、`#/traffic`、`#/alerts`）。
-- 页面文件与 ECharts（版本号写在文件名里）用 `go:embed` 打进服务端二进制，与 API 同一端口：`GET /` 返回 `index.html`，`GET /static/...` 返回静态文件，其他路径 404。静态文件长缓存 + 启动时预压缩 gzip，`/api/` 不缓存。
-- ECharts 是页面里最大的文件（压缩后约 370 KB），是最容易没取到的一个（服务端重启的那十几秒、网络抖动）。它没加载上时 `app.js` 自己重新加载它，最多 3 次（间隔 2、5、10 秒），期间页面显示正在重试；都不成功才显示「请刷新页面」和一个刷新按钮。重试成功后直接进入页面，不需要人去刷新。
-- 严格 CSP：`default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'`，禁止内联脚本和样式。ECharts 提示框用 `renderMode: 'richText'`（画在 canvas 上），不需要放开内联样式。
-- **agent 上报的字符串（主机名、网卡、挂载点、peer 名）一律按文本插入 DOM**，不拼 HTML；进入 URL 时做 `encodeURIComponent`。被攻破的 agent 也无法借此在页面里执行脚本。
-- 网速用字节/秒显示（KB/s、MB/s）；流量配额的 GB 按 1024³ 字节计算。
-- 时间按浏览器本地时区显示；按日流量的日期边界来自服务端 `timezone`。
+安全：严格的 CSP（没有内联脚本和样式，没有第三方来源）；节点上报的字符串（主机名、网卡名、挂载点、peer 名）只作为文本进 DOM，进 URL 时编码，进图表时是画在 canvas 上的文字。被攻破的节点不能借此在页面里执行脚本。
 
-## 9. 目录结构
+刷新是 10 秒轮询（范围超过 24 小时时 60 秒），不用 WebSocket。时间按浏览器的时区显示；服务端决定的日期（周期起止、到期日）按服务端的时区显示。
 
-```
-cmd/
-  vps-probe-agent/      main.go（含 -dry-run）
-  vps-probe-server/     main.go（serve / check / backup / test-notify / agent-config / add-node / install-cmd / gen-token / hash-password）
-  vps-probe-echo/       main.go：隧道探测应答端（可选，只装在隧道终点）
-proto/probe/v1/         probe.proto
-internal/
-  proto/probev1/        生成的 protobuf 代码（已提交）
-  wire/                 加密包格式，agent 与 server 共用
-  echo/                 隧道回显协议与应答端，agent 与 vps-probe-echo 共用
-  agent/
-    agent.go            采样主循环
-    config/
-    collect/            cpu、mem、load、disk、net、sys 采集
-    traffic/            流量累计与持久化（§4）
-    ping/               ICMP 互测、DNS / 隧道回显探测
-    report/             拆包、UDP 发送、ACK、补传
-  release/              release-signers 发布签名公钥（§13）、一行安装命令的生成（§6.1.1）
-  server/
-    config/             服务端配置、权限检查、agent.yml 生成、add-node 的文本插入
-    store/              SQLite：写入、降采样、清理、查询、备份
-    ingest/             UDP 接收、校验、去重、ACK
-    api/                只读 HTTP API
-    alert/              告警规则评估、状态机
-    notify/             Telegram、webhook 发送（只发不收）
-    cfaccess/           Cloudflare Access JWT 校验
-    basicauth/          HTTP Basic 认证、失败限速
-web/                    web.go（go:embed）+ static/（index.html、app.js、style.css、vendor/echarts 及其 LICENSE、NOTICE）
-  demo/                 演示站：demo.js（假数据）、api-shape.json（接口结构）、check.js、_headers（§14）；不进服务端程序
-deploy/
-  vps-probe-agent.service
-  agent.example.yml
-  vps-probe-server.service
-  server.example.yml
-  vps-probe-echo.service
-  echo.example.yml
-  cloudflared.example.yml   本地配置方式的隧道示例
-  install.sh              安装 / 升级 / 卸载（agent、server、echo）
-VERSION                   版本号；`make dist` 生成发布包
-scripts/third_party_licenses.sh   生成 THIRD_PARTY_LICENSES（`make licenses`，`make dist` 时自动执行）
-scripts/release.sh        核对 CI 构建的草稿 Release，签名并发布（`make release-verify` / `make release-sign`，§13）
-.github/workflows/release.yml   推送 tag 后测试、构建、建草稿 Release（§13）
-LICENSE                   Apache-2.0
-NOTICE                    版权声明及所含 Apache-2.0 组件的 NOTICE
-docs/
-  DESIGN.md
-```
+## 10. 发布与签名
 
-## 10. 测试重点
+目标：用户能确认下载的发布包是这个仓库某个 tag 的源码构建的，并且经维护者确认；GitHub 账号或 CI 被攻破，也发不出能通过验证的包。
 
-- `traffic`：重启（boot_id 变化）、计数器回绕/归零、跨月、`reset_day` = 29/30/31 遇到小月、状态文件损坏（先备份再重建，并告警）、并发落盘，全部做表驱动单元测试；采集源通过接口注入以便模拟。
-- 周期计算：时区与 DST（虽然 Asia/Shanghai 没有夏令时，仍按通用逻辑实现并测试）。
-- 协议：加解密往返、篡改头部/密文/附加数据、错误密钥、截断包、ACK 反射成 Report、超长包拆分。
-- ingest：未知节点、解密失败、畸形 protobuf、`ts` 越界，均需静默丢弃；重复报文的幂等性。
-- agent 发送器：ACK 移出队列、超时重发、服务端离线时只发探测包、队列上限。
-- 告警状态机：pending/firing/恢复/重复提醒、服务端启动静默期。
-- agent 降级：没有 `/proc/stat` 和 `/proc/uptime` 时能启动、开机时间为未知；采集项连续失败只记一条日志、恢复记一条；开机时间优先取 uptime、其次 `btime`。
-- 端到端：本地启动 server + 2 个 agent（peer 互指 127.0.0.1），跑通整条链路。
+1. 维护者改 `VERSION`，提交、推送，再单独推送 tag `v<VERSION>`。
+2. CI 测试、构建，建一个**草稿** Release。CI 不持有任何签名密钥。
+3. 维护者在自己的电脑上 `make release-sign`：下载草稿里的文件，在临时 worktree 里检出同一个 tag 重新构建，逐字节比较；一致才用离线密钥签 `.sha256`，上传签名，把草稿改成正式发布。
+4. 用户用 `ssh-keygen -Y verify` 验 `.sha256`，再用它核对 tar 包。OpenSSH 8.1 起自带，不用装别的。
 
-## 11. 里程碑
+签的是 `.sha256` 而不是各个 tar 包：一个签名覆盖整个版本。
 
-| 阶段 | 内容 | 验收 |
-|---|---|---|
-| M1 | agent 采集 + 流量累计 + ICMP + UDP 上报协议；`-dry-run` 模式把报文打印到 stdout | 单元测试通过；在一台 VPS 上重启后流量数据连续 |
-| M2 | server UDP ingest + SQLite + 降采样 + 只读 API | 两台 agent 上报，API 能查到数据 |
-| M3 | 前端五个页面 | 在浏览器里查看 |
-| M4 | 告警 + Telegram | 人为制造 CPU 高负载、停掉 agent，能收到告警和恢复通知 |
-| M5 | 安装脚本、systemd 加固、cloudflared 示例、README | 按 README 在一台干净的 VPS 上从零部署成功 |
+**可复现构建**：工具链固定为 go.mod 里写的版本（本机不同时自动下载）；`CGO_ENABLED=0`、`-trimpath`、`-buildvcs=false`；tar 包里的顺序、属主、权限、时间都固定。
 
-## 12. 暂不做
+**密钥**：专用的 ed25519 SSH 密钥，只在维护者的电脑和密码管理器里。公钥在 `internal/release/release-signers` 和 README，限定了用途（namespace），不能被挪去冒充别的签名。换密钥时把新公钥加进去，旧的留着。
 
-- TCP 时延（后续可做 TCP connect 到对端已有端口）；经端口转发隧道的时延已由 DNS 探测和隧道回显覆盖
-- 多用户 / 权限体系（依赖 CF Access；`basic_auth` 只有一个账号）
-- 匿名可见的公开状态页（需要单独的监听端口和字段白名单；有需求再做）。演示用途由静态演示站承担（§14）
-- agent 自动更新（安全原则 2）
-- 服务端配置热加载：改了 `server.yml`（包括 `add-node`）要重启服务端。重启不到一秒，期间的报文 agent 会重传
+不防的：维护者的电脑被攻破；用户拿到的公钥本身是假的。
 
-## 13. 发布与签名
+## 11. 演示站
 
-目标：用户能确认下载的发布包是这个仓库某个 tag 的源码构建出来的，并且经维护者确认；GitHub 账号或 CI 被攻破，也发不出能通过验证的包。
+让人不装就能看到界面，又不暴露任何真实部署。它是纯静态文件：界面就是 `web/static/` 里的同一份，多加载一个 `web/demo/demo.js`，它替换 `fetch`，在浏览器里生成 `/api/*` 的回答。十台虚构的节点；数值是时间戳的确定函数，所以各页面、各时间范围之间对得上，刷新只是多出新的点。
 
-### 13.1 流程
+接口变了而演示数据没跟上，界面会悄悄缺东西。两道检查：服务端的测试把每个接口响应的**结构**（字段名和类型）记在 `web/demo/api-shape.json`；`make demo-check` 用同样的规则检查 `demo.js` 的输出。CI 两个都跑。
 
-1. 维护者改 `VERSION`、提交并推送 `main`，再打 tag `v<VERSION>` 单独推送（tag 和提交在同一次 push 里可能不触发 CI）。
-2. GitHub Actions（`.github/workflows/release.yml`）：检查 tag 与 `VERSION` 一致 → `make test` → `make dist` → 检查提交的 `THIRD_PARTY_LICENSES` 是最新的 → 建一个**草稿** Release，上传两个 tar.gz 和 `vps-probe-<版本>.sha256`。草稿对外不可见。CI 不持有任何签名密钥。
-3. 维护者在自己电脑上 `make release-sign`：
-   - 下载草稿里的文件，用 `.sha256` 核对；
-   - 在临时 worktree 里检出同一个 tag（先确认本地 tag 和 GitHub 上的指向同一个 commit），重新 `make dist`，逐个比较 tar 包：文件列表、权限、属主、mtime 和每个文件的字节都要一致；
-   - 用离线签名密钥 `ssh-keygen -Y sign -n vps-probe-release` 签 `.sha256`，得到 `.sha256.sig`，再用仓库里的 `internal/release/release-signers` 验一遍；
-   - 上传 `.sig`，把草稿改为正式发布。
+## 12. 测试
 
-   只核对、不签名：`make release-verify`。
-4. 用户：用 README 给出的公钥 `ssh-keygen -Y verify` 验 `.sha256`，再 `sha256sum -c` 验 tar 包。OpenSSH ≥ 8.1 自带（Debian 11、Ubuntu 20.04 起），不需要装别的工具。
+- 流量累计：重启、计数器归零、跨周期、月末的重置日、状态文件损坏、并发落盘。
+- 网卡选择：单网卡、多网卡加内网、隧道默认路由、容器、等待默认路由时的三个状态。
+- 协议：加解密往返、篡改头部和密文、错误的密钥、ACK 反射、超长报文拆分与合并。
+- ingest：各种非法包都静默丢弃；重复报文幂等；数值范围。
+- 告警：状态机的每条边、每个指标的消息原文、每种报告的"只发一次"和重启后不重复；指标表覆盖配置里允许的每个指标。
+- 配置：三份示例配置都能加载，服务端示例里的规则等于默认值；生成的 agent 配置能被 agent 加载。
+- 接口：每个响应的结构与演示站一致。
+- 发布前在带 systemd 的容器里用发布包实际走一遍：装服务端、`add-node`、用打印的命令装 agent、装 echo、升级、卸载。
 
-签名对象是 `.sha256` 而不是各个 tar 包：一个签名覆盖整个版本，`.sha256` 里每个 tar 包的哈希又覆盖包内所有文件。
+## 13. 不做的事
 
-### 13.2 可复现构建
-
-本地重建能和 CI 产物逐字节一致，靠这些约定（`Makefile`）：
-
-- 工具链：`GOTOOLCHAIN` 取 go.mod 的 `toolchain` 行，本机 Go 版本不同时自动下载那个版本（经 Go checksum 数据库校验）。Debian 打包的 Go 与官方同版本的构建结果一致（已验证）。
-- `CGO_ENABLED=0`、`-trimpath`、`-buildvcs=false`。VCS 信息取决于检出方式（worktree、浅克隆），会让同一份源码产出不同的二进制；版本号已经由 `-X main.version` 写入，对应的 commit 就是 tag 指向的 commit。
-- tar：`--sort=name`、属主 0/0、权限归一（目录和可执行文件 0755，其余 0644）、mtime 统一为该 commit 的提交时间（`SOURCE_DATE_EPOCH`）；`gzip -n` 不写文件名和时间戳；`LC_ALL=C` 固定排序。
-
-### 13.3 密钥
-
-- 专用 ed25519 SSH 密钥，只存在维护者电脑上（`~/.ssh/vps-probe-release`，0600，无口令，以便发布流程无人值守），备份在维护者的密码管理器里；不进 CI，不进 GitHub，和登录 GitHub 的密钥分开。电脑损坏时从备份恢复即可继续发布。
-- 公钥在 `internal/release/release-signers`（OpenSSH allowed_signers 格式，限定 namespace `vps-probe-release`）和 README；它同时编进服务端程序，供一行安装命令验签（§6.1.1）。namespace 让这把密钥的签名不能被挪作他用（比如冒充 git commit 签名）。
-- 换密钥：把新公钥加进 `release-signers`（旧的保留，旧版本的签名仍能用旧公钥验证），在 README 和发布说明里写明更换。没有自动化的轮换流程。
-
-### 13.4 不防什么
-
-- 维护者电脑被攻破：攻击者可以签任何东西。
-- 用户拿到的公钥本身是假的：公钥要从 GitHub 仓库或 README 获取，以后升级沿用同一个。
-- CI 的 workflow 固定 action 的 commit SHA、不用缓存、checkout 不保存凭据，降低被供应链污染的机会；即使 CI 产物被篡改，也会在第 3 步的比对里暴露。
-
-## 14. 演示站
-
-目的：让人不装就能看到界面和功能，又不暴露任何真实部署。演示站是纯静态文件，没有后端，托管在静态托管服务上（Cloudflare Pages，站点根路径；页面里的 `/static/...` 是绝对路径，放在子目录下不能用）。
-
-### 14.1 原理
-
-- 界面就是 `web/static/` 里的同一份文件，一行不改。
-- 多加载一个 `web/demo/demo.js`（普通脚本，排在 `app.js` 这个 module 之前执行）：它替换 `window.fetch`，同源的 `/api/*` 请求不发出去，直接返回在浏览器里生成的数据；并在页面顶部加一条"演示数据"提示。
-- `web/demo/` 不在 `go:embed` 的范围内，不会进服务端程序。
-- `make demo` 生成 `dist/demo/`：拷贝 `web/static/`，在 `index.html` 的 `app.js` 之前插入 `demo.js` 的 script 标签（构建时插入，不另存一份 index.html），再放一个 `_headers`（与服务端相同的 CSP 等安全响应头）。
-
-### 14.2 数据
-
-- 十台虚构节点（名称、主机名、IP 都是编的，IP 用文档保留网段），不含任何真实部署的数据。
-- **数值是时间戳的确定函数**：`值 = 基线 + 日周期 + 按 (节点, 指标, 时间桶) 哈希出的噪声`。同一时刻在总览、节点图表的不同时间范围、时延矩阵和链路图里一致；定时刷新只是多出新的点，曲线不会跳。
-- 与服务端相同的分层规则（§6.4）：raw / 5m / 1h、每条曲线最多约 1000 点、`*_max` 列；所有查询参数（`from`/`to`、`window`、`range`、`periods`、`period`、告警筛选）都按真实接口的语义处理。
-- 流量：按 (节点, 日) 确定地生成每日用量，周期合计 = 各日之和。
-- 编排的"剧情"，以打开页面的时刻为锚点：一台节点正在被 DDoS（入站远大于出站、软中断升高、其他节点到它丢包，`ddos` 告警中）；一台节点离线（`offline` 告警中）；一条长期丢包的链路；一台节点流量接近配额；一台节点即将到期；告警历史里有对应的记录，以及每周流量汇总、周期结算、IP 变化等。
-
-### 14.3 防止过时
-
-接口加了字段而演示数据没跟上，界面会悄悄缺东西。两道检查：
-
-- `internal/server/api` 的测试把每个接口响应的**结构**（字段名和类型，不含数值）与 `web/demo/api-shape.json` 比较；接口变了测试就失败，`go test ./internal/server/api -update-shape` 更新这个文件。
-- `make demo-check`（需要 node）用同样的规则算出 `demo.js` 各接口输出的结构，与 `api-shape.json` 比较。发布流水线里会跑；本机没有 node 可以不跑。
+- 网页上加节点、改配置；远程执行命令、网页终端、文件管理；agent 自动更新。（§2）
+- 匿名可见的公开状态页：需要单独的端口和字段白名单，有人需要再做。
+- 多用户和权限。
+- 对网站或端口的可用性监控（HTTP / TCP 探测）。
+- Windows、macOS、非 systemd 系统的 agent。
+- 配置热加载。

@@ -1,6 +1,6 @@
 # Builds a pushed tag v<VERSION> into a draft GitHub release. CI holds no
 # signing key: the maintainer checks the draft against a local rebuild,
-# signs it and publishes it with `make release-sign` (docs/DESIGN.md §13).
+# signs it and publishes it with `make release-sign` (docs/DESIGN.md §10).
 name: release
 
 on:
