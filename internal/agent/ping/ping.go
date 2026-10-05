@@ -1,11 +1,12 @@
 // Package ping measures latency to a fixed set of peers. A peer is probed
 // with ICMP echo, or over UDP for paths that only carry TCP/UDP, such as a
 // port forward: a DNS query when the far end is a resolver (e.g. 1.1.1.1:53),
-// or an authenticated request when it is a vps-probe-echo responder.
+// or an authenticated request when it is a vps-probe-echo responder. The
+// responder can also be asked over a TCP connection, for a path without UDP.
 //
 // However a probe travels, it is one numbered request that is answered within
 // the timeout or counted as lost. The ways to send one are links (icmp.go,
-// udp.go); everything else is the same for all of them.
+// udp.go, tcp.go); everything else is the same for all of them.
 package ping
 
 import (
@@ -35,7 +36,7 @@ const (
 // Stats summarizes the probes to one peer that completed in a window.
 type Stats struct {
 	Target string
-	Addr   string // resolved IP (ip:port for UDP peers), empty if unresolved
+	Addr   string // resolved IP (ip:port for UDP and TCP peers), empty if unresolved
 	Sent   int
 	Lost   int
 	Min    float64 // milliseconds, over replies only
@@ -94,9 +95,10 @@ func New(peers []peer.Peer, interval, timeout time.Duration, log *slog.Logger) (
 			return nil, fmt.Errorf("ping: peer %w", err)
 		}
 		t := &target{Peer: pr, host: pr.Addr}
-		if pr.UDP() {
-			u, host := newUDPLink(p, t)
-			t.link, t.host = u, host
+		if pr.Type == peer.EchoTCP {
+			t.link, t.host = newTCPLink(p, t)
+		} else if pr.UDP() {
+			t.link, t.host = newUDPLink(p, t)
 		} else {
 			needICMP = append(needICMP, t)
 		}
@@ -111,7 +113,7 @@ func New(peers []peer.Peer, interval, timeout time.Duration, log *slog.Logger) (
 		if len(needICMP) == len(peers) {
 			return nil, err
 		}
-		log.Error("ICMP peers disabled, UDP peers still probed", "err", err)
+		log.Error("ICMP peers disabled, UDP and TCP peers still probed", "err", err)
 		return p, nil
 	}
 	p.icmp = ic

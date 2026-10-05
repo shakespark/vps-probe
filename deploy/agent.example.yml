@@ -31,3 +31,5 @@ peers:
   # - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }
   # type: echo 向隧道另一端的 vps-probe-echo 发带签名的请求；key 是那边 echo.yml 里的 key。
   # - { name: hk2-via-sgp, addr: "127.0.0.1:39527", type: echo, key: "<那边的 key>" }
+  # type: echo-tcp 同上，但走一条长连接的 TCP（那边的 echo.yml 要写 tcp: true），隧道不通 UDP 时用。
+  # - { name: hk2-via-ix, addr: "127.0.0.1:39529", type: echo-tcp, key: "<那边的 key>" }

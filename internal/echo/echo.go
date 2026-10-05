@@ -10,6 +10,10 @@
 // A reply is the request with kind 1 and a fresh MAC: never larger than the
 // request, and a responder never answers a reply, so two responders can't
 // be made to bounce packets between each other.
+//
+// The same packets can travel over a TCP connection instead, one after
+// another with no framing (they are all Size bytes), for tunnels whose UDP
+// path is missing or broken.
 package echo
 
 import (

@@ -113,7 +113,7 @@ func TestExampleConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("with the commented-out settings: %v", err)
 	}
-	if len(c.Peers) != 4 || len(c.Disks) != 2 || len(c.Interfaces) != 1 {
+	if len(c.Peers) != 5 || len(c.Disks) != 2 || len(c.Interfaces) != 1 {
 		t.Fatalf("with the commented-out settings: %+v", c)
 	}
 }

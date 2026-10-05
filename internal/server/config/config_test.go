@@ -407,7 +407,7 @@ func TestExampleConfig(t *testing.T) {
 	// the node it refers to; add-node works on the file as it is.
 	text := strings.Replace(string(data), "nodes: []\n", "nodes:\n  - {id: jp-1, token: "+tokB+"}\n", 1)
 	text = strings.Replace(text, `"<每台一个，gen-token 生成>"`, tokA, 1)
-	text = strings.Replace(text, `"<对端 echo.yml 的 key>"`, tokA, 1)
+	text = strings.Replace(text, `"<对端 echo.yml 的 key>"`, tokA, -1)
 	var lines []string
 	inNode := false
 	for _, l := range strings.Split(text, "\n") {
@@ -423,7 +423,7 @@ func TestExampleConfig(t *testing.T) {
 		t.Fatalf("with the example node uncommented: %v", err)
 	}
 	n, _ := full.Node("hk-1")
-	if n == nil || n.Traffic.Quota() != 1000<<30 || n.Plan.ExpireAt != "2027-03-15" || n.Ping.Addr != "203.0.113.5" || len(n.Ping.Extra) != 3 {
+	if n == nil || n.Traffic.Quota() != 1000<<30 || n.Plan.ExpireAt != "2027-03-15" || n.Ping.Addr != "203.0.113.5" || len(n.Ping.Extra) != 4 {
 		t.Errorf("example node: %+v", n)
 	}
 	out, err := AddNode(data, NewNode{ID: "first", Token: tokA})

@@ -41,6 +41,7 @@ nodes: []
   #       - { name: cf-vpn, addr: 1.1.1.1 }                          # VPN 型隧道：路由要走隧道
   #       - { name: cf-relay, addr: "127.0.0.1:15353", type: dns }   # 本地端口转发到 1.1.1.1:53
   #       - { name: hk1-via-sgp, addr: "127.0.0.1:39527", type: echo, key: "<对端 echo.yml 的 key>" }
+  #       - { name: hk1-via-ix, addr: "127.0.0.1:39529", type: echo-tcp, key: "<对端 echo.yml 的 key>" }  # 隧道不通 UDP 时
   #   disks: ["/", "/data"]       # 可选：看哪些挂载点的磁盘，默认只有 /
   #   interfaces: [eth0]          # 可选：哪些网卡的流量算数，默认自动识别（见 docs/install.md「网卡」）
 # traffic 里的周期设置、ping、disks、interfaces 只用来生成各节点的 agent 配置：改了以后

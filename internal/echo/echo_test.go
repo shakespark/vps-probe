@@ -140,3 +140,111 @@ func TestResponderRateCap(t *testing.T) {
 		t.Fatalf("got %d replies with a cap of 3/s", got)
 	}
 }
+
+func serveTCP(t *testing.T, r *Responder) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.ServeTCP(ln) }()
+	t.Cleanup(func() {
+		ln.Close()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	return ln.Addr().String()
+}
+
+// exchangeTCP writes the packets on one connection and reports how many
+// replies came back before the responder closed it or went quiet.
+func exchangeTCP(t *testing.T, addr string, pkts ...[]byte) (got int, closed bool) {
+	t.Helper()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for _, p := range pkts {
+		c.Write(p)
+	}
+	buf := make([]byte, Size)
+	for {
+		c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		if _, err := io.ReadFull(c, buf); err != nil {
+			// EOF, or a reset when it hung up with requests unread.
+			var ne net.Error
+			return got, !(errors.As(err, &ne) && ne.Timeout())
+		}
+		if _, ok := ParseReply(key, buf); !ok {
+			t.Fatalf("bad reply % x", buf)
+		}
+		got++
+	}
+}
+
+func TestResponderTCP(t *testing.T) {
+	addr := serveTCP(t, &Responder{Key: key, Log: discard})
+	now := time.Now()
+	if got, closed := exchangeTCP(t, addr, Request(key, 1, now), Request(key, 2, now), Request(key, 3, now)); got != 3 || closed {
+		t.Fatalf("valid requests: %d replies, closed %v", got, closed)
+	}
+	// The first request that is not answered ends the connection, with
+	// nothing written for it or after it.
+	junk := make([]byte, Size)
+	if got, closed := exchangeTCP(t, addr, Request(key, 1, now), junk, Request(key, 2, now)); got != 1 || !closed {
+		t.Fatalf("junk: %d replies, closed %v", got, closed)
+	}
+	if got, closed := exchangeTCP(t, addr, Request(key, 1, now.Add(-time.Hour))); got != 0 || !closed {
+		t.Fatalf("stale: %d replies, closed %v", got, closed)
+	}
+	if got, closed := exchangeTCP(t, addr, []byte("GET / HTTP/1.0\r\n\r\n")); got != 0 || closed {
+		t.Fatalf("short junk: %d replies, closed %v (want silence)", got, closed)
+	}
+	// A health check that connects and hangs up doesn't disturb anything.
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	if got, _ := exchangeTCP(t, addr, Request(key, 9, time.Now())); got != 1 {
+		t.Fatalf("after a bare connect: %d replies", got)
+	}
+}
+
+func TestResponderTCPAllow(t *testing.T) {
+	addr := serveTCP(t, &Responder{Key: key, Log: discard, Allow: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}})
+	if got, closed := exchangeTCP(t, addr, Request(key, 1, time.Now())); got != 0 || !closed {
+		t.Fatalf("source outside allow: %d replies, closed %v", got, closed)
+	}
+}
+
+// Closing the listener ends ServeTCP even with a connection still open.
+func TestResponderTCPShutdown(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- (&Responder{Key: key, Log: discard}).ServeTCP(ln) }()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write(Request(key, 1, time.Now()))
+	if _, err := io.ReadFull(c, make([]byte, Size)); err != nil {
+		t.Fatal(err)
+	}
+	ln.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ServeTCP still running")
+	}
+}

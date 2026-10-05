@@ -15,6 +15,7 @@ import (
 // Config is the responder's echo.yml.
 type Config struct {
 	Listen string   `yaml:"listen"`
+	TCP    bool     `yaml:"tcp"` // also answer on TCP, same address
 	Key    string   `yaml:"key"`
 	Allow  []string `yaml:"allow"`   // source IPs or CIDRs; empty = any
 	MaxPPS int      `yaml:"max_pps"` // 0 = the default, 1000

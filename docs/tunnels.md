@@ -48,6 +48,24 @@ vps-probe-server install-cmd -node jp-1     # 把打印的命令在 jp-1 上运�
 
 两端的时钟相差不能超过 5 分钟。
 
+### 隧道回显（TCP）
+
+隧道不通 UDP（或者 UDP 的回程有问题），或者转发面板要靠 TCP 连接判断规则是否正常时，让回显走 TCP：
+
+1. 应答端的 `echo.yml` 里加 `tcp: true`，重启它（`systemctl restart vps-probe-echo`），放行同一个端口的 TCP。
+2. 目标的类型写 `echo-tcp`，其余和上面一样：
+
+   ```yaml
+       ping:
+         extra:
+           - { name: hk1-via-ix, addr: "127.0.0.1:本地端口", type: echo-tcp, key: "<同一个 key>" }
+   ```
+
+agent 和应答端之间保持一条 TCP 连接，每秒在上面一问一答，测到的是整条隧道的往返时间，不是建立连接的时间。和 UDP 的两点不同：
+
+- 打开 `tcp` 以后，应答端的端口能被扫描到（UDP 的收到不认识的包不回应，扫描不到）。连接上除了对正确签名请求的回应不会写出任何数据；可以用 `allow` 只回应中转机的出口 IP。
+- TCP 丢了包会自己重传，所以线路丢包在这里表现为时延的尖峰，超过 2 秒才记为丢失。丢包率不要和 UDP、ICMP 测的直接比较。
+
 ### DNS
 
 把隧道的远端指向一个公共 DNS，不用装应答端：

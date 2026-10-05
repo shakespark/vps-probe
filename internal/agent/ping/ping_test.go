@@ -279,11 +279,108 @@ func TestEcho(t *testing.T) {
 	}
 }
 
+func TestEchoTCP(t *testing.T) {
+	key := []byte("abcdefghijklmnopqrstuvwxyz0123456789")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go (&echo.Responder{Key: key, Log: discard}).ServeTCP(ln)
+	t.Cleanup(func() { ln.Close() })
+	addr := ln.Addr().String()
+
+	// Nothing listens here: every probe is lost, and nothing blocks.
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := dead.Addr().String()
+	dead.Close()
+
+	p, err := New([]peer.Peer{
+		{Name: "tun", Addr: addr, Type: peer.EchoTCP, Key: string(key)},
+		{Name: "wrong-key", Addr: addr, Type: peer.EchoTCP, Key: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"},
+		{Name: "dead", Addr: deadAddr, Type: peer.EchoTCP, Key: string(key)},
+	}, 100*time.Millisecond, 500*time.Millisecond, discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runFor(p, 1200*time.Millisecond)
+	st := p.Snapshot(time.Now().Add(time.Second))
+	// Lost <= 2: the probe sent while connecting, and the one sent just
+	// before shutdown.
+	if s := st[0]; s.Sent < 5 || s.Lost > 2 || s.Addr != addr || s.Min <= 0 || s.Max > 100 {
+		t.Fatalf("tun: %+v", s)
+	}
+	// The responder hangs up on a request signed with another key.
+	if s := st[1]; s.Sent < 5 || s.Lost != s.Sent {
+		t.Fatalf("wrong-key: %+v", s)
+	}
+	if s := st[2]; s.Sent < 5 || s.Lost != s.Sent {
+		t.Fatalf("dead: %+v", s)
+	}
+}
+
+// A connection that ends is replaced, and probes are answered again.
+func TestEchoTCPReconnects(t *testing.T) {
+	key := []byte("abcdefghijklmnopqrstuvwxyz0123456789")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	// The first connection is dropped after one reply; later ones are served.
+	conns := make(chan net.Conn, 8)
+	go func() {
+		for first := true; ; first = false {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conns <- c
+			go func() {
+				defer c.Close()
+				buf := make([]byte, echo.Size)
+				for {
+					if _, err := io.ReadFull(c, buf); err != nil {
+						return
+					}
+					rep, err := echo.Answer(key, buf, time.Now())
+					if err != nil {
+						return
+					}
+					c.Write(rep)
+					if first {
+						return
+					}
+				}
+			}()
+		}
+	}()
+
+	p, err := New([]peer.Peer{{Name: "tun", Addr: ln.Addr().String(), Type: peer.EchoTCP, Key: string(key)}},
+		50*time.Millisecond, 300*time.Millisecond, discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runFor(p, 1200*time.Millisecond)
+	s := p.Snapshot(time.Now().Add(time.Second))[0]
+	if n := len(conns); n < 2 {
+		t.Fatalf("%d connections, want a reconnect", n)
+	}
+	if got := s.Sent - s.Lost; got < 10 {
+		t.Fatalf("only %d of %d answered after the reconnect", got, s.Sent)
+	}
+}
+
 func TestBadPeers(t *testing.T) {
 	for name, pr := range map[string]peer.Peer{
 		"type":      {Name: "x", Addr: "1.1.1.1", Type: "tcp"},
 		"short key": {Name: "x", Addr: "127.0.0.1:39527", Type: peer.Echo, Key: "short"},
 		"echo port": {Name: "x", Addr: "127.0.0.1", Type: peer.Echo, Key: "abcdefghijklmnopqrstuvwxyz0123456789"},
+		"tcp key":   {Name: "x", Addr: "127.0.0.1:39527", Type: peer.EchoTCP},
+		"tcp port":  {Name: "x", Addr: "127.0.0.1", Type: peer.EchoTCP, Key: "abcdefghijklmnopqrstuvwxyz0123456789"},
+		"dns key":   {Name: "x", Addr: "127.0.0.1:53", Type: peer.DNS, Key: "abcdefghijklmnopqrstuvwxyz0123456789"},
 	} {
 		if _, err := New([]peer.Peer{pr}, time.Second, time.Second, discard); err == nil {
 			t.Errorf("%s: accepted", name)

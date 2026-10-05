@@ -7,6 +7,11 @@
 
 listen: ":39527"            # UDP，IPv4 和 IPv6 都监听
 
+# 可选：同一个端口也接受 TCP，给 `type: echo-tcp` 的 peer 用（隧道不通 UDP，或者转发
+# 面板要靠 TCP 连接判断规则是否正常）。打开以后端口能被扫描到：TCP 握手由内核完成，
+# 但连接上除了对正确签名请求的回应，不会写出任何数据。
+# tcp: true
+
 # 和探测它的 agent peer 共用。用 `vps-probe-server gen-token` 生成。
 key: "<key>"
 

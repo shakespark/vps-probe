@@ -250,7 +250,8 @@ cmd_install() {
 		cat <<-EOF
 
 			Next steps (see docs/tunnels.md):
-			  - allow the UDP port in $CONF to this machine (cloud security group / firewall)
+			  - allow the UDP port in $CONF to this machine (cloud security group / firewall);
+			    with "tcp: true" the same port on TCP as well
 			  - point the tunnel's far end at this port, and add an echo peer with the
 			    same key to the probing node (its ping.extra in server.yml), then
 			    reinstall that node's config

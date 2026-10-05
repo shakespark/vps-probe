@@ -71,7 +71,7 @@
 **1. 在服务端下载发布包并验证签名**
 
 ```sh
-V=0.3.1
+V=0.4.0
 B=https://github.com/shakespark/vps-probe/releases/download/v$V
 curl -fLO $B/vps-probe-$V-linux-amd64.tar.gz -fLO $B/vps-probe-$V.sha256 -fLO $B/vps-probe-$V.sha256.sig
 

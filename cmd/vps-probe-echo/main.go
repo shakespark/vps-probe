@@ -5,6 +5,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -30,6 +31,14 @@ func configFlag(fs *flag.FlagSet) *string {
 	return fs.String("config", "/etc/vps-probe/echo.yml", "config file")
 }
 
+// listens names what the responder listens on.
+func listens(cfg *echo.Config) string {
+	if cfg.TCP {
+		return "udp+tcp " + cfg.Listen
+	}
+	return "udp " + cfg.Listen
+}
+
 // sources names the addresses the responder answers.
 func sources(cfg *echo.Config) string {
 	if len(cfg.Prefixes) == 0 {
@@ -46,7 +55,7 @@ func check(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("ok: listen udp %s, answering sources: %s\n", cfg.Listen, sources(cfg))
+	fmt.Printf("ok: listen %s, answering sources: %s\n", listens(cfg), sources(cfg))
 	return nil
 }
 
@@ -65,15 +74,29 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	r := &echo.Responder{Key: []byte(cfg.Key), Allow: cfg.Prefixes, MaxPPS: cfg.MaxPPS, Log: log}
+	tcpDone := make(chan error, 1)
+	var ln net.Listener
+	if cfg.TCP {
+		if ln, err = net.Listen("tcp", cfg.Listen); err != nil {
+			conn.Close()
+			return err
+		}
+		go func() { tcpDone <- r.ServeTCP(ln) }()
+	} else {
+		tcpDone <- nil
+	}
 	ctx, stop := cli.Context()
 	defer stop()
 	go func() {
 		<-ctx.Done()
 		conn.Close()
+		if ln != nil {
+			ln.Close()
+		}
 	}()
-	log.Info("echo responder started", "version", version, "listen", conn.LocalAddr(), "allow", sources(cfg))
-	r := &echo.Responder{Key: []byte(cfg.Key), Allow: cfg.Prefixes, MaxPPS: cfg.MaxPPS, Log: log}
-	if err := r.Serve(conn); err != nil {
+	log.Info("echo responder started", "version", version, "listen", conn.LocalAddr(), "tcp", cfg.TCP, "allow", sources(cfg))
+	if err := errors.Join(r.Serve(conn), <-tcpDone); err != nil {
 		return err
 	}
 	log.Info("echo responder stopped")
