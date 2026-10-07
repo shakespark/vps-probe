@@ -177,6 +177,63 @@ func addNode(args []string) error {
 	return nil
 }
 
+// removeNode cuts a node out of the config file and prints what is left to
+// do. Like addNode it replaces the file only if the result is a valid
+// config, and keeps the previous version beside it.
+func removeNode(args []string) error {
+	fs := flag.NewFlagSet("remove-node", flag.ExitOnError)
+	path := configFlag(fs)
+	id := fs.String("id", "", "id of the node to remove")
+	fs.Parse(args)
+	if *id == "" {
+		return errors.New("remove-node: -id is required")
+	}
+
+	// Load also checks the file's permissions.
+	cfg, err := config.Load(*path)
+	if err != nil {
+		return err
+	}
+	old, err := os.ReadFile(*path)
+	if err != nil {
+		return err
+	}
+	data, err := config.RemoveNode(old, *id)
+	if err != nil {
+		return err
+	}
+	bak, err := keepCopy(*path, old)
+	if err != nil {
+		return err
+	}
+	if err := atomicfile.Replace(*path, data); err != nil {
+		return err
+	}
+
+	w := os.Stderr
+	fmt.Fprintf(w, "Removed node %s from %s (previous version: %s).\n\n", *id, *path, bak)
+	fmt.Fprintf(w, "1. Restart the server. From then on it drops what that agent sends and the page no longer\n"+
+		"   shows the node. Its history stays in the database; adding a node with the same id\n"+
+		"   brings it back.\n\n     systemctl restart vps-probe-server\n\n")
+	var others []string
+	if n, _ := cfg.Node(*id); n != nil && n.Ping.Addr != "" {
+		for _, p := range cfg.Nodes {
+			if p.ID != *id && !cfg.PingExcluded(*id, p.ID) {
+				others = append(others, p.ID)
+			}
+		}
+	}
+	step := 2
+	if len(others) > 0 {
+		fmt.Fprintf(w, "%d. These nodes keep pinging %s until their config is reinstalled:\n   %s\n   For each of them:\n\n"+
+			"     vps-probe-server install-cmd -node ID | ssh root@THAT_VPS sh\n\n", step, *id, strings.Join(others, ", "))
+		step++
+	}
+	fmt.Fprintf(w, "%d. If the VPS is still yours, remove the agent there, from the release directory:\n\n"+
+		"     ./install.sh uninstall agent --purge\n", step)
+	return nil
+}
+
 // keepCopy saves content, the current content of path, beside it under a
 // new name, readable by root only, and returns that name.
 func keepCopy(path string, content []byte) (string, error) {

@@ -171,6 +171,22 @@ rm ../hk-1.yml                               # 服务端上的那一份也删掉
 
 系统的 `net.ipv4.ping_group_range` 不允许普通用户 ping 时，`install.sh` 只给 agent 服务加 `CAP_NET_RAW`，不改系统设置。
 
+### 去掉节点
+
+机器退掉或不想再监控时，**在服务端上**：
+
+```sh
+vps-probe-server remove-node -id hk-1
+systemctl restart vps-probe-server
+```
+
+- 和 `add-node` 一样只动文件里这一个节点的那几行，原文件留一份 `.bak-<时间>`。节点前后单独成行的注释不会删，需要的话手工清掉。
+- 别处还写着这个节点时（其他节点的 `ping.exclude`，告警规则或报告的 `nodes` / `exclude`），它会列出这些位置并且不改文件；先手工把那几处去掉，再执行一次。
+- 重启后这个节点的 token 作废，它的 agent 再发来的数据会被丢弃，页面上不再显示它，没恢复的告警一并清掉（不会再发"恢复"通知）。历史数据留在数据库里；以后用同一个 id 再 `add-node`，历史会重新显示出来。
+- 其他节点的 `agent.yml` 里还留着它的地址，会一直 ping 下去。`remove-node` 会列出是哪几个节点，对每个执行一次 `vps-probe-server install-cmd -node ID | ssh root@那台VPS sh`。机器已经不归你时这一步尤其别省：那个地址现在是别人的。
+- 机器还在手上时，在它上面卸载 agent：`./install.sh uninstall agent --purge`。已经重装或退掉的机器不用管，也不要再连上去。
+- 它用过的域名（动态 DNS 之类）记得自己删掉。
+
 ## 5. 升级
 
 用新的发布包重新运行同样的命令，**不带 `--config` 时保留现有配置**。先升级服务端，再升级 agent。

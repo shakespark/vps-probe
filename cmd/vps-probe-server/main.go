@@ -26,6 +26,7 @@ Nodes:
                            no token in it, the same for every node
   agent-config -node ID -o FILE
                            write the node's agent.yml instead ("-o -" prints it)
+  remove-node -id ID       take a node out of the config and print what is left to do
       add-node, install-cmd and agent-config take -server HOST:PORT, how agents reach this
       server (default: public_addr in the config); the first two also -version V, -base URL
       and -signers FILE to choose the release the command installs
@@ -43,6 +44,7 @@ func main() {
 		cli.Command{Name: "backup", Run: backup},
 		cli.Command{Name: "test-notify", Run: testNotify},
 		cli.Command{Name: "add-node", Run: addNode},
+		cli.Command{Name: "remove-node", Run: removeNode},
 		cli.Command{Name: "install-cmd", Run: installCmd},
 		cli.Command{Name: "agent-config", Run: agentConfig},
 		cli.Command{Name: "gen-token", Run: genToken},
